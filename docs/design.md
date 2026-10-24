@@ -155,8 +155,8 @@ Box(clickable, key=task.ID, radius t.Radius, border 1 t.Border,
 | 卡片悬停 | `t.SurfaceHover` | `t.SurfaceHover` | **是**：明色卡片为 `Background` 浮在 `Surface` 列面上，悬停须再深一档到 `SurfaceHover`（用 `Surface` 会与列面 1.00:1、卡片塌成洞）；暗色同值 |
 | 卡片按下 | `t.SurfacePressed` | `t.SurfacePressed` | 否 |
 | 描边（卡片静止） | `t.Border` | `t.Border` | 否 |
-| 描边（列面板） | `t.Border.Mix(t.Text, 0.12)` | 同 | 否：`Border` 对白卡仅 1.41:1，列框需要深一档 |
-| 描边（空态虚线） | `t.Border.Mix(t.Text, 0.30)` | 同 | 否 |
+| 描边（列面板） | `t.Border.Mix(t.Text, 0.40)` | 同 | 否：`Border` 对白底仅 1.41:1，列框需到约 3:1 才成为可感知边界 |
+| 描边（空态虚线） | `t.Border.Mix(t.Text, 0.45)` | 同 | 否 |
 | 描边（卡片悬停） | `t.Border.Mix(t.Text, 0.35)` | 同 | 否：悬停面被填充后，仅 0.22 的描边不够区分 |
 | 强调填充（主按钮） | `t.Accent` | `#2563eb` | **是**：暗色主题的 `#3b82f6` 配白字仅 3.68:1，低 AA；应用侧复制主题并把 Accent/AccentHover/AccentPressed 换成 `#2563eb` 系（hover/pressed 用 mygo 的 `Mix` 规则派生），白字 5.17:1。高对比偏好下不改 |
 | 主文字 / 标题 | `t.Text` | `t.Text` | 否 |

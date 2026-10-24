@@ -50,12 +50,12 @@ func cardHover(t *ui.Theme) ui.Color {
 // resting border so the edge survives on top of a filled face.
 func hoverBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.35) }
 
-// panelBorder outlines a column: one step darker than the flat border so
-// the panel reads as a surface, not an accident of tone.
-func panelBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.12) }
+// panelBorder outlines a column: about 3:1 against its own face in both
+// appearances, the floor for a meaningful non-text boundary.
+func panelBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.40) }
 
 // dashedBorder outlines an empty column's placeholder, a step deeper still.
-func dashedBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.3) }
+func dashedBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.45) }
 
 // typeScale is the design's f-* steps relative to the theme's size.
 func fxs(t *ui.Theme) float32 { return t.FontSize - 2 }
