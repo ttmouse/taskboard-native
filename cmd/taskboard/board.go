@@ -56,16 +56,23 @@ type detail struct {
 	comment  string
 	comments []model.Comment
 	loading  bool // comments still arriving
+
+	// snap is the task as it was opened; dirty() compares against it so a
+	// pushed update cannot silently overwrite unsaved typing.
+	snap   model.Task
+	pushed *model.Task // an incoming update held back while dirty
+	pushBy string
+}
+
+// dirty reports whether the dialog holds edits the user has not saved.
+func (d *detail) dirty() bool {
+	return strings.TrimSpace(d.title) != d.snap.Title || d.body != d.snap.Description
 }
 
 // form is a small dialog: a new task or a new project.
 type form struct {
-	open   bool
-	kind   string // "task" or "project"
-	title  string
-	body   string
-	name   string
-	column string
+	open bool
+	name string
 }
 
 // conflict shows the 409 the service answered, with the server's copy.
@@ -106,6 +113,7 @@ type board struct {
 	conflict *conflict
 
 	frameCtx *ui.Context
+	curTheme *ui.Theme // the theme the current frame builds with
 
 	drafts map[string]string // columnID → quick-add text
 
@@ -463,15 +471,23 @@ func (b *board) appendComment(taskID string, cm model.Comment) bool {
 	return false
 }
 
-// touchDetail refreshes the open detail from a pushed copy.
+// touchDetail refreshes the open detail from a pushed copy. It never
+// overwrites text the user has typed but not saved: a dirty dialog keeps
+// its input and shows what the push would have changed.
 func (b *board) touchDetail(t model.Task) {
 	if b.detail == nil || b.detail.id != t.ID || b.saving {
+		return
+	}
+	if b.detail.dirty() {
+		b.detail.pushed = &t
+		b.detail.pushBy = t.UpdatedBy
 		return
 	}
 	b.detail.title = t.Title
 	b.detail.body = t.Description
 	b.detail.assignee = t.Assignee
 	b.detail.column = b.columnName(t.ColumnID)
+	b.detail.pushed = nil
 }
 
 // --- actions ---
@@ -499,6 +515,7 @@ func (b *board) openDetail(t model.Task) {
 		assignee: t.Assignee,
 		column:   b.columnName(t.ColumnID),
 		loading:  true,
+		snap:     t,
 	}
 	b.detail = d
 	go func() {
@@ -534,6 +551,30 @@ func (b *board) saveDetail() {
 	body := d.body
 	cur := *t
 	if title == cur.Title && body == cur.Description {
+		// The task moved under this dialog (an agent pushed a newer
+		// version); save what the user typed against the fresh version
+		// instead of silently discarding it.
+		if d.dirty() {
+			b.conflict = &conflict{
+				open:    true,
+				id:      d.id,
+				title:   "任务已被修改",
+				message: fmt.Sprintf("「%s」已被 %s 更新到 v%d。", clip(cur.Title, 20), agentName(cur.UpdatedBy), cur.Version),
+				retry: func(version int) {
+					go func() {
+						if _, err := b.api.Update(cur.ID, version, &title, &body, nil); err == nil {
+							b.post(func() {
+								if b.detail != nil && b.detail.id == cur.ID {
+									b.detail.open = false
+									b.detail = nil
+								}
+							})
+						}
+					}()
+				},
+			}
+			return
+		}
 		b.detail.open = false
 		return
 	}
@@ -651,29 +692,9 @@ func (b *board) sendComment() {
 	}()
 }
 
-func (b *board) createTask() {
-	f := b.form
-	if f == nil || f.kind != "task" {
-		return
-	}
-	title := strings.TrimSpace(f.title)
-	if title == "" {
-		b.toast("无法创建", "标题不能为空。")
-		return
-	}
-	col := b.columnID(f.column)
-	body := f.body
-	f.open = false
-	go func() {
-		if _, err := b.api.CreateTask(b.cur, col, title, body, ""); err != nil {
-			b.toast("创建失败", err.Error())
-		}
-	}()
-}
-
 func (b *board) createProject() {
 	f := b.form
-	if f == nil || f.kind != "project" {
+	if f == nil {
 		return
 	}
 	name := strings.TrimSpace(f.name)
@@ -739,10 +760,7 @@ func (b *board) recover(id string, err error, retry func(version int)) {
 		}
 		return
 	}
-	by := fresh.UpdatedBy
-	if by == "" {
-		by = "其他代理"
-	}
+	by := agentName(fresh.UpdatedBy)
 	b.conflict = &conflict{
 		open:    true,
 		id:      id,
@@ -750,6 +768,14 @@ func (b *board) recover(id string, err error, retry func(version int)) {
 		message: fmt.Sprintf("「%s」已被 %s 更新到 v%d。", clip(fresh.Title, 20), by, fresh.Version),
 		retry:   retry,
 	}
+}
+
+// agentName names whoever last wrote a task, for dialogs and toasts.
+func agentName(by string) string {
+	if by == "" || by == "local" {
+		return "其他代理"
+	}
+	return by
 }
 
 // clip shortens s for a label, counting runes.

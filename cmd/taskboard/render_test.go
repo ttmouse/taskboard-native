@@ -116,7 +116,7 @@ func TestRenderBoardLightAndDark(t *testing.T) {
 
 	for _, want := range []string{
 		"local", "待办", "进行中", "评审", "完成",
-		"刷新", "新建任务", "在「待办」中添加任务",
+		"刷新", "新建项目", "在「待办」中添加任务",
 		"把看板接上 SSE", "原生窗口渲染验收", "版本冲突时拉一次详情对齐",
 		"1 条评论",
 	} {
@@ -134,7 +134,7 @@ func TestRenderBoardLightAndDark(t *testing.T) {
 	tt.Frame()
 	tt.Advance(400 * time.Millisecond)
 	tt.Frame()
-	for _, want := range []string{"待办", "把看板接上 SSE", "新建任务"} {
+	for _, want := range []string{"待办", "把看板接上 SSE", "新建项目"} {
 		if !tt.HasText(want) {
 			t.Errorf("dark frame lacks %q", want)
 		}
@@ -331,8 +331,9 @@ func TestConflictAligns(t *testing.T) {
 	newer.UpdatedBy = "mcp"
 	fake.external(newer)
 	waitFor(t, tt, "推送的更新", func() bool { return b.task("t-1").Version == 7 })
+	// The dialog was opened, not dirty: it follows the pushed copy.
 	if b.detail.title != "被代理改过的标题" {
-		t.Fatalf("open detail did not follow the pushed update: %q", b.detail.title)
+		t.Fatalf("clean detail did not follow the pushed update: %q", b.detail.title)
 	}
 
 	// A save carrying the old version must conflict.
@@ -507,4 +508,78 @@ func TestProjectSwitchAndQuickAdd(t *testing.T) {
 	b.drafts["c2-todo"] = "从列内新建的卡片"
 	b.post(func() { b.createTop("c2-todo", "从列内新建的卡片") })
 	waitFor(t, tt, "列内新建", func() bool { return tt.HasText("从列内新建的卡片") })
+}
+
+// TestDirtyDetailSurvivesPush checks an unsaved edit is not overwritten by
+// an agent's pushed update, and that saving it goes through the conflict
+// dialog instead of silently closing as "no changes".
+func TestDirtyDetailSurvivesPush(t *testing.T) {
+	fake := seedBoard()
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+
+	if err := tt.Click("把看板接上 SSE"); err != nil {
+		t.Fatalf("click card: %v", err)
+	}
+	tt.Frame()
+	b.detail.title = "我正在写的新标题"
+	tt.Frame()
+
+	cp := *b.task("t-1")
+	cp.Version = 8
+	cp.Title = "被代理抢先改的标题"
+	cp.UpdatedBy = "mcp"
+	fake.push(model.Event{Type: model.EventTaskUpdated, ProjectID: "local", ID: cp.ID, Version: 8, By: "mcp", Task: &cp})
+	waitFor(t, tt, "推送到达看板", func() bool { return b.task("t-1").Version == 8 })
+
+	if b.detail.title != "我正在写的新标题" {
+		t.Fatalf("pushed update overwrote the unsaved title: %q", b.detail.title)
+	}
+	if !tt.HasText("你的编辑尚未保存") {
+		t.Errorf("detail did not warn about the incoming update; texts: %v", tt.Texts())
+	}
+
+	tt.Frame()
+	if err := tt.Click("保存"); err != nil {
+		t.Fatalf("click save: %v", err)
+	}
+	waitFor(t, tt, "冲突弹窗", func() bool { return b.conflict != nil && tt.HasText("任务已被修改") })
+	if b.detail == nil {
+		t.Fatal("saving a dirty stale dialog closed it instead of asking")
+	}
+}
+
+// TestDarkAccentMeetsContrast checks the dark frame hands mygo a theme
+// whose accent keeps white button text above AA (4.5:1), instead of the
+// stock #3b82f6 (3.68:1).
+func TestDarkAccentMeetsContrast(t *testing.T) {
+	fake := seedBoard()
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	tt.SetDark(true)
+	tt.Frame()
+	waitFor(t, tt, "暗色渲染", func() bool { return tt.HasText("待办") })
+
+	accent := b.curTheme.Accent
+	want := [3]uint8{0x25, 0x63, 0xeb}
+	if accent.R != want[0] || accent.G != want[1] || accent.B != want[2] {
+		t.Fatalf("dark accent = #%02x%02x%02x, want the AA-safe #2563eb", accent.R, accent.G, accent.B)
+	}
+}
+
+// TestHoverFaceDiffersFromColumn checks a hovered card does not vanish
+// into its column in the light appearance (the reported 1.00:1 bug).
+func TestHoverFaceDiffersFromColumn(t *testing.T) {
+	light := ui.LightTheme()
+	if cardHover(light) == colFace(light) {
+		t.Fatal("light hover face equals the column face: the card disappears")
+	}
+	dark := ui.DarkTheme()
+	if cardHover(dark) == colFace(dark) {
+		t.Fatal("dark hover face equals the column face")
+	}
+	if cardFace(light) == colFace(light) {
+		t.Fatal("light resting face equals the column face")
+	}
 }

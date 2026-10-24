@@ -62,7 +62,7 @@
 | L0 | 窗口、看板底、顶栏 | `t.Background` | `t.Background` |
 | L1 | 列面板 | `t.Surface` | `t.Background` |
 | L2 | 卡片静止 | `t.Background` | `t.Surface` |
-| L2h | 卡片悬停 | `t.Surface` | `t.SurfaceHover` |
+| L2h | 卡片悬停 | `t.SurfaceHover` | `t.SurfaceHover` |
 | L2p | 卡片按下 | `t.SurfacePressed` | `t.SurfacePressed` |
 
 写成三个取值函数并由 `t.Dark` 分支，避免明暗两套写死的常量：`colFace(t)`、`cardFace(t)`、`cardHover(t)`。
@@ -135,11 +135,13 @@ Box(clickable, key=task.ID, radius t.Radius, border 1 t.Border,
 | 3 | 保存卡片 | `loading.LinearDots` | 14 | `t.TextMuted` | 正在保存任务 | 卡片右下角时间戳位置；弹层内在「保存」按钮左侧 |
 | 4 | 发评论 | `loading.BouncingDots` | 12 | `t.Accent` | 正在发送评论 | 「发送」按钮左侧内联；输入框 `Disabled(true)` |
 | 5 | SSE 更新后过渡 | `loading.Pulse` | 10 | `t.Accent` | 正在同步更新 | 顶栏最右同步点；静止态是 8×8 `Radius(999)` 的 `t.Success` 圆点，事件到达后换成 Pulse 显示 1.2s（其自身周期）再回静止圆点 |
+| 5b | 服务连接中（行内） | `loading.Arc` | 12 | `t.TextMuted` | 正在连接本地服务 | 顶栏最右。**初次载入期间（行 1 显示中）改为静止 8×8 `t.Border` 圆点**，保证同一时刻只有一个板级指示器 |
 | 6 | 服务离线重连 | `loading.Comet` | 12 | `t.Warning` | 正在重新连接本地服务 | 看板上方横幅内 + 文字「本地服务未连接，正在重试…」+ `ui.Button("重试")` |
 | 7 | 归档 | `loading.Arc` | 14 | `t.TextMuted` | 正在归档任务 | 弹层底部按钮行左侧 |
+| 7b | 载入评论 | `loading.LinearDots` | 12 | `t.TextMuted` | 正在载入评论 | 详情弹层「评论」标题右侧；与行 4 的 `BouncingDots` 区分，避免同形不同义 |
 | 8 | 移动列 | 不用指示器 | — | — | — | 乐观更新 + §9 的过渡；失败才回滚并 `c.Toast` |
 
-同一时刻最多一个全板级指示器（1、6）；2/3/4/5/7 都是行内小尺寸，可并存。
+同一时刻最多一个全板级指示器（1、6）；2/3/4/5/5b/7/7b 都是行内小尺寸，可并存。行 5b 在行 1 显示期间退化为静止圆点，避免出现两个板级旋转指示器。
 
 ## 7. 明暗主题对照
 
@@ -150,9 +152,13 @@ Box(clickable, key=task.ID, radius t.Radius, border 1 t.Border,
 | 窗口 / 顶栏 / 看板底 | `t.Background` | `t.Background` | 否：直接引用 |
 | 列面板 | `t.Surface`（比底略深一档） | `t.Background`（与底同档，靠描边分层） | **是**：`t.Dark` 分支，暗色下若用 `Surface` 会与卡片同色而糊成一片 |
 | 卡片静止 | `t.Background`（浮在列面上） | `t.Surface`（亮一档） | **是**：同上，明暗互换方向 |
-| 卡片悬停 | `t.Surface` | `t.SurfaceHover` | **是**：明色悬停加深，暗色悬停提亮 |
+| 卡片悬停 | `t.SurfaceHover` | `t.SurfaceHover` | **是**：明色卡片为 `Background` 浮在 `Surface` 列面上，悬停须再深一档到 `SurfaceHover`（用 `Surface` 会与列面 1.00:1、卡片塌成洞）；暗色同值 |
 | 卡片按下 | `t.SurfacePressed` | `t.SurfacePressed` | 否 |
-| 描边 | `t.Border` | `t.Border` | 否；悬停加深用 `t.Border.Mix(t.Text, 0.22)`，明暗都朝文字色靠 |
+| 描边（卡片静止） | `t.Border` | `t.Border` | 否 |
+| 描边（列面板） | `t.Border.Mix(t.Text, 0.12)` | 同 | 否：`Border` 对白卡仅 1.41:1，列框需要深一档 |
+| 描边（空态虚线） | `t.Border.Mix(t.Text, 0.30)` | 同 | 否 |
+| 描边（卡片悬停） | `t.Border.Mix(t.Text, 0.35)` | 同 | 否：悬停面被填充后，仅 0.22 的描边不够区分 |
+| 强调填充（主按钮） | `t.Accent` | `#2563eb` | **是**：暗色主题的 `#3b82f6` 配白字仅 3.68:1，低 AA；应用侧复制主题并把 Accent/AccentHover/AccentPressed 换成 `#2563eb` 系（hover/pressed 用 mygo 的 `Mix` 规则派生），白字 5.17:1。高对比偏好下不改 |
 | 主文字 / 标题 | `t.Text` | `t.Text` | 否 |
 | 次要文字 / 摘要 / 时间 | `t.TextMuted` | `t.TextMuted` | 否；高对比模式由 Theme 自动加深 |
 | 强调 / 主按钮 / 选中 | `t.Accent`，文字 `t.AccentText` | `t.Accent`，文字 `t.AccentText` | 否（系统强调色由 Theme 的 `follow` 接管） |
@@ -175,6 +181,7 @@ Box(clickable, key=task.ID, radius t.Radius, border 1 t.Border,
 | 整板无任务 | 每列各自显示占位框：`Box(Padding(t.Space(3)), Radius(t.Radius), Border(1, t.Border)).BorderStyle(ui.BorderDashed)` + `Text("还没有任务", f-sm, t.TextMuted)` |
 | 无评论 | `Text("还没有评论", f-sm, t.TextMuted)`，位于分隔线下、输入框上 |
 | 服务离线 | 横幅：`Row(Padding(0, t.Space(4)), Height(36), Background(t.Warning.Alpha(0.14)))` + 指示器 6 + 文案 + 「重试」；不遮断已载入的列与卡片（只读） |
+| SSE 到达但弹层有未保存编辑 | **不覆盖输入框**：卡片与版本号照常更新，弹层顶部显示一行「该任务已被 <agent> 更新到 vN，你的编辑尚未保存。」；点「保存」时按 409 同一套 AlertDialog 处理（使用最新版本 / 保留我的修改）。无未保存编辑时静默替换 |
 | 版本冲突 409 | 拉一次 `GET /api/tasks/{id}` 对齐。本地无未提交编辑 → 静默替换 + `c.Toast("任务已被其他代理更新，已同步最新版本")`；有未提交编辑 → `ui.AlertDialog(c, &a.conflict, "任务已被修改", "「X」已被 <agent> 更新到 v4。", "使用最新版本", "保留我的修改")`，返回 1 时以新 version 重发 PATCH |
 | 请求失败（非 409） | `c.AddToast(ui.Toast{Title:"操作失败", Description: err, Type:"error", Timeout: 6*time.Second})`；不弹模态 |
 

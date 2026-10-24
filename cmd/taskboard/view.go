@@ -35,15 +35,27 @@ func cardFace(t *ui.Theme) ui.Color {
 	return t.Background
 }
 
+// cardHover is a resting card's fill under the pointer. It must never
+// equal the column's own face: on light, the card is Background over a
+// Surface column, so hover goes one step further to SurfaceHover; on dark,
+// the card is Surface over a Background column, so hover goes lighter.
 func cardHover(t *ui.Theme) ui.Color {
 	if t.Dark {
 		return t.SurfaceHover
 	}
-	return t.Surface
+	return t.SurfaceHover
 }
 
-// hoverBorder is the card's outline under the pointer.
-func hoverBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.22) }
+// hoverBorder is the card's outline under the pointer: stronger than the
+// resting border so the edge survives on top of a filled face.
+func hoverBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.35) }
+
+// panelBorder outlines a column: one step darker than the flat border so
+// the panel reads as a surface, not an accident of tone.
+func panelBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.12) }
+
+// dashedBorder outlines an empty column's placeholder, a step deeper still.
+func dashedBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.3) }
 
 // typeScale is the design's f-* steps relative to the theme's size.
 func fxs(t *ui.Theme) float32 { return t.FontSize - 2 }
@@ -55,8 +67,23 @@ func flg(t *ui.Theme) float32 { return t.FontSize + 7 }
 func (b *board) view(c *ui.Context) {
 	b.frameCtx = c
 	b.pump()
-	t := c.Theme()
+	theme := c.Theme()
+	if theme.Dark {
+		// The dark theme's #3b82f6 with white text is 3.68:1, under AA for
+		// the 13px primary-button label. Hand the frame a copy with the
+		// light theme's deeper blue (5.17:1) and mygo's own derived
+		// hover/pressed steps, so no new colors enter the palette.
+		cp := *theme
+		accent := ui.Hex("#2563eb")
+		cp.Accent, cp.AccentHover, cp.AccentPressed = accent, accent.Mix(ui.Color{R: 255, G: 255, B: 255, A: 255}, 0.2), accent.Mix(ui.Color{A: 255}, 0.15)
+		cp.AccentText = ui.Hex("#ffffff")
+		cp.Selection, cp.Focus = accent.Alpha(0.4), accent.Mix(ui.Color{R: 255, G: 255, B: 255, A: 255}, 0.2).Alpha(0.6)
+		c.SetTheme(&cp)
+		theme = c.Theme()
+	}
 
+	t := theme
+	b.curTheme = t
 	ui.Column(c).Fill().Children(func() {
 		b.topBar(c, t)
 		ui.Divider(c).BorderColor(t.Border)
@@ -94,7 +121,7 @@ func (b *board) topBar(c *ui.Context, t *ui.Theme) {
 				m.Separator()
 			}
 			if m.Item("新建项目…").Chosen() {
-				b.openForm("project")
+				b.openForm()
 			}
 		}).Label("项目切换").FontSize(fmd(t)).FontWeight(500)
 		if b.switching {
@@ -105,21 +132,20 @@ func (b *board) topBar(c *ui.Context, t *ui.Theme) {
 			b.load()
 		}
 		if ui.Button(c, "新建项目").Clicked() {
-			b.openForm("project")
-		}
-		if ui.PrimaryButton(c, "新建任务").Clicked() {
-			b.openForm("task")
+			b.openForm()
 		}
 		b.syncDot(c, t)
 	})
 }
 
 // syncDot shows the stream's health: a green dot at rest, a pulse just
-// after an event, and a spinner while (re)connecting.
+// after an event, and a spinner while (re)connecting. While the board's
+// own full-page indicator shows, this one stays a plain dot, so the
+// screen never carries two board-level spinners at once.
 func (b *board) syncDot(c *ui.Context, t *ui.Theme) {
 	switch b.status {
 	case client.Online:
-		if time.Now().Before(b.pulseTill) {
+		if !b.loading && time.Now().Before(b.pulseTill) {
 			loading.Pulse(c, loading.Options{Size: 10, Color: t.Accent}).Label("正在同步更新")
 			c.After(time.Until(b.pulseTill))
 			return
@@ -128,6 +154,10 @@ func (b *board) syncDot(c *ui.Context, t *ui.Theme) {
 	case client.Offline:
 		loading.Comet(c, loading.Options{Size: 12, Color: t.Warning}).Label("正在重新连接本地服务")
 	default:
+		if b.loading {
+			ui.Box(c).Size(8, 8).Radius(999).Background(t.Border).Label("正在连接本地服务")
+			return
+		}
 		loading.Arc(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在连接本地服务")
 	}
 }
@@ -196,7 +226,7 @@ func (b *board) noProjectState(c *ui.Context, t *ui.Theme) {
 		ui.Text(c, "还没有项目").FontSize(flg(t)).FontWeight(600)
 		ui.Text(c, "创建第一个项目，开始整理任务。").FontSize(fsm(t)).TextColor(t.TextMuted)
 		if ui.PrimaryButton(c, "新建项目").Clicked() {
-			b.openForm("project")
+			b.openForm()
 		}
 	})
 }
@@ -218,7 +248,9 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 	tasks := b.tasksIn(col.ID)
 	panel := ui.Column(c.Key(col.ID)).Width(width).FillHeight().
 		Padding(t.Space(2.5)).Gap(t.Space(2)).Radius(t.Radius+4).
-		Background(colFace(t)).Border(1, t.Border)
+		Background(colFace(t)).Border(1, panelBorder(t)).
+		Role(ui.RoleGroup).
+		Label(fmt.Sprintf("%s列，%d 个任务", col.Name, len(tasks)))
 
 	if _, over := ui.DragOver[cardDrag](panel); over {
 		panel.Border(2, t.Accent)
@@ -241,8 +273,8 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 			ui.Column(c).FillWidth().Gap(t.Space(2)).Padding(0, 0, t.Space(6), 0).
 				FocusGroup(ui.Vertical).Label(col.Name + "列任务").Children(func() {
 				if len(tasks) == 0 {
-					ui.Box(c).FillWidth().Padding(t.Space(3)).Radius(t.Radius).
-						BorderWidth(1).BorderColor(t.Border).BorderStyle(ui.BorderDashed).Children(func() {
+					ui.Box(c).FillWidth().MinHeight(64).Padding(t.Space(3)).Radius(t.Radius).
+						BorderWidth(1).BorderColor(dashedBorder(t)).BorderStyle(ui.BorderDashed).Children(func() {
 						ui.Text(c, "还没有任务").FontSize(fsm(t)).TextColor(t.TextMuted)
 					})
 					return
@@ -373,8 +405,8 @@ func (b *board) cardView(c *ui.Context, t *ui.Theme, task *model.Task) {
 			if task.UpdatedBy != "" && task.UpdatedBy != "local" {
 				ui.Text(c, task.UpdatedBy).FontSize(fxs(t)).TextColor(t.TextMuted)
 			}
-			if b.savingID == task.ID {
-				loading.LinearDots(c, loading.Options{Size: 10, Color: t.TextMuted}).Label("正在保存任务")
+			if b.savingID == task.ID && (b.detail == nil || b.detail.id != task.ID) {
+				loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
 			}
 			ui.Text(c, stamp(task.UpdatedAt)).FontSize(fxs(t)).TextColor(t.TextMuted)
 		})
@@ -426,6 +458,13 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					open = false
 				}
 			})
+			if d.pushed != nil && d.dirty() {
+				ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, fmt.Sprintf("该任务已被 %s 更新到 v%d，你的编辑尚未保存。",
+						agentName(d.pushBy), d.pushed.Version)).
+						FontSize(fsm(t)).TextColor(t.Warning)
+				})
+			}
 
 			ui.Field(c, "标题", func() {
 				ui.TextInput(c, &d.title).Label("任务标题").AutoFocus()
@@ -453,7 +492,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 			ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "评论").FontSize(fsm(t)).FontWeight(600).TextColor(t.TextMuted)
 				if d.loading {
-					loading.BouncingDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入评论")
+					loading.LinearDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入评论")
 				}
 			})
 			if len(d.comments) == 0 && !d.loading {
@@ -518,50 +557,23 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 
 // --- forms ---
 
-func (b *board) openForm(kind string) {
-	f := &form{open: true, kind: kind}
-	if kind == "task" && len(b.columns) > 0 {
-		f.column = b.columns[0].Name
-	}
-	b.form = f
-}
+func (b *board) openForm() { b.form = &form{open: true} }
 
 func (b *board) formView(c *ui.Context, t *ui.Theme) {
 	f := b.form
 	open := f.open
-	title := "新建任务"
-	if f.kind == "project" {
-		title = "新建项目"
-	}
 	ui.Modal(c, &open, func() {
 		ui.Column(c).Width(t.Space(80)).Gap(t.Space(3)).Children(func() {
-			ui.Text(c, title).FontSize(fmd(t)).FontWeight(600)
-			if f.kind == "project" {
-				ui.Field(c, "项目名", func() {
-					ui.TextInput(c, &f.name).Label("项目名").AutoFocus()
-				})
-			} else {
-				ui.Field(c, "标题", func() {
-					ui.TextInput(c, &f.title).Label("任务标题").AutoFocus()
-				})
-				ui.Field(c, "正文", func() {
-					ui.TextArea(c, &f.body).Label("任务正文").MinHeight(80)
-				})
-				ui.Field(c, "列", func() {
-					ui.Select(c, &f.column, b.columnNames()).Label("任务所在列")
-				})
-			}
+			ui.Text(c, "新建项目").FontSize(fmd(t)).FontWeight(600)
+			ui.Field(c, "项目名", func() {
+				ui.TextInput(c, &f.name).Label("项目名").AutoFocus()
+			})
 			ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
 				if ui.Button(c, "取消").Clicked() {
 					open = false
 				}
-				label := "创建"
-				if f.kind == "project" {
-					if ui.PrimaryButton(c, label).Clicked() {
-						b.createProject()
-					}
-				} else if ui.PrimaryButton(c, label).Clicked() {
-					b.createTask()
+				if ui.PrimaryButton(c, "创建").Clicked() {
+					b.createProject()
 				}
 			})
 		})
