@@ -1,0 +1,243 @@
+# 视觉与交互规格（MyGo 原生看板 v0）
+
+范围：`cmd/taskboard` 单窗口原生看板。所有度量可写进代码；所有颜色只能来自 `ui.Theme` 字段，
+所有控件必须是 `mygo/ui` 与 `plugins/loading` 里真实存在的构造函数（见文末核对清单）。
+文案全中文。术语：`t := c.Theme()`，`s(n) := t.Space(n)`（Spacing=4，即 s(1)=4）；`s1`…`s8` 是间距 token 名。
+
+## 1. 窗口与布局网格
+
+| 项 | 值 | 实现 |
+| --- | --- | --- |
+| 窗口 | 1280×800，最小 960×560 | `mygo.NewWindow(WindowOptions{Width:1280, Height:800, MinWidth:960, MinHeight:560, Content: ui.View(a.view)})` |
+| 标题栏 | 系统标题栏（默认样式） | 不设 `TitleBarStyle`；视图自绘的顶栏不承担拖窗 |
+| 顶栏高 | 52 | `ui.Row(c).Height(52).Padding(0, t.Space(4)).AlignItems(ui.Center)` + 下方 `ui.Divider(c)` |
+| 看板边距 | s4 | `ui.Column(c).Fill().Padding(t.Space(4))` |
+| 列间距 | s3 | `ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Stretch)` |
+| 列宽 | 等分，最小 240，最大 360 | `ui.Column(c).Grow(1).MinWidth(240).MaxWidth(360)` |
+| 列内边距 / 卡片间距 | s2.5 / s2 | `Padding(t.Space(2.5)).Gap(t.Space(2))` |
+| 卡片内边距 / 内部间距 | s3 / s1.5 | `Padding(t.Space(3)).Gap(t.Space(1.5))` |
+| 列头高 | 32 | `ui.Row(c).Height(32).AlignItems(ui.Center).Gap(t.Space(1.5))` |
+| 列尾留白 | s6 | 卡片列表底 `Padding(0, 0, t.Space(6), 0)` |
+
+- 1280 窗口四列各 303（1212 + 3×12 + 2×16 = 1280）；960 窗口降到 240 以下即触发整板横向滚动：
+  外层 `ui.ScrollHorizontal(c).Grow(1)` 管横向，列内 `ui.Scroll(c).Grow(1)` 管纵向，两层各管一个方向。
+- 列数由 `model.Project.Columns` 决定，三到四列是正常形态，**不写死 4**；超过 5 列横向滚动。
+- 顶栏内容：左 `ui.MenuButton` 显示当前项目名（点开为项目列表 + 「新建项目」），中 `ui.Spacer`，
+  右 `ui.Button("刷新")` + `ui.PrimaryButton("新建项目")`，最右同步点（见 §6 第 5 行）。
+
+## 2. Tokens
+
+间距只用 Theme 的 Spacing 刻度（`t.Space(n)`），禁止裸数字。
+
+| Token | 值 | 用途 |
+| --- | --- | --- |
+| s1 | `t.Space(1)` = 4 | 徽标内边、图标与文字、焦点环间距 |
+| s1.5 | `t.Space(1.5)` = 6 | 卡片内部行距、列头元素间距 |
+| s2 | `t.Space(2)` = 8 | 卡片间距、列内卡片间 |
+| s2.5 | `t.Space(2.5)` = 10 | 列面板内边距 |
+| s3 | `t.Space(3)` = 12 | 卡片内边距、列间距、弹层内边距 |
+| s4 | `t.Space(4)` = 16 | 看板边距、顶栏左右边距 |
+| s6 | `t.Space(6)` = 24 | 列尾留白 |
+| s8 | `t.Space(8)` = 32 | 空态上下留白、弹层大间距 |
+
+字号：以 `t.FontSize`（macOS 13 / Windows 14）为基准的相对刻度，写 `.FontSize(...)` 数值。
+
+| Token | 值 | 用途 |
+| --- | --- | --- |
+| f-xs | `t.FontSize-2` | 徽标数字、版本号、评论计数 |
+| f-sm | `t.FontSize-1` | 卡片摘要、时间、占位文案、错误说明 |
+| f-base | `t.FontSize` | 正文、卡片标题（+`FontWeight(500)`）、按钮、输入框、列名（+`FontWeight(600)`） |
+| f-md | `t.FontSize+2` | 弹层标题、顶栏项目名（+`FontWeight(500)`） |
+| f-lg | `t.FontSize+7` | 空态标题、初次加载标题（+`FontWeight(600)`） |
+
+圆角：卡片/按钮/输入框 = `t.Radius`（6）；列面板/弹层面板 = `t.Radius+4`（10）；徽标用 `ui.Badge` 自带 999。
+
+描边：一律 1 DIP `t.Border`；悬停态卡片 `t.Border.Mix(t.Text, 0.22)`；拖动落点 `2` DIP `t.Accent`；
+不使用渐变色、不使用 `ui.Hex`/`ui.RGBA` 自造颜色（唯一例外：拖动浮层阴影 `RGBA(0,0,0,0.18)`）。
+
+背景层级（每个角色只从 Theme 的相邻两档取一档）：
+
+| 层 | 角色 | 明 | 暗 |
+| --- | --- | --- | --- |
+| L0 | 窗口、看板底、顶栏 | `t.Background` | `t.Background` |
+| L1 | 列面板 | `t.Surface` | `t.Background` |
+| L2 | 卡片静止 | `t.Background` | `t.Surface` |
+| L2h | 卡片悬停 | `t.Surface` | `t.SurfaceHover` |
+| L2p | 卡片按下 | `t.SurfacePressed` | `t.SurfacePressed` |
+
+写成三个取值函数并由 `t.Dark` 分支，避免明暗两套写死的常量：`colFace(t)`、`cardFace(t)`、`cardHover(t)`。
+弹层（`ui.Modal`）用框架自带外观；遮罩、阴影由 Modal 负责，不另加。
+
+## 3. 列 anatomy
+
+```
+Column(padding t.Space(2.5), gap t.Space(2), radius t.Radius+4, border 1 t.Border)   ← colFace(t)
+├─ Row(height 32): Text(列名, f-base, 600).Role(ui.RoleHeading).Level(2) + Spacer + Badge(任务数)
+├─ TextInput(草稿).Placeholder("添加任务，回车创建").Label("在「待办」中添加任务")
+└─ Scroll(grow 1) → Column(gap t.Space(2), padding bottom t.Space(6))
+   └─ 卡片…（以及空态占位，见 §8）
+```
+
+- 列整体可拖放：`ui.DragOver[CardDrag](panel)` 有值时 `panel.Border(2, t.Accent)`；
+  `ui.Drop[CardDrag](panel)` 取到值时用 `panel.PointerPosition()` 的 Y 与各卡片 `Bounds` 判定插入位置
+  （落在某卡下半即排它后面）。判定用的 2 DIP `t.Accent` 插入线高度 2、圆角 1、上下 `Margin(2, 0)`。
+- 列头用 `Role(ui.RoleHeading).Level(2)`，名称就是列名文字本身（RoleHeading 以文字为名，不要再设 Label 覆盖）；
+  列容器本身 `Role(ui.RoleGroup).Label("待办列，3 个任务")`，让读屏进列时一次报出列名 + 计数。
+- 列名不加全大写、不加字距，保持 sentence case 的中文原样。
+
+## 4. 卡片 anatomy
+
+```
+Box(clickable, key=task.ID, radius t.Radius, border 1 t.Border,
+    padding t.Space(3), gap t.Space(1.5), bg cardFace(t)).MinHeight(64)
+├─ Row(gap t.Space(1.5), AlignItems Start): ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).MaxLines(2).Ellipsis("…")
+│        + [task.Version > 1] ui.Badge(c, "v"+strconv.Itoa(task.Version))   ← 版本徽标
+├─ [可选] ui.Text(c, 摘要).FontSize(t.FontSize-1).TextColor(t.TextMuted).MaxLines(2).Ellipsis("…")  ← Description 首两行
+└─ Row(height 20, AlignItems Center, gap t.Space(1.5)):
+     ui.Avatar(c, task.Assignee, nil)（Assignee 为空则不画） + Spacer
+     + [len(task.Comments) > 0] ui.Badge(c, strconv.Itoa(len(task.Comments))).Label("3 条评论")
+     + [task.UpdatedBy ≠ "" && ≠ "local"] ui.Text(c, task.UpdatedBy).FontSize(t.FontSize-2).TextColor(t.TextMuted)   ← 代理徽标用文字
+     + ui.Text(c, 相对时间).FontSize(t.FontSize-2).TextColor(t.TextMuted)  ← 保存中换成指示器，见 §6 第 3 行
+```
+
+- 卡片是自定义可点元素：`ui.Box(c.Key(task.ID)).Focusable().Cursor(ui.CursorPointer)
+  .Role(ui.RoleButton).Label("打开任务：" + task.Title)`，用 `.Clicked()` 判定；
+  `Focusable` + `Clicked` 让它自动可被 Enter/Space 激活。
+- 正文只在详情里编辑，卡片上只显示不编辑（避免误触与二次焦点）。
+- 卡片不显示完整评论内容，只显示计数；评论列表在详情弹层。
+
+## 5. 交互
+
+| 动作 | 规格 |
+| --- | --- |
+| 卡片悬停 | 背景 `cardHover(t)`、描边 `t.Border.Mix(t.Text, 0.22)`，`ElementTransition{Duration: 200*time.Millisecond, Colors: true}` 变色 |
+| 卡片按下 | 背景 `t.SurfacePressed`；按下即 `CursorPointer` 已设，不做缩放 |
+| 卡片点击 | 打开详情：`ui.Modal(c, &a.detailOpen, …)`，点击遮罩 / Escape 关闭 |
+| 键盘焦点 | 保留默认焦点环（`t.Focus` 绘制），不 `FocusRing(false)`；每列卡片组 `FocusGroup(ui.Vertical).Label("待办列任务")`，Tab 进列，↑↓ 选卡，Enter 打开 |
+| 拖动 | 卡片 `.Drag(CardDrag(task.ID))`；拖动中 `Dragging()` 为真 → `Opacity(0.4)`；落点由 `Drop`/`DragOver` 决定；失败回滚到推送前位置 |
+| 右键移动 | 卡片 `.ContextMenu(func(m *ui.Menu){…})`：`m.Submenu("移动到", func(s *ui.Menu){ 每列 s.Item(列名).Checked(当前列).Chosen() })`、`m.Separator()`、`m.Item("打开详情").Chosen()`、`m.Item("归档").Chosen()` |
+| 列内新建 | 列头下方输入框，Enter 提交并清空（保持焦点），Escape 放弃；创建成功后列内顶部插入新卡 |
+| 详情弹层 | 标题 `ui.TextInput`（`Label("任务标题")`）、正文 `ui.TextArea`（`MinHeight(96)`，`Label("任务正文")`）、`ui.Select` 选列（`Label("移动到列")`）、`ui.Button("归档")`（`TextColor(t.Danger)`）；底部 `PrimaryButton("保存")` |
+| 评论 | 列表在上（作者 f-sm 600 + 时间 f-xs `TextMuted` + 正文 f-base）、`ui.Divider` 分隔、输入框 + `PrimaryButton("发送")`；空列表见 §8 |
+| 归档 | 不弹确认：`c.ToastAction("已归档「X」", "撤销", undo)`，撤销走 PATCH 还原 `archived=false` |
+| 变更高亮 | 收到他人更新后 600ms 内把 `AnimateColor("flash", t.Accent.Alpha(0.12), ui.Animation{Duration: 600 * time.Millisecond})` 的目标设为强调色淡底，随后把目标切回 `cardFace(t)`，颜色平滑回落 |
+
+详情弹层的保存是显式的（点「保存」才 PATCH），避免输入过程中每键写服务。
+
+## 6. 加载态映射表
+
+所有指示器必须带中文 `Label`（读屏读作"未知长度的进度指示器"），`ReduceMotion` 下插件自动静止。
+
+| # | 场景 | 指示器 | Size | Color | 中文 Label | 位置与文案 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 初次载入看板 | `loading.Arc` | 20 | `t.TextMuted` | 正在载入看板 | 看板区居中，下方 `ui.Text("正在载入看板…", f-sm, t.TextMuted)` |
+| 2 | 切换项目 | `loading.Ring` | 16 | `t.Accent` | 正在切换项目 | 顶栏项目名右侧内联；旧列内容整体 `Opacity(0.55)`，不清空 |
+| 3 | 保存卡片 | `loading.LinearDots` | 14 | `t.TextMuted` | 正在保存任务 | 卡片右下角时间戳位置；弹层内在「保存」按钮左侧 |
+| 4 | 发评论 | `loading.BouncingDots` | 12 | `t.Accent` | 正在发送评论 | 「发送」按钮左侧内联；输入框 `Disabled(true)` |
+| 5 | SSE 更新后过渡 | `loading.Pulse` | 10 | `t.Accent` | 正在同步更新 | 顶栏最右同步点；静止态是 8×8 `Radius(999)` 的 `t.Success` 圆点，事件到达后换成 Pulse 显示 1.2s（其自身周期）再回静止圆点 |
+| 6 | 服务离线重连 | `loading.Comet` | 12 | `t.Warning` | 正在重新连接本地服务 | 看板上方横幅内 + 文字「本地服务未连接，正在重试…」+ `ui.Button("重试")` |
+| 7 | 归档 | `loading.Arc` | 14 | `t.TextMuted` | 正在归档任务 | 弹层底部按钮行左侧 |
+| 8 | 移动列 | 不用指示器 | — | — | — | 乐观更新 + §9 的过渡；失败才回滚并 `c.Toast` |
+
+同一时刻最多一个全板级指示器（1、6）；2/3/4/5/7 都是行内小尺寸，可并存。
+
+## 7. 明暗主题对照
+
+主题不写死，全部由 `ui.LightTheme()` / `ui.DarkTheme()` 的字段表达；`t.Dark` 只用来在三处结构性差异上分支。
+
+| 角色 | 明（light） | 暗（dark） | 需显式处理 |
+| --- | --- | --- | --- |
+| 窗口 / 顶栏 / 看板底 | `t.Background` | `t.Background` | 否：直接引用 |
+| 列面板 | `t.Surface`（比底略深一档） | `t.Background`（与底同档，靠描边分层） | **是**：`t.Dark` 分支，暗色下若用 `Surface` 会与卡片同色而糊成一片 |
+| 卡片静止 | `t.Background`（浮在列面上） | `t.Surface`（亮一档） | **是**：同上，明暗互换方向 |
+| 卡片悬停 | `t.Surface` | `t.SurfaceHover` | **是**：明色悬停加深，暗色悬停提亮 |
+| 卡片按下 | `t.SurfacePressed` | `t.SurfacePressed` | 否 |
+| 描边 | `t.Border` | `t.Border` | 否；悬停加深用 `t.Border.Mix(t.Text, 0.22)`，明暗都朝文字色靠 |
+| 主文字 / 标题 | `t.Text` | `t.Text` | 否 |
+| 次要文字 / 摘要 / 时间 | `t.TextMuted` | `t.TextMuted` | 否；高对比模式由 Theme 自动加深 |
+| 强调 / 主按钮 / 选中 | `t.Accent`，文字 `t.AccentText` | `t.Accent`，文字 `t.AccentText` | 否（系统强调色由 Theme 的 `follow` 接管） |
+| 危险（归档） | `t.Danger` | `t.Danger` | 否；仅文字色，不做红色填充 |
+| 成功（同步点静止态） | `t.Success` | `t.Success` | 否 |
+| 警告（离线横幅） | `t.Warning.Alpha(0.14)` 底 + `t.Warning` 指示器 | 同 | 否：只调透明度不换色 |
+| 焦点环 | `t.Focus`（Theme 已带透明度） | `t.Focus` | 否；不自绘焦点环 |
+| 滚动条 | `t.Scrollbar` | `t.Scrollbar` | 否 |
+| 拖动浮层 | `Shadow(0, 6, 18, 0, ui.RGBA(0,0,0,0.18))` | 同 | 否：两套主题下都是半透明黑，暗色下也不发白 |
+| Toast / Tooltip | `ui.Toast`，框架用 `t.Inverse` / `t.InverseText` | 同 | 否 |
+
+只有三行需要 `t.Dark` 分支（列面、卡片静止、卡片悬停），写成 `colFace(t)` / `cardFace(t)` / `cardHover(t)` 三个函数，其余一律直接读字段。
+切换主题时不需要重载数据：`Context.Theme()` 每帧返回当前主题，`c.Invalidate()` 由框架在系统外观变化时自动触发。
+
+## 8. 空态与错误态
+
+| 场景 | 内容 |
+| --- | --- |
+| 无项目 | 居中 `Column(gap t.Space(2), PaddingY(t.Space(8)))`：`Text("还没有项目", f-lg, 600)` + `Text("创建第一个项目，开始整理任务。", f-sm, t.TextMuted)` + `PrimaryButton("新建项目")` |
+| 整板无任务 | 每列各自显示占位框：`Box(Padding(t.Space(3)), Radius(t.Radius), Border(1, t.Border)).BorderStyle(ui.BorderDashed)` + `Text("还没有任务", f-sm, t.TextMuted)` |
+| 无评论 | `Text("还没有评论", f-sm, t.TextMuted)`，位于分隔线下、输入框上 |
+| 服务离线 | 横幅：`Row(Padding(0, t.Space(4)), Height(36), Background(t.Warning.Alpha(0.14)))` + 指示器 6 + 文案 + 「重试」；不遮断已载入的列与卡片（只读） |
+| 版本冲突 409 | 拉一次 `GET /api/tasks/{id}` 对齐。本地无未提交编辑 → 静默替换 + `c.Toast("任务已被其他代理更新，已同步最新版本")`；有未提交编辑 → `ui.AlertDialog(c, &a.conflict, "任务已被修改", "「X」已被 <agent> 更新到 v4。", "使用最新版本", "保留我的修改")`，返回 1 时以新 version 重发 PATCH |
+| 请求失败（非 409） | `c.AddToast(ui.Toast{Title:"操作失败", Description: err, Type:"error", Timeout: 6*time.Second})`；不弹模态 |
+
+## 9. 动效
+
+| 变化 | 规格 |
+| --- | --- |
+| 卡片插入 | `Enter: &ui.Motion{Collapse: true, Scale: 0.98}`，200ms `ui.EaseOut` |
+| 卡片删除/归档 | `Exit: &ui.Motion{Collapse: true, Opacity: 0}`，200ms `ui.EaseOut` |
+| 跨列移动 | `Match: cardMatch{task.ID}` 让同一元素从源列滑到目标列；`Position:true, Colors:true, Animation:&ui.Snappy`（500ms 弹簧，Bounce 0.15） |
+| 列内重排 | 每张卡同一 `ElementTransition{Duration:180ms, Ease:ui.EaseOut, Position:true}`，兄弟卡跟手让位 |
+| 他人更新高亮 | `AnimateColor("flash", t.Accent.Alpha(0.12), ui.Animation{Duration: 600 * time.Millisecond})` 后切回 `cardFace(t)` |
+| 详情弹层 | `ui.Modal` 无内置入场动画（遮罩+面板直接出现）；不叠加位移或缩放，只用框架的遮罩 40% 黑 |
+| ReduceMotion | 不自行实现位移（`Transition` 已在此偏好下（`c.Preferences().ReduceMotion`）不动，Enter/Exit 仅就地淡入淡出，颜色仍平滑）；loading 插件自动取静止姿态；自定义 `Animate`/`AnimateTo` 自动直达目标 |
+
+位移类时长一律 ≤300ms（弹簧除外，且只用于跨列；不可用于打开/关闭弹层）。
+不使用 `Loop` 做装饰动画；不允许无限动画（除 loading 指示器）。
+
+## 10. 无障碍
+
+- 每个 loading 必须有 `Label`，文案见 §6 的 Label 列；同一屏内两个指示器的 Label 不得相同。
+- 按钮可读名称（默认文字即名称，图标化时必须显式 `Label`）：
+  刷新看板 / 新建项目 / 项目切换（菜单：项目列表）/ 保存任务 / 归档任务 / 发送评论 / 重试连接 / 关闭详情。
+- 卡片 `Role(ui.RoleButton)` + `Label("打开任务：<标题>")`；列头 `Role(ui.RoleHeading).Level(2)`（以文字为名）；列容器 `Role(ui.RoleGroup)` + `Label("待办列，3 个任务")`。
+- 输入框一律 `Label`：任务标题 / 任务正文 / 移动到列 / 在「待办」中添加任务 / 写评论。
+- 评论计数徽标 `Label("3 条评论")`，否则 `ui.Badge` 的裸数字会被读成孤立数字。
+- 焦点顺序：顶栏（项目 → 刷新 → 新建项目）→ 列 1（新建输入 → 卡片组）→ 列 2 …；弹层打开时焦点进入面板首字段（`AutoFocus()`），关闭后回到原卡片。
+- 仅靠颜色传达的信息必须配文字：离线横幅有文案、版本冲突有弹层标题、保存中有指示器 + Label。
+
+## 11. 反模式（禁止）
+
+1. 禁止 WebView / HTML / CSS 外壳：全部走 `ui` 包原生控件。
+2. 禁止 `ui.Hex`、`ui.RGBA` 自造色值（阴影例外）；明暗差异必须靠 Theme 字段表达。
+3. 禁止在静止卡片、列、按钮上加 `Shadow`；只有拖动浮层与 `ui.Modal` / 菜单这类真正悬浮的东西有阴影。
+4. 禁止轮询：不用 ticker/定时器拉 `/api/tasks`；一切更新来自 SSE。
+5. 禁止 SSE 事件后整表重建或 `c.Invalidate()` 全清：靠 `c.Key` + `Match` 就地更新。
+6. 禁止把列数、列名、种子文案写死在视图里；一律来自 `Board.Columns`。
+7. 禁止裸 `Height(52)` 之类的魔法尺寸散落各处：间距走 `t.Space`，字号走 §2 的 f-* 刻度。
+8. 禁止无 `Label` 的 loading / 无 `Label` 的图标按钮 / 用 emoji 当图标。
+9. 禁止正文小于 `t.FontSize-1`；禁止全大写、字距拉宽的装饰性小标签。
+10. 禁止把完整正文塞进卡片：摘要 `MaxLines(2)`，超出在详情里看。
+11. 禁止在列内再嵌横向滚动，或在整板横向滚动内再套纵向滚动容器（每层只滚一个方向）。
+12. 禁止乐观更新失败后不提示：任何回滚必须伴随 `c.Toast`。
+13. 禁止禁用按钮却不给理由（如「保存」在无改动时应直接不提交，而不是灰着不解释）。
+14. 禁止自定义焦点环或隐藏焦点：一律用框架的 `t.Focus` 环。
+
+## 12. 核对清单（全部已在 mygo v0.6.3 中存在）
+
+本文引用的全部 mygo v0.6.3 标识符，已逐个在模块缓存里 `grep` 核对存在（构造函数在 `ui/api_gen.go`，方法在 `Element`/`Context`，常量在对应源文件，指示器在 `plugins/loading`）。
+
+- 控件：`Box` `Row` `Column` `Text` `Button` `PrimaryButton` `Badge` `Avatar` `Divider` `Spacer` `Scroll`
+  `ScrollHorizontal` `Modal` `AlertDialog` `MenuButton` `Select` `TextInput` `TextArea` `Tooltip`（方法）
+- 元素方法：`Padding` `PaddingY` `Gap` `Grow` `Width` `Height` `MinWidth` `MaxWidth` `MinHeight` `Radius`
+  `Border` `BorderStyle` `Background` `TextColor` `FontSize` `FontWeight` `MaxLines` `Ellipsis` `Opacity` `Fill`
+  `AlignItems` `Label` `Role` `Level` `Focusable` `FocusGroup` `FocusRing` `AutoFocus` `Cursor` `Disabled`
+  `ContextMenu` `Drag` `DragOver` `Drop` `Dragging` `PointerPosition` `Clicked` `Shadow` `Transition`
+  `AnimateColor` `Animate` `AnimateTo`
+- 常量与类型：`ui.Center` `ui.Stretch` `ui.Horizontal` `ui.Vertical` `ui.CursorPointer` `ui.BorderDashed`
+  `ui.RoleButton` `ui.RoleHeading` `ui.RoleGroup` `ui.EaseOut` `ui.Snappy` `ui.Motion` `ui.ElementTransition`
+  `ui.Animation` `ui.Toast`
+- Context：`c.Theme()` `c.Key()` `c.Invalidate()` `c.Toast()` `c.ToastAction()` `c.AddToast()`
+  `c.Preferences().ReduceMotion`
+- loading 插件：`loading.Arc` `loading.Ring` `loading.LinearDots` `loading.BouncingDots` `loading.Pulse`
+  `loading.Comet`、`loading.Options{Size, Color, Easing, Paused}`、`.Label(...)`
+
+共核对 111 个 API 标识符，0 处不存在。未引用的控件（`Table` `Tree` `Calendar` `Tabs` 等）不在本规格内。

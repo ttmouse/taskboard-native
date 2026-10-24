@@ -1,0 +1,550 @@
+// Command taskboard-mcp is the taskboard MCP server: newline-delimited
+// JSON-RPC 2.0 over stdio. Every tool call is an HTTP request to the local
+// taskboard service, so the service stays the only writer.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"taskboard-native/internal/model"
+	"taskboard-native/internal/service"
+)
+
+// protocolVersion is the MCP revision this server implements.
+const protocolVersion = "2025-06-18"
+
+func main() {
+	if err := newServer().serve(os.Stdin, os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "taskboard-mcp: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// newServer builds the stdio server from the environment: TASKBOARD_ADDR
+// locates the service, TASKBOARD_AGENT is the identity on writes.
+func newServer() *server {
+	agent := os.Getenv("TASKBOARD_AGENT")
+	if agent == "" {
+		agent = "mcp"
+	}
+	base := service.DefaultListenAddr()
+	if !strings.HasPrefix(base, "http") {
+		base = "http://" + base
+	}
+	return &server{
+		agent: agent,
+		base:  base,
+		http:  &http.Client{Timeout: 20 * time.Second},
+	}
+}
+
+type server struct {
+	agent string
+	base  string
+	http  *http.Client
+}
+
+// --- JSON-RPC wire types ---
+
+type request struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type response struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Result  any             `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
+}
+
+const (
+	codeParseError     = -32700
+	codeInvalidRequest = -32600
+	codeMethodNotFound = -32601
+	codeInvalidParams  = -32602
+)
+
+// serve reads one JSON-RPC message per line until EOF.
+func (s *server) serve(in io.Reader, out io.Writer) error {
+	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	enc := json.NewEncoder(out)
+	enc.SetEscapeHTML(false)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		resp, ok := s.handleLine(line)
+		if !ok {
+			continue // notification: no response
+		}
+		if err := enc.Encode(resp); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
+}
+
+// handleLine dispatches one message. ok=false means it was a notification.
+func (s *server) handleLine(line []byte) (response, bool) {
+	var req request
+	if err := json.Unmarshal(line, &req); err != nil {
+		return response{JSONRPC: "2.0", Error: &rpcError{Code: codeParseError, Message: "parse error: " + err.Error()}}, true
+	}
+	if req.JSONRPC != "2.0" || req.Method == "" {
+		return response{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: codeInvalidRequest, Message: "invalid request"}}, true
+	}
+	// Notifications (no id) are acknowledged only by doing the work, except
+	// notifications/initialized which needs none.
+	if len(req.ID) == 0 || string(req.ID) == "null" {
+		return response{}, false
+	}
+	result, rpcErr := s.dispatch(req)
+	if rpcErr != nil {
+		return response{JSONRPC: "2.0", ID: req.ID, Error: rpcErr}, true
+	}
+	return response{JSONRPC: "2.0", ID: req.ID, Result: result}, true
+}
+
+func (s *server) dispatch(req request) (any, *rpcError) {
+	switch req.Method {
+	case "initialize":
+		return map[string]any{
+			"protocolVersion": protocolVersion,
+			"capabilities": map[string]any{
+				"tools": map[string]any{"listChanged": false},
+			},
+			"serverInfo": map[string]any{
+				"name":    "taskboard-native",
+				"version": "0.1.0",
+			},
+			"instructions": "本机看板：用 list_projects 找到项目，用 list_tasks 按 projectId 查看卡片，" +
+				"create_task / update_task / move_task / add_comment 写入。写操作需要卡片当前 version。",
+		}, nil
+	case "ping":
+		return map[string]any{}, nil
+	case "tools/list":
+		return map[string]any{"tools": toolDefinitions()}, nil
+	case "tools/call":
+		var params struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, &rpcError{Code: codeInvalidParams, Message: "invalid params: " + err.Error()}
+		}
+		text, err := s.callTool(params.Name, params.Arguments)
+		if err != nil {
+			return map[string]any{
+				"content": []map[string]any{{"type": "text", "text": err.Error()}},
+				"isError": true,
+			}, nil
+		}
+		return map[string]any{
+			"content": []map[string]any{{"type": "text", "text": text}},
+			"isError": false,
+		}, nil
+	case "resources/list":
+		return map[string]any{"resources": []any{}}, nil
+	case "prompts/list":
+		return map[string]any{"prompts": []any{}}, nil
+	default:
+		return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found: " + req.Method}
+	}
+}
+
+func toolDefinitions() []map[string]any {
+	object := func(props map[string]any, required ...string) map[string]any {
+		schema := map[string]any{"type": "object", "properties": props}
+		if len(required) > 0 {
+			schema["required"] = required
+		}
+		// Every schema is closed: unknown arguments are rejected by the API.
+		schema["additionalProperties"] = false
+		return schema
+	}
+	str := func(desc string) map[string]any {
+		return map[string]any{"type": "string", "description": desc}
+	}
+	num := func(desc string) map[string]any {
+		return map[string]any{"type": "integer", "description": desc}
+	}
+	boolean := func(desc string) map[string]any {
+		return map[string]any{"type": "boolean", "description": desc}
+	}
+	return []map[string]any{
+		{
+			"name":        "list_projects",
+			"description": "列出所有看板项目及其列（项目 id 用于后续按项目作用域查询）。",
+			"inputSchema": object(map[string]any{}),
+		},
+		{
+			"name":        "list_tasks",
+			"description": "按项目列出卡片（projectId 必填，作用域限定）。默认只返回未归档卡片。",
+			"inputSchema": object(map[string]any{
+				"projectId":       str("项目 id，必填"),
+				"includeArchived": boolean("是否包含已归档卡片，默认 false"),
+			}, "projectId"),
+		},
+		{
+			"name":        "create_task",
+			"description": "在项目里新建卡片，默认追加到第一列或指定列的末尾。",
+			"inputSchema": object(map[string]any{
+				"projectId":   str("项目 id，必填"),
+				"title":       str("卡片标题，必填"),
+				"columnId":    str("目标列 id 或列名，省略则用项目第一列"),
+				"description": str("卡片正文"),
+				"assignee":    str("负责人"),
+			}, "projectId", "title"),
+		},
+		{
+			"name":        "update_task",
+			"description": "修改卡片字段（乐观并发：必须带当前 version，冲突时返回任务详情）。",
+			"inputSchema": object(map[string]any{
+				"id":          str("卡片 id，必填"),
+				"version":     num("卡片当前 version，必填"),
+				"title":       str("新标题"),
+				"description": str("新正文"),
+				"assignee":    str("新负责人"),
+			}, "id", "version"),
+		},
+		{
+			"name":        "move_task",
+			"description": "把卡片移动到目标列（列名或列 id），可指定放在某张卡之后或列首。",
+			"inputSchema": object(map[string]any{
+				"id":       str("卡片 id，必填"),
+				"version":  num("卡片当前 version，必填"),
+				"columnId": str("目标列 id 或列名，必填"),
+				"afterId":  str("放在该卡片之后；省略表示列末"),
+				"atTop":    boolean("true 时放到列首"),
+			}, "id", "version", "columnId"),
+		},
+		{
+			"name":        "add_comment",
+			"description": "给卡片追加一条评论。",
+			"inputSchema": object(map[string]any{
+				"taskId": str("卡片 id，必填"),
+				"text":   str("评论正文，必填"),
+			}, "taskId", "text"),
+		},
+		{
+			"name":        "list_comments",
+			"description": "列出卡片评论（按时间升序）。",
+			"inputSchema": object(map[string]any{
+				"taskId": str("卡片 id，必填"),
+			}, "taskId"),
+		},
+	}
+}
+
+// callTool runs one tool against the HTTP API and returns raw JSON text.
+func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
+	var args map[string]json.RawMessage
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("arguments must be an object: %w", err)
+		}
+	}
+	if args == nil {
+		args = map[string]json.RawMessage{}
+	}
+	switch name {
+	case "list_projects":
+		return s.get("/api/projects")
+	case "list_tasks":
+		projectID, err := requiredString(args, "projectId")
+		if err != nil {
+			return "", err
+		}
+		includeArchived, err := optionalBool(args, "includeArchived")
+		if err != nil {
+			return "", err
+		}
+		path := "/api/tasks?projectId=" + url.QueryEscape(projectID)
+		if includeArchived {
+			path += "&includeArchived=true"
+		}
+		return s.get(path)
+	case "create_task":
+		projectID, err := requiredString(args, "projectId")
+		if err != nil {
+			return "", err
+		}
+		title, err := requiredString(args, "title")
+		if err != nil {
+			return "", err
+		}
+		columnID, err := optionalString(args, "columnId")
+		if err != nil {
+			return "", err
+		}
+		if columnID != "" {
+			columnID, err = s.resolveColumn(projectID, columnID)
+			if err != nil {
+				return "", err
+			}
+		}
+		body := map[string]any{"projectId": projectID, "title": title, "columnId": columnID}
+		if v, err := optionalString(args, "description"); err != nil {
+			return "", err
+		} else if v != "" {
+			body["description"] = v
+		}
+		if v, err := optionalString(args, "assignee"); err != nil {
+			return "", err
+		} else if v != "" {
+			body["assignee"] = v
+		}
+		return s.send(http.MethodPost, "/api/tasks", body, http.StatusCreated)
+	case "update_task":
+		id, err := requiredString(args, "id")
+		if err != nil {
+			return "", err
+		}
+		version, err := requiredInt(args, "version")
+		if err != nil {
+			return "", err
+		}
+		body := map[string]any{"version": version}
+		for _, field := range []string{"title", "description", "assignee"} {
+			if v, err := optionalString(args, field); err != nil {
+				return "", err
+			} else if v != "" {
+				body[field] = v
+			}
+		}
+		return s.send(http.MethodPatch, "/api/tasks/"+url.PathEscape(id), body, http.StatusOK)
+	case "move_task":
+		id, err := requiredString(args, "id")
+		if err != nil {
+			return "", err
+		}
+		version, err := requiredInt(args, "version")
+		if err != nil {
+			return "", err
+		}
+		want, err := requiredString(args, "columnId")
+		if err != nil {
+			return "", err
+		}
+		target, err := s.task(id)
+		if err != nil {
+			return "", err
+		}
+		columnID, err := s.resolveColumn(target.ProjectID, want)
+		if err != nil {
+			return "", err
+		}
+		body := map[string]any{"version": version, "columnId": columnID}
+		if v, err := optionalString(args, "afterId"); err != nil {
+			return "", err
+		} else if v != "" {
+			body["afterId"] = v
+		}
+		if v, err := optionalBool(args, "atTop"); err != nil {
+			return "", err
+		} else if v {
+			body["atTop"] = true
+		}
+		return s.send(http.MethodPatch, "/api/tasks/"+url.PathEscape(id), body, http.StatusOK)
+	case "add_comment":
+		taskID, err := requiredString(args, "taskId")
+		if err != nil {
+			return "", err
+		}
+		text, err := requiredString(args, "text")
+		if err != nil {
+			return "", err
+		}
+		return s.send(http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/comments", map[string]any{"text": text}, http.StatusCreated)
+	case "list_comments":
+		taskID, err := requiredString(args, "taskId")
+		if err != nil {
+			return "", err
+		}
+		return s.get("/api/tasks/" + url.PathEscape(taskID) + "/comments")
+	default:
+		return "", fmt.Errorf("unknown tool %q", name)
+	}
+}
+
+// --- HTTP helpers ---
+
+func (s *server) get(path string) (string, error) {
+	return s.do(http.MethodGet, path, nil, http.StatusOK)
+}
+
+func (s *server) send(method, path string, body any, want int) (string, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	return s.do(method, path, raw, want)
+}
+
+func (s *server) do(method, path string, body []byte, want int) (string, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, s.base+path, reader)
+	if err != nil {
+		return "", err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("X-Agent", s.agent)
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("service unreachable at %s: %w", s.base, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != want {
+		return "", apiError(resp.StatusCode, raw)
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+// apiError renders an API error body, keeping the current task on conflicts
+// so an agent can retry with the right version.
+func apiError(status int, raw []byte) error {
+	var body struct {
+		Error string      `json:"error"`
+		Task  *model.Task `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil || body.Error == "" {
+		return fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+	}
+	if status == http.StatusConflict && body.Task != nil {
+		cur, _ := json.Marshal(body.Task)
+		return fmt.Errorf("version_conflict: task is at v%d: %s", body.Task.Version, cur)
+	}
+	return fmt.Errorf("HTTP %d: %s", status, body.Error)
+}
+
+func (s *server) task(id string) (model.Task, error) {
+	req, err := http.NewRequest(http.MethodGet, s.base+"/api/tasks/"+url.PathEscape(id), nil)
+	if err != nil {
+		return model.Task{}, err
+	}
+	req.Header.Set("X-Agent", s.agent)
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return model.Task{}, fmt.Errorf("service unreachable at %s: %w", s.base, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return model.Task{}, apiError(resp.StatusCode, raw)
+	}
+	var task model.Task
+	if err := json.Unmarshal(raw, &task); err != nil {
+		return model.Task{}, err
+	}
+	return task, nil
+}
+
+// resolveColumn maps a column id or name in a project to its id.
+func (s *server) resolveColumn(projectID, idOrName string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, s.base+"/api/projects/"+url.PathEscape(projectID)+"/board", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Agent", s.agent)
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("service unreachable at %s: %w", s.base, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", apiError(resp.StatusCode, raw)
+	}
+	var board service.Board
+	if err := json.Unmarshal(raw, &board); err != nil {
+		return "", err
+	}
+	for _, c := range board.Columns {
+		if c.ID == idOrName || c.Name == idOrName {
+			return c.ID, nil
+		}
+	}
+	names := make([]string, 0, len(board.Columns))
+	for _, c := range board.Columns {
+		names = append(names, c.Name)
+	}
+	return "", fmt.Errorf("unknown column %q (available: %s)", idOrName, strings.Join(names, ", "))
+}
+
+// --- argument decoding ---
+
+func requiredString(args map[string]json.RawMessage, key string) (string, error) {
+	v, err := optionalString(args, key)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(v) == "" {
+		return "", fmt.Errorf("%s is required", key)
+	}
+	return v, nil
+}
+
+func optionalString(args map[string]json.RawMessage, key string) (string, error) {
+	raw, ok := args[key]
+	if !ok || string(raw) == "null" {
+		return "", nil
+	}
+	var v string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	return v, nil
+}
+
+func requiredInt(args map[string]json.RawMessage, key string) (int, error) {
+	raw, ok := args[key]
+	if !ok || string(raw) == "null" {
+		return 0, fmt.Errorf("%s is required", key)
+	}
+	var v int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, fmt.Errorf("%s must be an integer", key)
+	}
+	return v, nil
+}
+
+func optionalBool(args map[string]json.RawMessage, key string) (bool, error) {
+	raw, ok := args[key]
+	if !ok || string(raw) == "null" {
+		return false, nil
+	}
+	var v bool
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+	return v, nil
+}
