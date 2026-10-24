@@ -93,7 +93,9 @@ func (s *Store) PatchTask(id string, version int, patch TaskPatch, by string) (m
 	if version != t.Version {
 		return t, &VersionError{Current: t}
 	}
-	restore := patch.Archived != nil && !*patch.Archived
+	// restore un-archives; archived:false on a live card is a plain no-op
+	// patch, so it must not reorder anything.
+	restore := patch.Archived != nil && !*patch.Archived && t.Archived
 	archive := patch.Archived != nil && *patch.Archived
 	if t.Archived && !restore {
 		return t, invalid("task %s is archived", id)

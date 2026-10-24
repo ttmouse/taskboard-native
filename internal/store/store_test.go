@@ -371,6 +371,65 @@ func TestArchiveHidesFromBoard(t *testing.T) {
 	if _, err := s.ArchiveTask(target.ID, archived.Version, "cli"); err == nil {
 		t.Fatalf("double archive succeeded")
 	}
+
+	// archived:false restores the card to the bottom of its column.
+	restore := false
+	restored, err := s.PatchTask(target.ID, archived.Version, TaskPatch{Archived: &restore}, "gui")
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if restored.Archived || restored.Version != archived.Version+1 || restored.UpdatedBy != "gui" {
+		t.Fatalf("restored = %+v", restored)
+	}
+	if ev := events[len(events)-1]; ev.Type != model.EventTaskUpdated || ev.Task == nil || ev.Task.Archived {
+		t.Fatalf("restore event = %+v", ev)
+	}
+	board, err = s.Board("local")
+	if err != nil {
+		t.Fatalf("board after restore: %v", err)
+	}
+	var column []model.Task
+	for _, task := range board.Tasks {
+		if task.ColumnID == restored.ColumnID {
+			column = append(column, task)
+		}
+	}
+	last := column[len(column)-1]
+	if last.ID != target.ID || last.Position != float64(len(column)*1000) {
+		t.Fatalf("restored card sits at %v of %d, want bottom %d", last.Position, len(column), len(column)*1000)
+	}
+
+	// archived:false on a live card changes nothing but the version.
+	noop := false
+	unchanged, err := s.PatchTask(target.ID, restored.Version, TaskPatch{Archived: &noop}, "gui")
+	if err != nil {
+		t.Fatalf("archived:false on live card: %v", err)
+	}
+	if unchanged.Position != restored.Position || unchanged.Version != restored.Version+1 {
+		t.Fatalf("no-op restore moved the card: %+v (was %+v)", unchanged, restored)
+	}
+
+	// archived:true goes through the same patch path and compacts the column.
+	archiveAgain := true
+	reArchived, err := s.PatchTask(target.ID, unchanged.Version, TaskPatch{Archived: &archiveAgain}, "cli")
+	if err != nil {
+		t.Fatalf("archive via patch: %v", err)
+	}
+	if !reArchived.Archived || reArchived.Version != unchanged.Version+1 {
+		t.Fatalf("re-archived = %+v", reArchived)
+	}
+	if ev := events[len(events)-1]; ev.Type != model.EventTaskArchived {
+		t.Fatalf("archive-via-patch event = %s, want task.archived", ev.Type)
+	}
+	board, err = s.Board("local")
+	if err != nil {
+		t.Fatalf("board: %v", err)
+	}
+	for _, task := range board.Tasks {
+		if task.ID == target.ID {
+			t.Fatalf("re-archived card still on board")
+		}
+	}
 }
 
 func TestInvalidInputs(t *testing.T) {

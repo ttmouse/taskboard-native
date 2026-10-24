@@ -248,6 +248,29 @@ func (f *fakeBoard) Archive(id string, version int) (model.Task, error) {
 	return model.Task{}, fmt.Errorf("任务不存在")
 }
 
+func (f *fakeBoard) Restore(id string, version int) (model.Task, error) {
+	f.wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.tasks {
+		t := &f.tasks[i]
+		if t.ID != id {
+			continue
+		}
+		if version != 0 && version != t.Version {
+			return *t, &client.ConflictError{Current: *t}
+		}
+		t.Archived = false
+		t.Version++
+		t.UpdatedAt = f.now
+		t.UpdatedBy = "gui"
+		cp := *t
+		f.emitLocked(model.Event{Type: model.EventTaskUpdated, ProjectID: t.ProjectID, ID: t.ID, Version: t.Version, By: "gui", Task: &cp})
+		return cp, nil
+	}
+	return model.Task{}, fmt.Errorf("任务不存在")
+}
+
 func (f *fakeBoard) Comments(taskID string) ([]model.Comment, error) {
 	f.wait()
 	f.mu.Lock()

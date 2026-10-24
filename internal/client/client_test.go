@@ -140,6 +140,52 @@ func TestBoardLifecycle(t *testing.T) {
 	}
 }
 
+// TestRestoreBringsCardBack checks the undo path over the wire: archive,
+// then clear the flag, and the card is live again in its own column.
+func TestRestoreBringsCardBack(t *testing.T) {
+	_, c := newService(t)
+	projects, err := c.Projects()
+	if err != nil || len(projects) == 0 {
+		t.Fatalf("projects: %v", err)
+	}
+	p := projects[0]
+	task, err := c.CreateTask(p.ID, p.Columns[1].ID, "会被归档再恢复", "", "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	archived, err := c.Archive(task.ID, task.Version)
+	if err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if !archived.Archived {
+		t.Fatal("archive did not mark the task")
+	}
+	board, err := c.Board(p.ID)
+	if err != nil {
+		t.Fatalf("board: %v", err)
+	}
+	if hasTask(board.Tasks, task.ID) {
+		t.Fatal("archived task still listed")
+	}
+	restored, err := c.Restore(task.ID, archived.Version)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if restored.Archived {
+		t.Fatal("restore left the task archived")
+	}
+	if restored.ColumnID != p.Columns[1].ID {
+		t.Fatalf("restored into %q, want %q", restored.ColumnID, p.Columns[1].ID)
+	}
+	board, err = c.Board(p.ID)
+	if err != nil {
+		t.Fatalf("board after restore: %v", err)
+	}
+	if !hasTask(board.Tasks, task.ID) {
+		t.Fatal("restored task is not back on the board")
+	}
+}
+
 func TestResolveColumn(t *testing.T) {
 	_, c := newService(t)
 	projects, err := c.Projects()

@@ -31,6 +31,7 @@ type api interface {
 	Update(id string, version int, title, description, assignee *string) (model.Task, error)
 	Move(id string, version int, toColumn, afterID string, atTop bool) (model.Task, error)
 	Archive(id string, version int) (model.Task, error)
+	Restore(id string, version int) (model.Task, error)
 	Comments(taskID string) ([]model.Comment, error)
 	AddComment(taskID, text string) (model.Comment, error)
 	CreateProject(name string) (model.Project, error)
@@ -618,24 +619,13 @@ func (b *board) archiveTask(id string) {
 	}()
 }
 
-// restore undoes an archive. The service soft-deletes a task and refuses
-// patches to it, so the card comes back as a new one with the same text,
-// in the same column, and the toast says so.
+// restore undoes an archive: the service clears the flag and puts the card
+// back at the bottom of its own column, and the pushed event redraws it.
 func (b *board) restore(t model.Task) {
 	go func() {
-		created, err := b.api.CreateTask(t.ProjectID, t.ColumnID, t.Title, t.Description, t.Assignee)
-		if err != nil {
+		if _, err := b.api.Restore(t.ID, 0); err != nil {
 			b.toast("撤销失败", err.Error())
-			return
 		}
-		if created.ID == "" {
-			return
-		}
-		b.post(func() {
-			if c := b.ctx(); c != nil {
-				c.Toast("已把「" + clip(t.Title, 20) + "」放回原列")
-			}
-		})
 	}()
 }
 

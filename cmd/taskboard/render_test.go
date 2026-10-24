@@ -456,6 +456,25 @@ func TestEditMoveArchiveAndComment(t *testing.T) {
 	if b.task("t-1") != nil {
 		t.Fatal("archived card still on the board")
 	}
+
+	// Undo clears the flag on the service and the pushed event redraws the
+	// card, in the column it was archived from.
+	archivedTask, err := fake.Task("t-1")
+	if err != nil || !archivedTask.Archived {
+		t.Fatalf("archived task = %+v, %v", archivedTask, err)
+	}
+	b.post(func() { b.restore(archivedTask) })
+	waitFor(t, tt, "撤销归档", func() bool { return b.task("t-1") != nil })
+	if tt.HasText("还没有任务") && len(b.tasksIn("c-done")) == 0 {
+		t.Error("restored card did not come back to its column")
+	}
+	restored, err := fake.Task("t-1")
+	if err != nil || restored.Archived {
+		t.Fatalf("restored task = %+v, %v", restored, err)
+	}
+	if restored.ColumnID != "c-done" {
+		t.Fatalf("restored into %q, want its original column c-done", restored.ColumnID)
+	}
 }
 
 // TestProjectSwitchAndQuickAdd checks the project menu switches boards and

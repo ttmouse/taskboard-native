@@ -241,6 +241,7 @@ type TaskPatch struct {
 	ColumnID *string `json:"columnId,omitempty"`
 	AfterID  string  `json:"afterId,omitempty"`
 	AtTop    bool    `json:"atTop,omitempty"`
+	Archived *bool   `json:"archived,omitempty"`
 }
 
 // --- API ---
@@ -393,6 +394,24 @@ func (c *Client) Archive(id string, version int) (model.Task, error) {
 	var t model.Task
 	err := c.do(context.Background(), "POST", "/api/tasks/"+url.PathEscape(id)+"/archive",
 		map[string]int{"version": version}, &t)
+	return t, err
+}
+
+// Restore puts an archived card back: the service clears the flag, bumps
+// the version and places the card at the bottom of its own column. version
+// 0 reads the current one first.
+func (c *Client) Restore(id string, version int) (model.Task, error) {
+	if version == 0 {
+		t, err := c.Task(id)
+		if err != nil {
+			return model.Task{}, err
+		}
+		version = t.Version
+	}
+	live := false
+	var t model.Task
+	err := c.do(context.Background(), "PATCH", "/api/tasks/"+url.PathEscape(id),
+		TaskPatch{Version: version, Archived: &live}, &t)
 	return t, err
 }
 
