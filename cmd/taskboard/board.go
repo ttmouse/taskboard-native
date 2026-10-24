@@ -69,6 +69,10 @@ func (d *detail) dirty() bool {
 	return strings.TrimSpace(d.title) != d.snap.Title || d.body != d.snap.Description
 }
 
+// stale reports whether an agent pushed a newer version while the dialog
+// held unsaved edits, so saving must ask before overwriting either side.
+func (d *detail) stale() bool { return d.dirty() && d.pushed != nil }
+
 // form is a small dialog: a new task or a new project.
 type form struct {
 	open bool
@@ -117,10 +121,11 @@ type board struct {
 
 	drafts map[string]string // columnID → quick-add text
 
-	agent     string
-	streaming bool                 // the SSE reader is running
-	recent    map[string]time.Time // task ID → until when it shows as changed
-	bounds    map[string]ui.Rect
+	agent       string
+	streaming   bool                 // the SSE reader is running
+	recent      map[string]time.Time // task ID → until when it shows as changed
+	bounds      map[string]ui.Rect
+	motionState // empty in production; experiments are build-tagged
 }
 
 func newBoard(a api) *board {
@@ -236,6 +241,7 @@ func (b *board) openProject(id string) {
 				b.columns = bd.Project.Columns
 			}
 			b.detail = nil
+			b.clearMotion()
 			b.sortTasks()
 		})
 	}()
@@ -421,6 +427,7 @@ func (b *board) upsert(t model.Task) bool {
 		if t.Version < b.tasks[i].Version {
 			return false
 		}
+		b.noteMove(b.tasks[i], t)
 		b.tasks[i] = t
 		b.sortTasks()
 		return true
@@ -439,6 +446,7 @@ func (b *board) remove(id string) bool {
 			continue
 		}
 		b.tasks = append(b.tasks[:i], b.tasks[i+1:]...)
+		b.forgetMotion(id)
 		if b.detail != nil && b.detail.id == id {
 			b.detail = nil
 		}
@@ -487,6 +495,7 @@ func (b *board) touchDetail(t model.Task) {
 	b.detail.body = t.Description
 	b.detail.assignee = t.Assignee
 	b.detail.column = b.columnName(t.ColumnID)
+	b.detail.snap = t
 	b.detail.pushed = nil
 }
 
@@ -535,7 +544,7 @@ func (b *board) openDetail(t model.Task) {
 // saveDetail patches the task's text and closes the dialog.
 func (b *board) saveDetail() {
 	d := b.detail
-	if d == nil {
+	if d == nil || b.saving {
 		return
 	}
 	t := b.task(d.id)
@@ -550,32 +559,32 @@ func (b *board) saveDetail() {
 	}
 	body := d.body
 	cur := *t
-	if title == cur.Title && body == cur.Description {
-		// The task moved under this dialog (an agent pushed a newer
-		// version); save what the user typed against the fresh version
-		// instead of silently discarding it.
-		if d.dirty() {
-			b.conflict = &conflict{
-				open:    true,
-				id:      d.id,
-				title:   "任务已被修改",
-				message: fmt.Sprintf("「%s」已被 %s 更新到 v%d。", clip(cur.Title, 20), agentName(cur.UpdatedBy), cur.Version),
-				retry: func(version int) {
-					go func() {
-						if _, err := b.api.Update(cur.ID, version, &title, &body, nil); err == nil {
-							b.post(func() {
-								if b.detail != nil && b.detail.id == cur.ID {
-									b.detail.open = false
-									b.detail = nil
-								}
-							})
-						}
-					}()
-				},
-			}
-			return
-		}
+	if !d.dirty() && title == cur.Title && body == cur.Description {
 		b.detail.open = false
+		return
+	}
+	// Another agent pushed a newer version after this dialog opened: the
+	// base version is stale, so asking is the only safe save. The choice
+	// "keep mine" rewrites against the fresh version.
+	if d.stale() {
+		b.conflict = &conflict{
+			open:    true,
+			id:      d.id,
+			title:   "任务已被修改",
+			message: fmt.Sprintf("「%s」已被 %s 更新到 v%d。", clip(cur.Title, 20), agentName(cur.UpdatedBy), cur.Version),
+			retry: func(version int) {
+				go func() {
+					if _, err := b.api.Update(cur.ID, version, &title, &body, nil); err == nil {
+						b.post(func() {
+							if b.detail != nil && b.detail.id == cur.ID {
+								b.detail.open = false
+								b.detail = nil
+							}
+						})
+					}
+				}()
+			},
+		}
 		return
 	}
 	b.saving = true
@@ -615,6 +624,7 @@ func (b *board) moveTask(id, toColumn, afterID string, atTop bool) {
 	optimistic := cur
 	optimistic.ColumnID = toColumn
 	optimistic.Version++
+	b.previewMovePosition(&optimistic, afterID, atTop)
 	b.replace(optimistic)
 	if b.detail != nil && b.detail.id == id {
 		b.detail.column = b.columnName(toColumn)
@@ -672,7 +682,7 @@ func (b *board) restore(t model.Task) {
 
 func (b *board) sendComment() {
 	d := b.detail
-	if d == nil {
+	if d == nil || b.commenting {
 		return
 	}
 	text := strings.TrimSpace(d.comment)
@@ -686,6 +696,9 @@ func (b *board) sendComment() {
 		b.post(func() {
 			b.commenting = false
 			if err != nil {
+				if b.detail == d && d.comment == "" {
+					d.comment = text
+				}
 				b.toast("评论失败", err.Error())
 			}
 		})
@@ -728,6 +741,7 @@ func (b *board) replace(t model.Task) {
 			if t.Version < b.tasks[i].Version {
 				return
 			}
+			b.noteMove(b.tasks[i], t)
 			b.tasks[i] = t
 			b.sortTasks()
 			return

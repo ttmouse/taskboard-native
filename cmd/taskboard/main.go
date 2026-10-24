@@ -1,3 +1,5 @@
+//go:build !motionplayground
+
 // Command taskboard opens the native kanban window. It starts the local
 // service in-process, then talks to it only over HTTP and SSE: the window
 // holds no database handle and never reads state that did not come from

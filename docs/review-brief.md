@@ -23,6 +23,7 @@ screencapture -x -R$(echo $B | tr ' ' ',') /tmp/tb-review/window.png
 2. 状态：加载态（`TASKBOARD_SLOW=800ms` 启动，观初次载入 Arc + 「正在载入看板…」）、空态（新建空项目）、离线横幅、409 冲突、SSE 就地更新（用 CLI 写入触发）。
 3. 明暗两种外观（系统外观切换或渲染图对照）。
 4. loading 插件使用是否符合规格表（docs/design.md §6）：指示器选型、尺寸、颜色、中文 Label。
+5. 布局自解释（design.md 总则与 §11 第 15、16 条）：无多余次要标签、字段前缀与说明文字，含义由位置、层级、间距、字号表达。
 
 ## 真实数据操作（触发 SSE）
 ```bash

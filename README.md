@@ -34,3 +34,15 @@ go build ./... && go vet ./... && go test ./...
 ```
 
 免窗口渲染图（1280×800，明暗/空态/加载态）：`docs/assets/render/`；验收截图：`docs/assets/review/`。
+
+## 连续 API 动效演示
+
+**动效候选目前只在独立原生 Playground 中比较，尚未验收合入正式窗口。** 打开 `build/playground/darwin-arm64/Taskboard Motion Playground.app`，切换方案并播放同一场景。构建和隔离方式见 [playground/README.md](playground/README.md)。
+
+保持 App 打开，在当前 `local` 项目中运行：
+
+```bash
+python3 scripts/demo-motion.py
+```
+
+脚本通过真实 API 连续新增三张卡片，并以重叠节奏移动到进行中、评审和完成；还包含两卡同时返回不同状态的场景。窗口仅通过 SSE 自动更新。演示会保留这三张任务，不清理既有数据。可用 `--addr` 和 `--project` 指定服务和项目。

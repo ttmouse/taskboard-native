@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"image"
 	"image/png"
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +36,11 @@ func renderDir(t *testing.T) string {
 // save writes the tester's last frame as a PNG and checks its size.
 func save(t *testing.T, tt *ui.Tester, name string) string {
 	t.Helper()
+	return saveFrame(t, tt, name, renderW, renderH)
+}
+
+func saveFrame(t *testing.T, tt *ui.Tester, name string, width, height int) string {
+	t.Helper()
 	path := filepath.Join(renderDir(t), name)
 	f, err := os.Create(path)
 	if err != nil {
@@ -42,8 +49,8 @@ func save(t *testing.T, tt *ui.Tester, name string) string {
 	defer f.Close()
 	img := tt.Image()
 	b := img.Bounds()
-	if b.Dx() != renderW || b.Dy() != renderH {
-		t.Fatalf("%s is %dx%d, want %dx%d", name, b.Dx(), b.Dy(), renderW, renderH)
+	if b.Dx() != width || b.Dy() != height {
+		t.Fatalf("%s is %dx%d, want %dx%d", name, b.Dx(), b.Dy(), width, height)
 	}
 	if err := png.Encode(f, img); err != nil {
 		t.Fatalf("encode %s: %v", path, err)
@@ -104,6 +111,14 @@ func newBoardTester(b *board) *ui.Tester {
 	return ui.NewTester(b.view, renderW, renderH)
 }
 
+// settle frames the view past the board's entrance animation, so a
+// snapshot shows the resting board rather than columns mid-rise.
+func settle(t *testing.T, tt *ui.Tester) {
+	t.Helper()
+	tt.Advance(700 * time.Millisecond)
+	tt.Frame()
+}
+
 // TestRenderBoardLightAndDark renders the full board in both appearances
 // and checks the Chinese chrome is on screen.
 func TestRenderBoardLightAndDark(t *testing.T) {
@@ -113,6 +128,7 @@ func TestRenderBoardLightAndDark(t *testing.T) {
 
 	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
 	waitFor(t, tt, "事件流连接", func() bool { return tt.HasText("实时同步已连接") })
+	settle(t, tt)
 
 	for _, want := range []string{
 		"local", "待办", "进行中", "评审", "完成",
@@ -164,6 +180,7 @@ func TestRenderEmpty(t *testing.T) {
 	tt := newBoardTester(b)
 
 	waitFor(t, tt, "空看板", func() bool { return tt.HasText("还没有任务") })
+	settle(t, tt)
 	if n := strings.Count(strings.Join(tt.Texts(), "\n"), "还没有任务"); n != 4 {
 		t.Fatalf("empty state appears %d times, want one per column (4)", n)
 	}
@@ -530,7 +547,10 @@ func TestDirtyDetailSurvivesPush(t *testing.T) {
 	cp.Version = 8
 	cp.Title = "被代理抢先改的标题"
 	cp.UpdatedBy = "mcp"
-	fake.push(model.Event{Type: model.EventTaskUpdated, ProjectID: "local", ID: cp.ID, Version: 8, By: "mcp", Task: &cp})
+	// external updates the fake's authoritative copy as well as emitting
+	// the event, so a save built on the pre-push version would succeed
+	// against the live service — exactly the real-world hazard.
+	fake.external(cp)
 	waitFor(t, tt, "推送到达看板", func() bool { return b.task("t-1").Version == 8 })
 
 	if b.detail.title != "我正在写的新标题" {
@@ -581,5 +601,166 @@ func TestHoverFaceDiffersFromColumn(t *testing.T) {
 	}
 	if cardFace(light) == colFace(light) {
 		t.Fatal("light resting face equals the column face")
+	}
+}
+
+// TestInsertIndexSlots checks the drop slot logic: a pointer above a
+// card's middle inserts before it, below inserts after, and cards the
+// last frame never measured are skipped.
+func TestInsertIndexSlots(t *testing.T) {
+	b := newBoard(seedBoard())
+	b.bounds = map[string]ui.Rect{
+		"t-1": {X: 0, Y: 100, W: 280, H: 80},
+		"t-2": {X: 0, Y: 190, W: 280, H: 80},
+	}
+	tasks := []model.Task{{ID: "t-1"}, {ID: "t-2"}, {ID: "t-unknown"}}
+
+	cases := []struct {
+		y    float32
+		want int
+	}{
+		{90, 0},  // above the first card
+		{135, 0}, // first card's upper half
+		{145, 1}, // first card's lower half → after it
+		{189, 1}, // second card's upper half
+		{235, 2}, // second card's lower half → after it
+		{400, 2}, // below everything
+	}
+	for _, tc := range cases {
+		if got := b.insertIndex(tasks, tc.y); got != tc.want {
+			t.Errorf("insertIndex(y=%v) = %d, want %d", tc.y, got, tc.want)
+		}
+	}
+}
+
+// The smallest supported window must leave the dialog actions reachable.
+func TestDetailFitsMinimumWindow(t *testing.T) {
+	b := newBoard(seedBoard())
+	tt := ui.NewTester(b.view, 960, 560)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	b.openDetail(*b.task("t-1"))
+	waitFor(t, tt, "评论载入", func() bool { return b.detail != nil && !b.detail.loading })
+	for _, label := range []string{"关闭详情", "发送评论", "保存任务", "归档任务"} {
+		r, ok := tt.Find(label)
+		if !ok || r.Y < 0 || r.Y+r.H > 560 || r.X < 0 || r.X+r.W > 960 {
+			t.Errorf("%s is outside minimum window: %+v (found %v)", label, r, ok)
+		}
+	}
+}
+
+func TestCommentEnterSends(t *testing.T) {
+	fake := seedBoard()
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	b.openDetail(*b.task("t-1"))
+	waitFor(t, tt, "评论载入", func() bool { return b.detail != nil && !b.detail.loading })
+	if err := tt.Click("写评论"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Type("回车发送的评论")
+	tt.Key(0, ui.KeyEnter)
+	waitFor(t, tt, "回车发送", func() bool {
+		comments, _ := fake.Comments("t-1")
+		for _, cm := range comments {
+			if cm.Text == "回车发送的评论" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestRenderDetailSizes(t *testing.T) {
+	for _, size := range []struct {
+		name string
+		w, h int
+		dark bool
+	}{
+		{"detail-light.png", 1280, 800, false},
+		{"detail-dark.png", 1280, 800, true},
+		{"detail-minimum.png", 960, 560, false},
+	} {
+		t.Run(size.name, func(t *testing.T) {
+			b := newBoard(seedBoard())
+			tt := ui.NewTester(b.view, size.w, size.h)
+			tt.SetDark(size.dark)
+			waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+			b.openDetail(*b.task("t-1"))
+			waitFor(t, tt, "评论载入", func() bool { return !b.detail.loading })
+			settle(t, tt)
+			saveFrame(t, tt, size.name, size.w, size.h)
+			// Force the content taller than any viewport. Fixed controls must
+			// remain inside the dialog while only the content scrolls.
+			b.detail.comments = append(b.detail.comments, model.Comment{
+				ID: "long-comment", Author: strings.Repeat("agent-", 30),
+				Text: strings.Repeat("这是一条用于检查滚动边界的长评论。", 100),
+			})
+			tt.Frame()
+			for _, label := range []string{"关闭详情", "写评论", "发送评论", "保存任务", "归档任务"} {
+				r, ok := tt.Find(label)
+				if !ok || r.Y < 0 || r.Y+r.H > float32(size.h) {
+					t.Errorf("long content hides %s: %+v (found %v)", label, r, ok)
+				}
+			}
+			if size.h == 560 {
+				saveFrame(t, tt, "detail-long-minimum.png", size.w, size.h)
+			}
+		})
+	}
+}
+
+type failedCommentAPI struct{ api }
+
+func (f failedCommentAPI) AddComment(string, string) (model.Comment, error) {
+	return model.Comment{}, errors.New("测试服务不可用")
+}
+
+func TestCommentFailureRestoresDraft(t *testing.T) {
+	b := newBoard(failedCommentAPI{seedBoard()})
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+	b.openDetail(*b.task("t-1"))
+	waitFor(t, tt, "评论载入", func() bool { return !b.detail.loading })
+	b.detail.comment = "不能丢失的评论草稿"
+	b.sendComment()
+	if !b.commenting {
+		t.Fatal("send did not enter pending state")
+	}
+	b.detail.comment = "另一次提交"
+	b.sendComment()
+	if b.detail.comment != "另一次提交" {
+		t.Fatal("duplicate submission was not blocked")
+	}
+	b.detail.comment = ""
+	waitFor(t, tt, "失败后恢复草稿", func() bool { return !b.commenting })
+	if b.detail.comment != "不能丢失的评论草稿" {
+		t.Fatalf("failed comment lost draft: %q", b.detail.comment)
+	}
+}
+
+func TestDarkHighContrastPreservesFocus(t *testing.T) {
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	tt.SetDark(true)
+	tt.SetPreferences(ui.Preferences{HighContrast: true})
+	tt.Frame()
+	if b.curTheme.Focus.A != 255 {
+		t.Fatalf("high contrast focus was weakened: alpha %d", b.curTheme.Focus.A)
+	}
+}
+
+func TestRenderBoardWindowSizes(t *testing.T) {
+	for _, width := range []int{960, 1800} {
+		fake := seedBoard()
+		if width == 960 {
+			fake.tasks[0].Title = strings.Repeat("检查超长任务标题能否省略", 8)
+			fake.tasks[0].UpdatedBy = strings.Repeat("agent-", 30)
+		}
+		b := newBoard(fake)
+		tt := ui.NewTester(b.view, width, 800)
+		waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+		settle(t, tt)
+		saveFrame(t, tt, "board-"+strconv.Itoa(width)+".png", width, 800)
 	}
 }
