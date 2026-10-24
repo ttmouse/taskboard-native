@@ -273,3 +273,11 @@ func fetchBoard(t *testing.T, srv *service.Server) (int, []byte) {
 	raw, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, raw
 }
+
+// TestGlobalFlagsBeforeCommand checks the documented form
+// `tb --agent rams list` parses, not only the flag-after-command form.
+func TestGlobalFlagsBeforeCommand(t *testing.T) {
+	if got := run([]string{"--agent", "rams", "projects", "--addr", "127.0.0.1:1"}); got != exitError {
+		t.Fatalf("global flags before command were not parsed as such; exit=%d", got)
+	}
+}

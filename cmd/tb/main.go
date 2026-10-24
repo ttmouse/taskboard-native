@@ -34,7 +34,26 @@ func run(args []string) int {
 		usage()
 		return exitUsage
 	}
-	cmd, rest := args[0], args[1:]
+	// Global flags may come before the command: tb --agent rams list.
+	i := 0
+	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		switch args[i] {
+		case "-h", "--help":
+			usage()
+			return exitOK
+		case "--agent", "--addr":
+			i += 2
+		default:
+			i++
+		}
+	}
+	if i >= len(args) {
+		usage()
+		return exitUsage
+	}
+	lead := args[:i]
+	cmd := args[i]
+	rest := append(append([]string{}, lead...), args[i+1:]...)
 	switch cmd {
 	case "help", "-h", "--help":
 		usage()
@@ -62,6 +81,8 @@ func run(args []string) int {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `taskboard CLI
+
+  tb [--agent WHO] [--addr ADDR] <command>
 
   tb projects
   tb list    [--project ID]
