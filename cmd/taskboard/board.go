@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -93,6 +94,7 @@ type board struct {
 	loading    bool // first board in flight
 	switching  bool // another project's board in flight
 	saving     bool
+	savingID   string // task whose text is being saved
 	commenting bool
 	archiving  bool
 	loadErr    string
@@ -535,6 +537,7 @@ func (b *board) saveDetail() {
 		return
 	}
 	b.saving = true
+	b.savingID = cur.ID
 	optimistic := cur
 	optimistic.Title, optimistic.Description = title, body
 	optimistic.Version++
@@ -543,6 +546,7 @@ func (b *board) saveDetail() {
 		_, err := b.api.Update(cur.ID, cur.Version, &title, &body, nil)
 		b.post(func() {
 			b.saving = false
+			b.savingID = ""
 			if err == nil {
 				if b.detail != nil {
 					b.detail.open = false
@@ -614,18 +618,24 @@ func (b *board) archiveTask(id string) {
 	}()
 }
 
-// restore puts an archived card back by patching text with a fresh version.
+// restore undoes an archive. The service soft-deletes a task and refuses
+// patches to it, so the card comes back as a new one with the same text,
+// in the same column, and the toast says so.
 func (b *board) restore(t model.Task) {
 	go func() {
-		fresh, err := b.api.Task(t.ID)
+		created, err := b.api.CreateTask(t.ProjectID, t.ColumnID, t.Title, t.Description, t.Assignee)
 		if err != nil {
 			b.toast("撤销失败", err.Error())
 			return
 		}
-		title, body := fresh.Title, fresh.Description
-		if _, err := b.api.Update(fresh.ID, fresh.Version, &title, &body, nil); err != nil {
-			b.toast("撤销失败", err.Error())
+		if created.ID == "" {
+			return
 		}
+		b.post(func() {
+			if c := b.ctx(); c != nil {
+				c.Toast("已把「" + clip(t.Title, 20) + "」放回原列")
+			}
+		})
 	}()
 }
 
@@ -720,7 +730,7 @@ func (b *board) replace(t model.Task) {
 // else says so. retry resends with the server's version.
 func (b *board) recover(id string, err error, retry func(version int)) {
 	var ce *client.ConflictError
-	if !asConflict(err, &ce) {
+	if !errors.As(err, &ce) {
 		b.toast("操作失败", err.Error())
 		if fresh, ferr := b.api.Task(id); ferr == nil {
 			b.post(func() { b.replace(fresh) })
@@ -759,20 +769,4 @@ func clip(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
-}
-
-// conflictError extracts a ConflictError without importing errors twice.
-func asConflict(err error, out **client.ConflictError) bool {
-	for err != nil {
-		if ce, ok := err.(*client.ConflictError); ok {
-			*out = ce
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }

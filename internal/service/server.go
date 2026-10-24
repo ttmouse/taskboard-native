@@ -355,6 +355,7 @@ type taskPatch struct {
 	ColumnID    *string `json:"columnId"`
 	AfterID     string  `json:"afterId"`
 	AtTop       bool    `json:"atTop"`
+	Archived    *bool   `json:"archived"`
 }
 
 func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
@@ -372,6 +373,7 @@ func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
 		Assignee:    req.Assignee,
 		AfterID:     req.AfterID,
 		AtTop:       req.AtTop,
+		Archived:    req.Archived,
 	}
 	// An empty columnId means "leave the column alone", which lets clients
 	// send a uniform patch body.

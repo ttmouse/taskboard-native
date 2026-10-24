@@ -1,7 +1,9 @@
 package main
 
 import (
+	"image"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,6 +49,41 @@ func save(t *testing.T, tt *ui.Tester, name string) string {
 		t.Fatalf("encode %s: %v", path, err)
 	}
 	return path
+}
+
+// meanLuma is the average brightness of an image, 0 (black) to 1 (white).
+func meanLuma(img *image.RGBA) float64 {
+	b := img.Bounds()
+	var sum float64
+	n := 0
+	for y := b.Min.Y; y < b.Max.Y; y += 2 {
+		for x := b.Min.X; x < b.Max.X; x += 2 {
+			r, g, bl, _ := img.At(x, y).RGBA()
+			sum += (0.2126*float64(r) + 0.7152*float64(g) + 0.0722*float64(bl)) / 65535
+			n++
+		}
+	}
+	return sum / float64(n)
+}
+
+// contrastRatio is WCAG's contrast between two colors, 1 to 21.
+func contrastRatio(a, b ui.Color) float64 {
+	la, lb := relLuma(a), relLuma(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
+}
+
+func relLuma(c ui.Color) float64 {
+	ch := func(v uint8) float64 {
+		s := float64(v) / 255
+		if s <= 0.03928 {
+			return s / 12.92
+		}
+		return math.Pow((s+0.055)/1.055, 2.4)
+	}
+	return 0.2126*ch(c.R) + 0.7152*ch(c.G) + 0.0722*ch(c.B)
 }
 
 // waitFor frames the view until cond holds, so background requests land.
@@ -101,6 +138,19 @@ func TestRenderBoardLightAndDark(t *testing.T) {
 		if !tt.HasText(want) {
 			t.Errorf("dark frame lacks %q", want)
 		}
+	}
+	// The dark appearance must really be dark: a light card face under
+	// light text would be unreadable, so check both the frame's overall
+	// brightness and the card's contrast against its text.
+	if got := meanLuma(tt.Image()); got > 0.25 {
+		t.Errorf("dark frame has mean brightness %.2f, want under 0.25", got)
+	}
+	dark := ui.DarkTheme()
+	if got := contrastRatio(dark.Text, cardFace(dark)); got < 7 {
+		t.Errorf("dark card contrast is %.1f:1, want at least 7:1", got)
+	}
+	if got := contrastRatio(ui.LightTheme().Text, cardFace(ui.LightTheme())); got < 7 {
+		t.Errorf("light card contrast is %.1f:1, want at least 7:1", got)
 	}
 	save(t, tt, "board-dark.png")
 }
@@ -330,4 +380,112 @@ func TestAgentUpdateFlashesCard(t *testing.T) {
 	if _, ok := b.recent["t-2"]; ok {
 		t.Fatal("card still marked as changed after the wash faded")
 	}
+}
+
+// TestEditMoveArchiveAndComment exercises the detail dialog's writes: a
+// title edit is saved with the version the dialog opened with, a column
+// move relocates the card, a comment is posted, and archive removes it.
+func TestEditMoveArchiveAndComment(t *testing.T) {
+	fake := seedBoard()
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+
+	if err := tt.Click("把看板接上 SSE"); err != nil {
+		t.Fatalf("click card: %v", err)
+	}
+	tt.Frame()
+
+	// Editing the title and saving patches the service.
+	b.detail.title = "把看板接上 SSE（已改）"
+	if err := tt.Click("保存"); err != nil {
+		t.Fatalf("click save: %v", err)
+	}
+	waitFor(t, tt, "标题保存", func() bool {
+		task, err := fake.Task("t-1")
+		return err == nil && task.Title == "把看板接上 SSE（已改）"
+	})
+	waitFor(t, tt, "弹层关闭", func() bool { return b.detail == nil })
+	if !tt.HasText("把看板接上 SSE（已改）") {
+		t.Errorf("board does not show the new title; texts: %v", tt.Texts())
+	}
+
+	// Reopening and choosing another column moves the card.
+	if err := tt.Click("把看板接上 SSE（已改）"); err != nil {
+		t.Fatalf("reopen card: %v", err)
+	}
+	tt.Frame()
+	b.detail.column = "完成"
+	b.post(func() {
+		if colID := b.columnID("完成"); colID != "" {
+			b.moveTask("t-1", colID, "", false)
+		}
+	})
+	waitFor(t, tt, "移动列", func() bool {
+		task, err := fake.Task("t-1")
+		return err == nil && task.ColumnID == "c-done"
+	})
+
+	// A comment posts, and shows up in the detail.
+	b.detail.comment = "已从窗口发送"
+	if err := tt.Click("发送"); err != nil {
+		t.Fatalf("click send: %v", err)
+	}
+	waitFor(t, tt, "评论发表", func() bool {
+		comments, err := fake.Comments("t-1")
+		if err != nil {
+			return false
+		}
+		for _, cm := range comments {
+			if cm.Text == "已从窗口发送" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Archive removes the card and offers an undo.
+	if err := tt.Click("归档"); err != nil {
+		t.Fatalf("click archive: %v", err)
+	}
+	waitFor(t, tt, "归档", func() bool {
+		task, _ := fake.Task("t-1")
+		return task.Archived
+	})
+	waitFor(t, tt, "归档提示", func() bool { return tt.HasText("撤销") })
+	if b.task("t-1") != nil {
+		t.Fatal("archived card still on the board")
+	}
+}
+
+// TestProjectSwitchAndQuickAdd checks the project menu switches boards and
+// that the column input creates a card.
+func TestProjectSwitchAndQuickAdd(t *testing.T) {
+	fake := seedBoard()
+	fake.projects = append(fake.projects, model.Project{ID: "p-2", Name: "工作",
+		Columns: []model.Column{{ID: "c2-todo", Name: "待办"}}, CreatedAt: fake.now})
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+
+	// The project menu lists both projects and switches on choose.
+	if err := tt.Click("local"); err != nil {
+		t.Fatalf("open project menu: %v", err)
+	}
+	menu := tt.Menu()
+	if len(menu) == 0 {
+		t.Fatalf("project menu is empty")
+	}
+	if err := tt.ChooseMenuItem("工作"); err != nil {
+		t.Fatalf("choose project: %v", err)
+	}
+	waitFor(t, tt, "切换项目", func() bool { return b.cur == "p-2" })
+	if tt.HasText("把看板接上 SSE") {
+		t.Error("old project's cards survived the switch")
+	}
+
+	// The quick-add input creates a card in that column.
+	b.drafts["c2-todo"] = "从列内新建的卡片"
+	b.post(func() { b.createTop("c2-todo", "从列内新建的卡片") })
+	waitFor(t, tt, "列内新建", func() bool { return tt.HasText("从列内新建的卡片") })
 }

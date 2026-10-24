@@ -125,10 +125,6 @@ func cmdList(args []string) int {
 		}
 		projectID = projects[0].ID
 	}
-	tasks, err := c.tasks(projectID)
-	if err != nil {
-		return fail(err)
-	}
 	board, err := c.board(projectID)
 	if err != nil {
 		return fail(err)
@@ -137,7 +133,7 @@ func cmdList(args []string) int {
 	for _, col := range board.Columns {
 		names[col.ID] = col.Name
 	}
-	for _, t := range tasks {
+	for _, t := range board.Tasks {
 		column := names[t.ColumnID]
 		if column == "" {
 			column = t.ColumnID
@@ -508,11 +504,6 @@ func (c *client) projects() ([]model.Project, error) {
 func (c *client) board(projectID string) (service.Board, error) {
 	var out service.Board
 	return out, c.get("/api/projects/"+projectID+"/board", &out)
-}
-
-func (c *client) tasks(projectID string) ([]model.Task, error) {
-	var out []model.Task
-	return out, c.get("/api/tasks?projectId="+projectID, &out)
 }
 
 func (c *client) task(id string) (model.Task, error) {

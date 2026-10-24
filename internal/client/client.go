@@ -66,13 +66,12 @@ func (d *Discover) HostPort() string {
 	return ""
 }
 
-// NotRunning reports that no local service answered.
-var NotRunning = errors.New("任务看板服务未运行")
+// ErrNotRunning reports that no local service answered.
+var ErrNotRunning = errors.New("任务看板服务未运行")
 
-// ErrNotRunning is NotRunning under the name the CLI reads.
-var ErrNotRunning = NotRunning
-
-// LoadDiscover reads server.json, then TASKBOARD_ADDR and TASKBOARD_TOKEN.
+// LoadDiscover reads the service's address: server.json (written by a
+// service that announces itself), then TASKBOARD_ADDR, then the default
+// loopback address. Dial checks that something answers there.
 func LoadDiscover() (*Discover, error) {
 	if raw, err := os.ReadFile(filepath.Join(ConfigDir(), "server.json")); err == nil {
 		var d Discover
@@ -83,7 +82,7 @@ func LoadDiscover() (*Discover, error) {
 	if addr := strings.TrimSpace(os.Getenv("TASKBOARD_ADDR")); addr != "" {
 		return &Discover{Addr: addr, Token: os.Getenv("TASKBOARD_TOKEN")}, nil
 	}
-	return nil, NotRunning
+	return &Discover{Addr: DefaultAddr, Token: os.Getenv("TASKBOARD_TOKEN")}, nil
 }
 
 // ConflictError reports a version mismatch; Current is the server's task.
@@ -139,7 +138,7 @@ func Dial(agent string) (*Client, error) {
 	}
 	c := New(d, agent)
 	if _, err := c.Health(); err != nil {
-		return nil, NotRunning
+		return nil, ErrNotRunning
 	}
 	return c, nil
 }
@@ -169,7 +168,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return NotRunning
+		return ErrNotRunning
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
@@ -412,18 +411,6 @@ func (c *Client) AddComment(taskID, text string) (model.Comment, error) {
 	return cm, err
 }
 
-// Bubbles lists the host→deep-link table.
-func (c *Client) Bubbles() ([]model.Bubble, error) {
-	var bs []model.Bubble
-	err := c.get("/api/bubbles", &bs)
-	return bs, err
-}
-
-// SetBubbles replaces the host→deep-link table.
-func (c *Client) SetBubbles(bs []model.Bubble) error {
-	return c.do(context.Background(), "PUT", "/api/bubbles", bs, nil)
-}
-
 // --- SSE ---
 
 // StreamState is how the event stream stands.
@@ -449,46 +436,10 @@ func (s StreamState) String() string {
 	}
 }
 
-// Stream is one subscription to the SSE stream.
-type Stream struct {
-	events chan model.Event
-	ready  chan struct{}
-	states chan StreamState
-	done   chan struct{}
-	once   atomic.Bool
-}
-
-// Events delivers pushed events until Stop.
-func (s *Stream) Events() <-chan model.Event { return s.events }
-
-// Ready fires once per (re)connection, after which the view resyncs.
-func (s *Stream) Ready() <-chan struct{} { return s.ready }
-
-// States reports connection changes.
-func (s *Stream) States() <-chan StreamState { return s.states }
-
-// Stop ends the reader; it is safe to call more than once.
-func (s *Stream) Stop() {
-	if s.once.CompareAndSwap(false, true) {
-		close(s.done)
-	}
-}
-
-// OpenStream starts the reader. It reconnects with exponential backoff,
-// resuming from Last-Event-ID so no event is lost across a drop.
-func (c *Client) OpenStream() *Stream {
-	s := &Stream{
-		events: make(chan model.Event, 256),
-		ready:  make(chan struct{}, 1),
-		states: make(chan StreamState, 16),
-		done:   make(chan struct{}),
-	}
-	go s.run(c, "")
-	return s
-}
-
-// Subscribe is OpenStream scoped to one project, with callbacks instead of
-// channels. It blocks until ctx ends.
+// Subscribe reads the project's events, calling onEvent for each and
+// onState whenever the connection changes. It reconnects with exponential
+// backoff — reset by every connection that stood — resuming from
+// Last-Event-ID so a drop loses nothing, and blocks until ctx ends.
 func (c *Client) Subscribe(ctx context.Context, projectID string, onEvent func(model.Event), onState func(StreamState)) error {
 	var lastID atomic.Int64
 	backoff := 250 * time.Millisecond
@@ -496,14 +447,26 @@ func (c *Client) Subscribe(ctx context.Context, projectID string, onEvent func(m
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if onState != nil {
-			onState(Connecting)
-		}
-		err := c.consume(ctx, projectID, &lastID, onEvent, onState)
+		reached := false
+		c.consume(ctx, projectID, &lastID, func(ev model.Event) {
+			reached = true
+			if onEvent != nil {
+				onEvent(ev)
+			}
+		}, func(st StreamState) {
+			if st == Online {
+				reached = true
+			}
+			if onState != nil {
+				onState(st)
+			}
+		})
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err != nil && onState != nil {
+		if reached {
+			backoff = 250 * time.Millisecond
+		} else if onState != nil {
 			onState(Offline)
 		}
 		select {
@@ -517,86 +480,14 @@ func (c *Client) Subscribe(ctx context.Context, projectID string, onEvent func(m
 	}
 }
 
-func (s *Stream) run(c *Client, projectID string) {
-	var lastID atomic.Int64
-	backoff := 250 * time.Millisecond
-	for {
-		select {
-		case <-s.done:
-			return
-		default:
-		}
-		s.state(Connecting)
-		err := c.consumeStream(s, projectID, &lastID)
-		select {
-		case <-s.done:
-			return
-		default:
-		}
-		if err != nil {
-			s.state(Offline)
-		}
-		select {
-		case <-s.done:
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < 5*time.Second {
-			backoff *= 2
-		}
-	}
-}
-
-// state publishes st without ever blocking the reader.
-func (s *Stream) state(st StreamState) {
-	select {
-	case s.states <- st:
-	default:
-	}
-}
-
-func (c *Client) consumeStream(s *Stream, projectID string, lastID *atomic.Int64) error {
-	return c.consume(context.Background(), projectID, lastID, func(ev model.Event) {
-		select {
-		case s.events <- ev:
-		case <-s.done:
-		}
-	}, func(st StreamState) {
-		s.state(st)
-		if st == Online {
-			select {
-			case s.ready <- struct{}{}:
-			default:
-			}
-		}
-	}, s.done)
-}
-
 // consume runs one connection, calling onEvent per event and onState on
-// every state change, until the stream ends or done closes.
-func (c *Client) consume(ctx context.Context, projectID string, lastID *atomic.Int64, onEvent func(model.Event), onState func(StreamState), done ...<-chan struct{}) error {
-	var stop <-chan struct{}
-	if len(done) > 0 {
-		stop = done[0]
-	}
+// every state change, until the stream ends or ctx ends.
+func (c *Client) consume(ctx context.Context, projectID string, lastID *atomic.Int64, onEvent func(model.Event), onState func(StreamState)) error {
 	u := c.Base + "/api/events"
 	if projectID != "" {
 		u += "?projectId=" + url.QueryEscape(projectID)
 	}
-	reqCtx := ctx
-	var cancel context.CancelFunc
-	if stop != nil {
-		reqCtx, cancel = context.WithCancel(ctx)
-		defer cancel()
-		go func() {
-			select {
-			case <-stop:
-				cancel()
-			case <-reqCtx.Done():
-			}
-		}()
-	}
-	req, err := http.NewRequestWithContext(reqCtx, "GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return err
 	}

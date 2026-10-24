@@ -104,6 +104,9 @@ func (b *board) topBar(c *ui.Context, t *ui.Theme) {
 		if ui.Button(c, "刷新").Label("刷新看板").Clicked() {
 			b.load()
 		}
+		if ui.Button(c, "新建项目").Clicked() {
+			b.openForm("project")
+		}
 		if ui.PrimaryButton(c, "新建任务").Clicked() {
 			b.openForm("task")
 		}
@@ -268,16 +271,23 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, col *model.Column) {
 		title := strings.TrimSpace(draft)
 		if title != "" {
 			b.drafts[col.ID] = ""
-			b.createIn(col.ID, title)
+			b.createTop(col.ID, title)
 		}
 	}
 }
 
-func (b *board) createIn(columnID, title string) {
+// createTop creates a card and lifts it to the head of its column, which
+// is where a quick add puts it.
+func (b *board) createTop(columnID, title string) {
 	proj := b.cur
 	go func() {
-		if _, err := b.api.CreateTask(proj, columnID, title, "", ""); err != nil {
+		t, err := b.api.CreateTask(proj, columnID, title, "", "")
+		if err != nil {
 			b.toast("创建失败", err.Error())
+			return
+		}
+		if _, err := b.api.Move(t.ID, t.Version, columnID, "", true); err != nil {
+			b.toast("新任务未能置顶", err.Error())
 		}
 	}()
 }
@@ -299,13 +309,25 @@ func (b *board) cardView(c *ui.Context, t *ui.Theme, task *model.Task) {
 		Focusable().Cursor(ui.CursorPointer).Role(ui.RoleButton).
 		Label("打开任务：" + task.Title).
 		Drag(cardDrag(task.ID)).Transition(tr)
-	card.Background(b.cardFill(c, t, task.ID))
+	// The fill animates between rest, hover, press and the accent wash a
+	// card shows for a moment after another agent changed it.
+	face := cardFace(t)
 	if card.Hovered() {
-		card.Background(cardHover(t)).Border(1, hoverBorder(t))
+		face = cardHover(t)
+		card.Border(1, hoverBorder(t))
 	}
 	if card.Pressed() {
-		card.Background(t.SurfacePressed)
+		face = t.SurfacePressed
 	}
+	if until, ok := b.recent[task.ID]; ok {
+		if time.Now().Before(until) {
+			face = t.Accent.Alpha(0.12)
+			c.After(time.Until(until))
+		} else {
+			delete(b.recent, task.ID)
+		}
+	}
+	card.Background(card.AnimateColor("face", face, ui.Animation{Duration: 200 * time.Millisecond, Ease: ui.EaseOut}))
 	if card.Dragging() {
 		card.Opacity(0.4)
 	}
@@ -351,6 +373,9 @@ func (b *board) cardView(c *ui.Context, t *ui.Theme, task *model.Task) {
 			if task.UpdatedBy != "" && task.UpdatedBy != "local" {
 				ui.Text(c, task.UpdatedBy).FontSize(fxs(t)).TextColor(t.TextMuted)
 			}
+			if b.savingID == task.ID {
+				loading.LinearDots(c, loading.Options{Size: 10, Color: t.TextMuted}).Label("正在保存任务")
+			}
 			ui.Text(c, stamp(task.UpdatedAt)).FontSize(fxs(t)).TextColor(t.TextMuted)
 		})
 	})
@@ -359,19 +384,6 @@ func (b *board) cardView(c *ui.Context, t *ui.Theme, task *model.Task) {
 	if card.Clicked() {
 		b.openDetail(*task)
 	}
-}
-
-// cardFill is the resting fill, or the accent wash a card shows for a
-// moment after another agent changed it.
-func (b *board) cardFill(c *ui.Context, t *ui.Theme, id string) ui.Color {
-	if until, ok := b.recent[id]; ok {
-		if time.Now().Before(until) {
-			c.After(time.Until(until))
-			return t.Accent.Alpha(0.12)
-		}
-		delete(b.recent, id)
-	}
-	return cardFace(t)
 }
 
 // dropOn turns a drop on a column into a move, using the pointer's Y to
@@ -424,7 +436,11 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 			ui.Field(c, "移动到", func() {
 				names := b.columnNames()
 				if d.column == "" {
-					d.column = b.columnName(b.task(d.id).ColumnID)
+					if t := b.task(d.id); t != nil {
+						d.column = b.columnName(t.ColumnID)
+					} else {
+						d.column = names[0]
+					}
 				}
 				if ui.Select(c, &d.column, names).Label("移动到列").Changed() {
 					if colID := b.columnID(d.column); colID != "" {
@@ -448,6 +464,9 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					ui.Column(c).FillWidth().Gap(t.Space(2)).Children(func() {
 						for i := range d.comments {
 							cm := &d.comments[i]
+							if i > 0 {
+								ui.Divider(c).BorderColor(t.Border)
+							}
 							ui.Column(c).Key("c-" + cm.ID).FillWidth().Gap(2).Children(func() {
 								ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
 									ui.Text(c, cm.Author).FontSize(fsm(t)).FontWeight(600)
@@ -473,9 +492,12 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 			})
 
 			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-				if ui.Button(c, "归档").Label("归档任务").Cursor(ui.CursorPointer).Clicked() {
-					open = false
+				if ui.Button(c, "归档").Label("归档任务").Cursor(ui.CursorPointer).
+					TextColor(t.Danger).Clicked() {
 					b.archiveTask(d.id)
+				}
+				if b.archiving {
+					loading.Arc(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在归档任务")
 				}
 				ui.Spacer(c)
 				if b.saving {
@@ -564,7 +586,7 @@ func (b *board) conflictView(c *ui.Context, t *ui.Theme) {
 	case 1:
 		cf.open = false
 		b.conflict = nil
-		if fresh := b.task(cfTaskID(cf)); fresh != nil && cf.retry != nil {
+		if fresh := b.task(cf.id); fresh != nil && cf.retry != nil {
 			cf.retry(fresh.Version)
 		}
 	}
@@ -572,9 +594,6 @@ func (b *board) conflictView(c *ui.Context, t *ui.Theme) {
 		b.conflict = nil
 	}
 }
-
-// cfTaskID keeps the alert's target addressable without threading it.
-func cfTaskID(cf *conflict) string { return cf.id }
 
 // --- format helpers ---
 
