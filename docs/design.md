@@ -137,6 +137,10 @@ Button(key="project-"+id, name).FillWidth().Radius(t.Radius)
 | L2p | 卡片按下 | `t.SurfacePressed` | `t.SurfacePressed` |
 
 写成三个取值函数并由 `t.Dark` 分支，避免明暗两套写死的常量：`colFace(t)`、`cardFace(t)`、`cardHover(t)`。
+提示气泡（tooltip）不属于上面的层级：它是浮层，用「主题翻转」的 `t.Inverse` 底 + `t.InverseText` 字；
+主题没设 `Inverse`（默认明色主题就是）时取 `tipFace(t)` 的回退 —— `t.Text` 底 + `t.Background` 字。
+不要直接用框架 `Tooltip()` 的默认定位：它把气泡居中挂在锚点上方，评审列 ✓ 的 24×24 芯片会把气泡顶出卡片右缘，
+浮到列间空隙和上一张卡片上（LOCAL-32）。评审 ✓ 的提示由 `approveHint` 挂在芯片左侧、并用 `insideCard` 夹回卡片内。
 弹层（`ui.Modal`）用框架自带外观；遮罩、阴影由 Modal 负责，不另加。
 
 ## 4. 列 anatomy
