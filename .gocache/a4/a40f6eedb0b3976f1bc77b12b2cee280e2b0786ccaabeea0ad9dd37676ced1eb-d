@@ -1,0 +1,12 @@
+./caret.go
+./coretext_darwin.go
+./decoration.go
+./edit.go
+./engine.go
+./join.go
+./lang.go
+./layout.go
+./raster.go
+./rundelegate_darwin.go
+./stub.go
+./rundelegate_darwin_arm64.s

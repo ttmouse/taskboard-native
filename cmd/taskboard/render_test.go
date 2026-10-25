@@ -15,6 +15,7 @@ import (
 	"taskboard-native/internal/client"
 	"taskboard-native/internal/model"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -127,12 +128,12 @@ func TestRenderBoardLightAndDark(t *testing.T) {
 	tt := newBoardTester(b)
 
 	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
-	waitFor(t, tt, "事件流连接", func() bool { return tt.HasText("实时同步已连接") })
+	waitFor(t, tt, "看板列", func() bool { return tt.HasText("待办") })
 	settle(t, tt)
 
 	for _, want := range []string{
 		"local", "待办", "进行中", "评审", "完成",
-		"刷新", "新建项目", "在「待办」中添加任务",
+		"打开设置", "新建项目", // settings icon a11y + sidebar plus
 		"把看板接上 SSE", "原生窗口渲染验收", "版本冲突时拉一次详情对齐",
 		"1 条评论",
 	} {
@@ -179,10 +180,12 @@ func TestRenderEmpty(t *testing.T) {
 	b := newBoard(fake)
 	tt := newBoardTester(b)
 
-	waitFor(t, tt, "空看板", func() bool { return tt.HasText("还没有任务") })
+	waitFor(t, tt, "空看板", func() bool {
+		return tt.HasText("待办") && tt.HasText("完成")
+	})
 	settle(t, tt)
-	if n := strings.Count(strings.Join(tt.Texts(), "\n"), "还没有任务"); n != 4 {
-		t.Fatalf("empty state appears %d times, want one per column (4)", n)
+	if tt.HasText("还没有任务") || tt.HasText("添加任务，或拖入") {
+		t.Fatalf("empty columns should show no reminder; texts: %v", tt.Texts())
 	}
 	for _, want := range []string{"待办", "进行中", "评审", "完成"} {
 		if !tt.HasText(want) {
@@ -495,9 +498,9 @@ func TestEditMoveArchiveAndComment(t *testing.T) {
 	}
 }
 
-// TestProjectSwitchAndQuickAdd checks the project menu switches boards and
+// TestProjectSwitchAndCreateTask checks the project sidebar switches boards and
 // that the column input creates a card.
-func TestProjectSwitchAndQuickAdd(t *testing.T) {
+func TestProjectSwitchAndCreateTask(t *testing.T) {
 	fake := seedBoard()
 	fake.projects = append(fake.projects, model.Project{ID: "p-2", Name: "工作",
 		Columns: []model.Column{{ID: "c2-todo", Name: "待办"}}, CreatedAt: fake.now})
@@ -505,26 +508,24 @@ func TestProjectSwitchAndQuickAdd(t *testing.T) {
 	tt := newBoardTester(b)
 	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
 
-	// The project menu lists both projects and switches on choose.
-	if err := tt.Click("local"); err != nil {
-		t.Fatalf("open project menu: %v", err)
+	// The project sidebar lists both projects; click switches boards.
+	if !tt.HasText("工作") {
+		t.Fatalf("project sidebar missing 工作; texts: %v", tt.Texts())
 	}
-	menu := tt.Menu()
-	if len(menu) == 0 {
-		t.Fatalf("project menu is empty")
-	}
-	if err := tt.ChooseMenuItem("工作"); err != nil {
-		t.Fatalf("choose project: %v", err)
+	if err := tt.Click("切换到项目 工作"); err != nil {
+		// Fall back to visible label if accessibility label differs.
+		if err2 := tt.Click("工作"); err2 != nil {
+			t.Fatalf("choose project: %v / %v", err, err2)
+		}
 	}
 	waitFor(t, tt, "切换项目", func() bool { return b.cur == "p-2" })
 	if tt.HasText("把看板接上 SSE") {
 		t.Error("old project's cards survived the switch")
 	}
 
-	// The quick-add input creates a card in that column.
-	b.drafts["c2-todo"] = "从列内新建的卡片"
-	b.post(func() { b.createTop("c2-todo", "从列内新建的卡片") })
-	waitFor(t, tt, "列内新建", func() bool { return tt.HasText("从列内新建的卡片") })
+	// Creating a card (sidebar/API path) still lands it in the column.
+	b.post(func() { b.createTop("c2-todo", "从侧栏路径新建的卡片") })
+	waitFor(t, tt, "新建卡片", func() bool { return tt.HasText("从侧栏路径新建的卡片") })
 }
 
 // TestDirtyDetailSurvivesPush checks an unsaved edit is not overwritten by
@@ -604,34 +605,8 @@ func TestHoverFaceDiffersFromColumn(t *testing.T) {
 	}
 }
 
-// TestInsertIndexSlots checks the drop slot logic: a pointer above a
-// card's middle inserts before it, below inserts after, and cards the
-// last frame never measured are skipped.
-func TestInsertIndexSlots(t *testing.T) {
-	b := newBoard(seedBoard())
-	b.bounds = map[string]ui.Rect{
-		"t-1": {X: 0, Y: 100, W: 280, H: 80},
-		"t-2": {X: 0, Y: 190, W: 280, H: 80},
-	}
-	tasks := []model.Task{{ID: "t-1"}, {ID: "t-2"}, {ID: "t-unknown"}}
-
-	cases := []struct {
-		y    float32
-		want int
-	}{
-		{90, 0},  // above the first card
-		{135, 0}, // first card's upper half
-		{145, 1}, // first card's lower half → after it
-		{189, 1}, // second card's upper half
-		{235, 2}, // second card's lower half → after it
-		{400, 2}, // below everything
-	}
-	for _, tc := range cases {
-		if got := b.insertIndex(tasks, tc.y); got != tc.want {
-			t.Errorf("insertIndex(y=%v) = %d, want %d", tc.y, got, tc.want)
-		}
-	}
-}
+// Full-height drop projection is covered by TestDragProjectionReflowsAndCancels
+// and TestProjectedDropCommitsDisplayedSlot in motion_test.go.
 
 // The smallest supported window must leave the dialog actions reachable.
 func TestDetailFitsMinimumWindow(t *testing.T) {
@@ -762,5 +737,68 @@ func TestRenderBoardWindowSizes(t *testing.T) {
 		waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
 		settle(t, tt)
 		saveFrame(t, tt, "board-"+strconv.Itoa(width)+".png", width, 800)
+	}
+}
+
+// TestTitleOnlyCards checks the denser card layout hides summary + footer
+// while titles, click-to-open, and the settings sheet stay available.
+func TestTitleOnlyCards(t *testing.T) {
+	dir := t.TempDir()
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+	t.Setenv("TASKBOARD_DB", "")
+
+	fake := seedBoard()
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	summary := "事件到达后就地更新卡片，不轮询、不整表重建。"
+	if !tt.HasText(summary) {
+		t.Fatalf("full card missing description summary %q", summary)
+	}
+	if !tt.HasText("1 条评论") {
+		t.Fatalf("full card missing comment badge")
+	}
+
+	b.prefs.TitleOnlyCards = true
+	tt.Frame()
+	settle(t, tt)
+
+	for _, want := range []string{"把看板接上 SSE", "原生窗口渲染验收", "版本冲突时拉一次详情对齐"} {
+		if !tt.HasText(want) {
+			t.Errorf("title-only frame lacks title %q", want)
+		}
+	}
+	if tt.HasText(summary) {
+		t.Errorf("title-only frame still shows description summary")
+	}
+	if tt.HasText("1 条评论") {
+		t.Errorf("title-only frame still shows comment badge")
+	}
+
+	if err := tt.Click("打开设置"); err != nil {
+		t.Fatalf("click 打开设置: %v", err)
+	}
+	tt.Frame()
+	if !tt.HasText("卡片仅显示标题") {
+		t.Fatalf("settings sheet missing toggle; texts: %v", tt.Texts())
+	}
+	if err := tt.Click("卡片仅显示标题"); err != nil {
+		t.Fatalf("click toggle: %v", err)
+	}
+	tt.Frame()
+	settle(t, tt)
+	if b.prefs.TitleOnlyCards {
+		t.Fatalf("toggle did not turn title-only off")
+	}
+	got := loadUIPrefs()
+	if got.TitleOnlyCards {
+		t.Fatalf("prefs file still has titleOnlyCards=true")
+	}
+	if !tt.HasText(summary) {
+		t.Errorf("full cards should show summary after toggle off")
 	}
 }

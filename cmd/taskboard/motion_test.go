@@ -1,5 +1,3 @@
-//go:build motionplayground
-
 package main
 
 import (
@@ -15,12 +13,12 @@ func TestColumnDropHighlightDoesNotMoveLayout(t *testing.T) {
 	for _, target := range []string{"评审", "完成"} {
 		t.Run(target, func(t *testing.T) {
 			b := newBoard(seedBoard())
-			b.variant = variants[1]
+			configureMotion(b, "B · 柔和弹簧")
 			defer b.stop()
 			tt := newBoardTester(b)
 			waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
 			settle(t, tt)
-			labels := []string{target, "在「" + target + "」中添加任务", "进行中", "在「进行中」中添加任务"}
+			labels := []string{target + "列", "进行中列", "打开任务：原生窗口渲染验收"}
 			before := map[string]ui.Rect{}
 			for _, label := range labels {
 				r, ok := tt.Find(label)
@@ -30,10 +28,10 @@ func TestColumnDropHighlightDoesNotMoveLayout(t *testing.T) {
 				before[label] = r
 			}
 			source, _ := tt.Find("打开任务：把看板接上 SSE")
-			input := before[labels[1]]
+			dest := before[target+"列"]
 			tt.Press(source.X+31, source.Y+23)
 			tt.Move(source.X+43, source.Y+35)
-			tt.Move(input.X+60, input.Y+110)
+			tt.Move(dest.X+60, dest.Y+110)
 			for _, label := range labels {
 				after, _ := tt.Find(label)
 				if after != before[label] {
@@ -41,14 +39,14 @@ func TestColumnDropHighlightDoesNotMoveLayout(t *testing.T) {
 				}
 			}
 			tt.Key(0, ui.KeyEscape)
-			tt.Release(input.X+60, input.Y+110)
+			tt.Release(dest.X+60, dest.Y+110)
 		})
 	}
 }
 
 func TestDragHidesOriginalKeepsPreviewAndRestoresOnCancel(t *testing.T) {
 	b := newBoard(seedBoard())
-	b.variant = variants[1]
+	configureMotion(b, "B · 柔和弹簧")
 	defer b.stop()
 	tt := newBoardTester(b)
 	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
@@ -79,7 +77,7 @@ func TestDragHidesOriginalKeepsPreviewAndRestoresOnCancel(t *testing.T) {
 }
 
 func TestDropStartsAtReleasedPreview(t *testing.T) {
-	for _, variant := range variants[:2] {
+	for _, variant := range testMotionVariants() {
 		for _, tc := range []struct {
 			name, task               string
 			grabX, grabY, endX, endY float32
@@ -87,11 +85,11 @@ func TestDropStartsAtReleasedPreview(t *testing.T) {
 			{"cross-column", "t-1", 31, 23, 720, 470},
 			{"right-to-left", "t-5", 60, 40, 90, 410},
 			{"same-column", "t-1", 30, 20, 170, 480},
-			{"empty-column", "t-1", 230, 35, 1100, 300},
+			{"empty-column", "t-1", 230, 35, 0, 0}, // end filled from 完成 column
 		} {
 			t.Run(variant+"/"+tc.name, func(t *testing.T) {
 				b := newBoard(seedBoard())
-				b.variant = variant
+				configureMotion(b, variant)
 				defer b.stop()
 				tt := newBoardTester(b)
 				waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
@@ -99,10 +97,25 @@ func TestDropStartsAtReleasedPreview(t *testing.T) {
 				label := "打开任务：" + b.task(tc.task).Title
 				source, _ := tt.Find(label)
 				// Grab away from the center: the release must retain this offset.
+				// Clamp into the card — sidebar narrows columns so fixed grabX can miss.
 				grabX, grabY := tc.grabX, tc.grabY
+				if grabX > source.W-8 {
+					grabX = source.W * 0.55
+				}
+				if grabY > source.H-8 {
+					grabY = source.H * 0.35
+				}
 				endX, endY := tc.endX, tc.endY
+				if tc.name == "empty-column" {
+					done, ok := tt.Find("完成列")
+					if !ok {
+						t.Fatal("完成列 not found")
+					}
+					endX, endY = done.X+done.W/2, done.Y+done.H*0.45
+				}
 				tt.Press(source.X+grabX, source.Y+grabY)
 				tt.Move(source.X+grabX+12, source.Y+grabY+12)
+				tt.Move((source.X+endX)/2, (source.Y+endY)/2)
 				tt.Move(endX, endY)
 				tt.Release(endX, endY)
 				after, ok := tt.Find(label)
@@ -143,7 +156,7 @@ func TestDropStartsAtReleasedPreview(t *testing.T) {
 // than disappearing behind its destination column's scroll clip.
 func TestMovingCardStaysVisibleAcrossColumns(t *testing.T) {
 	b := newBoard(seedBoard())
-	b.variant = "B · 柔和弹簧"
+	configureMotion(b, "B · 柔和弹簧")
 	defer b.stop()
 	tt := newBoardTester(b)
 	tt.SetDark(true)
@@ -173,7 +186,7 @@ func TestMovingCardStaysVisibleAcrossColumns(t *testing.T) {
 
 func TestParallelFlightsAndRetarget(t *testing.T) {
 	b := newBoard(seedBoard())
-	b.variant = "B · 柔和弹簧"
+	configureMotion(b, "B · 柔和弹簧")
 	defer b.stop()
 	tt := newBoardTester(b)
 	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
@@ -221,7 +234,7 @@ func TestParallelFlightsAndRetarget(t *testing.T) {
 
 func TestReducedMotionDoesNotLiftCards(t *testing.T) {
 	b := newBoard(seedBoard())
-	b.variant = "B · 柔和弹簧"
+	configureMotion(b, "B · 柔和弹簧")
 	defer b.stop()
 	tt := newBoardTester(b)
 	tt.SetPreferences(ui.Preferences{ReduceMotion: true})
@@ -230,7 +243,7 @@ func TestReducedMotionDoesNotLiftCards(t *testing.T) {
 	card.ColumnID, card.Version = "c-doing", card.Version+1
 	b.post(func() { b.applyEvent(model.Event{Type: model.EventTaskMoved, ProjectID: b.cur, Task: &card}) })
 	tt.Frame()
-	if len(b.flights) != 0 {
+	if len(b.flights) != 0 || len(b.liftedFlights) != 0 {
 		t.Fatal("reduced motion created an overlay flight")
 	}
 }
@@ -239,15 +252,15 @@ func TestDragProjectionReflowsAndCancels(t *testing.T) {
 	for _, target := range []string{"完成", "进行中"} {
 		t.Run(target, func(t *testing.T) {
 			b := newBoard(seedBoard())
-			b.variant = variants[1]
+			configureMotion(b, "B · 柔和弹簧")
 			defer b.stop()
 			tt := newBoardTester(b)
 			waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
 			settle(t, tt)
 			source, _ := tt.Find("打开任务：把看板接上 SSE")
 			sibling, _ := tt.Find("打开任务：对齐设计规格的间距与字号")
-			input, _ := tt.Find("在「" + target + "」中添加任务")
-			x, y := input.X+40, input.Y+input.H+25
+			colRect, _ := tt.Find(target + "列")
+			x, y := colRect.X+40, colRect.Y+80
 			tt.Press(source.X+31, source.Y+23)
 			tt.Move(source.X+43, source.Y+35)
 			tt.Move(x, y)
@@ -290,14 +303,14 @@ func TestProjectedDropCommitsDisplayedSlot(t *testing.T) {
 	for _, target := range []string{"待办", "进行中", "完成"} {
 		t.Run(target, func(t *testing.T) {
 			b := newBoard(seedBoard())
-			b.variant = variants[1]
+			configureMotion(b, "B · 柔和弹簧")
 			defer b.stop()
 			tt := newBoardTester(b)
 			waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
 			settle(t, tt)
 			source, _ := tt.Find("打开任务：把看板接上 SSE")
-			input, _ := tt.Find("在「" + target + "」中添加任务")
-			x, y := input.X+40, input.Y+input.H+350
+			colRect, _ := tt.Find(target + "列")
+			x, y := colRect.X+40, colRect.Y+colRect.H*0.75
 			tt.Press(source.X+31, source.Y+23)
 			tt.Move(source.X+43, source.Y+35)
 			tt.Move(x, y)
@@ -334,7 +347,7 @@ func TestMiddleCardLeavesNoHole(t *testing.T) {
 	f := seedBoard()
 	f.add(model.Task{ID: "t-6", ProjectID: "local", ColumnID: "c-todo", Title: "第三张", Position: 3000, Version: 1})
 	b := newBoard(f)
-	b.variant = variants[1]
+	configureMotion(b, "B · 柔和弹簧")
 	defer b.stop()
 	tt := newBoardTester(b)
 	waitFor(t, tt, "看板载入", func() bool { return b.task("t-6") != nil })
@@ -366,4 +379,165 @@ func TestMiddleCardLeavesNoHole(t *testing.T) {
 	tt.Release(1100, 320)
 	tt.Advance(2 * time.Second)
 	tt.Frame()
+}
+
+func TestActiveCardsStaggerAndNeighborsStayFlat(t *testing.T) {
+	b := newBoard(seedBoard())
+	configureMotion(b, "B · 柔和弹簧")
+	defer b.stop()
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+	settle(t, tt)
+	before := map[string]ui.Rect{}
+	for _, id := range []string{"t-1", "t-2", "t-3", "t-4", "t-5"} {
+		before[id], _ = tt.Find("打开任务：" + b.task(id).Title)
+	}
+	b.post(func() {
+		for _, move := range [][2]string{{"t-1", "c-doing"}, {"t-3", "c-review"}, {"t-5", "c-done"}} {
+			card := *b.task(move[0])
+			card.ColumnID = move[1]
+			card.Version++
+			b.applyEvent(model.Event{Type: model.EventTaskMoved, ProjectID: b.cur, By: b.agent, Task: &card})
+		}
+	})
+	tt.Frame()
+	if len(b.liftedFlights) != 3 {
+		t.Fatalf("want 3 active flights, got %d", len(b.liftedFlights))
+	}
+	at := b.liftedFlights["t-1"].at
+	for i, id := range []string{"t-1", "t-3", "t-5"} {
+		if got := b.liftedFlights[id].at.Sub(at); got != time.Duration(i)*40*time.Millisecond {
+			t.Fatalf("%s starts at %v", id, got)
+		}
+		if b.task(id).ColumnID == map[string]string{"t-1": "c-todo", "t-3": "c-doing", "t-5": "c-review"}[id] {
+			t.Fatal("visual stagger delayed state update")
+		}
+	}
+	// At 32ms only the first card is lifting; at 64ms the second joins;
+	// after 80ms all three overlap rather than waiting for a predecessor.
+	for _, step := range []struct {
+		d       time.Duration
+		started int
+	}{{32 * time.Millisecond, 1}, {32 * time.Millisecond, 2}, {56 * time.Millisecond, 3}} {
+		tt.Advance(step.d)
+		tt.Frame()
+		for i, id := range []string{"t-1", "t-3", "t-5"} {
+			r, _ := tt.Find("打开任务：" + b.task(id).Title)
+			if i < step.started {
+				if r.W <= before[id].W+0.01 || r.Y >= before[id].Y-0.05 {
+					t.Fatalf("%s did not lift at %v: %+v", id, tt.Now().Sub(at), r)
+				}
+			} else if math.Abs(float64(r.X-before[id].X)) > 0.02 || math.Abs(float64(r.Y-before[id].Y)) > 0.02 || math.Abs(float64(r.W-before[id].W)) > 0.02 {
+				t.Fatalf("%s moved before its start: %+v -> %+v", id, before[id], r)
+			}
+		}
+	}
+	for _, id := range []string{"t-2", "t-4"} {
+		if b.liftedFlights[id] != nil {
+			t.Fatalf("passive neighbor %s lifted", id)
+		}
+		r, _ := tt.Find("打开任务：" + b.task(id).Title)
+		if r.W != before[id].W || r.H != before[id].H {
+			t.Fatalf("neighbor %s scaled: %+v -> %+v", id, before[id], r)
+		}
+	}
+	tt.Advance(48 * time.Millisecond)
+	tt.Advance(200 * time.Millisecond)
+	for _, id := range []string{"t-1", "t-3", "t-5"} {
+		r, _ := tt.Find("打开任务：" + b.task(id).Title)
+		if r.X <= before[id].X+20 {
+			t.Fatalf("%s did not travel", id)
+		}
+	}
+	tt.Advance(time.Second)
+	tt.Advance(time.Second)
+	tt.Frame()
+	if len(b.liftedFlights) != 0 || len(b.flights) != 0 {
+		t.Fatal("flight state survived landing")
+	}
+	for _, id := range []string{"t-1", "t-3", "t-5"} {
+		r, _ := tt.Find("打开任务：" + b.task(id).Title)
+		// Scale leftover enlarges; destination column may be narrower with sidebar.
+		if r.W > before[id].W+2 {
+			t.Fatalf("%s stayed enlarged: %+v vs %+v", id, r, before[id])
+		}
+	}
+}
+
+func TestLiftedRetargetKeepsPositionAndElevation(t *testing.T) {
+	for _, elapsed := range []time.Duration{360 * time.Millisecond, 780 * time.Millisecond} {
+		t.Run(elapsed.String(), func(t *testing.T) {
+			b := newBoard(seedBoard())
+			configureMotion(b, "B · 柔和弹簧")
+			defer b.stop()
+			tt := newBoardTester(b)
+			waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+			settle(t, tt)
+			move := func(col string) {
+				card := *b.task("t-1")
+				card.ColumnID = col
+				card.Version++
+				b.post(func() { b.applyEvent(model.Event{Type: model.EventTaskMoved, ProjectID: b.cur, Task: &card}) })
+				tt.Frame()
+			}
+			move("c-doing")
+			for passed := time.Duration(0); passed < elapsed; passed += 12 * time.Millisecond {
+				tt.Advance(12 * time.Millisecond)
+			}
+			label := "打开任务：" + b.task("t-1").Title
+			tt.Frame() // compare both samples at the same virtual time
+			before, _ := tt.Find(label)
+			height := b.liftedFlights["t-1"].elevation
+			move("c-done")
+			after, _ := tt.Find(label)
+			if math.Abs(float64(before.X-after.X)) > 0.02 || math.Abs(float64(before.Y-after.Y)) > 0.02 || math.Abs(float64(before.W-after.W)) > 0.02 {
+				t.Fatalf("retarget jumped: %+v -> %+v", before, after)
+			}
+			if math.Abs(float64(b.liftedFlights["t-1"].elevation-height)) > 0.001 {
+				t.Fatal("retarget jumped in height")
+			}
+			tt.Advance(time.Second)
+			tt.Frame()
+			if len(b.liftedFlights) != 0 {
+				t.Fatal("retarget did not land")
+			}
+		})
+	}
+}
+
+func TestQueuedLiftRetargetKeepsItsSlot(t *testing.T) {
+	b := newBoard(seedBoard())
+	configureMotion(b, "B · 柔和弹簧")
+	defer b.stop()
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+	settle(t, tt)
+	move := func(id, col string) {
+		card := *b.task(id)
+		card.ColumnID = col
+		card.Version++
+		b.applyEvent(model.Event{Type: model.EventTaskMoved, ProjectID: b.cur, Task: &card})
+	}
+	b.post(func() { move("t-1", "c-review"); move("t-2", "c-doing") })
+	tt.Frame()
+	start := b.liftedFlights["t-2"].at
+	end := b.liftedFlights["t-2"].endAt
+	tt.Advance(16 * time.Millisecond)
+	tt.Frame()
+	label := "打开任务：" + b.task("t-2").Title
+	before, _ := tt.Find(label)
+	b.post(func() { move("t-2", "c-done") })
+	tt.Frame()
+	after, _ := tt.Find(label)
+	if b.liftedFlights["t-2"].at != start || b.liftedFlights["t-2"].endAt != end {
+		t.Fatal("queued retarget restarted or shortened its stage clock")
+	}
+	if math.Abs(float64(before.X-after.X)) > 0.02 || math.Abs(float64(before.Y-after.Y)) > 0.02 {
+		t.Fatal("queued retarget jumped")
+	}
+	tt.Advance(2 * time.Second)
+	tt.Frame()
+	if len(b.liftedFlights) != 0 {
+		t.Fatal("queued retarget did not finish")
+	}
 }

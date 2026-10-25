@@ -138,7 +138,8 @@ func (s *server) dispatch(req request) (any, *rpcError) {
 				"version": "0.1.0",
 			},
 			"instructions": "本机看板：用 list_projects 找到项目，用 list_tasks 按 projectId 查看卡片，" +
-				"create_task / update_task / move_task / add_comment 写入。写操作需要卡片当前 version。",
+				"可用 list_tasks(summary=true) 先读卡片摘要，再用 get_task(id) 读取正文和评论。" +
+				"create_project / create_task / update_task / move_task / add_comment 可写入；卡片更新和移动需要当前 version。",
 		}, nil
 	case "ping":
 		return map[string]any{}, nil
@@ -194,16 +195,36 @@ func toolDefinitions() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "list_projects",
-			"description": "列出所有看板项目及其列（项目 id 用于后续按项目作用域查询）。",
+			"description": "列出所有看板项目及其列；配置了工作目录的项目会包含 workspacePath（项目 id 用于后续按项目作用域查询）。",
 			"inputSchema": object(map[string]any{}),
 		},
 		{
+			"name":        "create_project",
+			"description": "创建看板项目。可选 workspacePath 必须是本机已存在的绝对目录；服务负责校验，MCP 不会创建目录或执行任务。",
+			"inputSchema": object(map[string]any{
+				"name":          str("项目名称，必填"),
+				"workspacePath": str("可选的本机绝对目录路径，目录必须已存在"),
+			}, "name"),
+		},
+		{
 			"name":        "list_tasks",
-			"description": "按项目列出卡片（projectId 必填，作用域限定）。默认只返回未归档卡片。",
+			"description": "按项目列出卡片（projectId 必填，作用域限定）。默认只返回未归档卡片；可使用 summary=true 先读摘要，再用 get_task(id) 读取单卡正文和评论。",
 			"inputSchema": object(map[string]any{
 				"projectId":       str("项目 id，必填"),
 				"includeArchived": boolean("是否包含已归档卡片，默认 false"),
+				"columnId":        str("按项目内的列 id 精确筛选"),
+				"assignee":        str("按负责人精确筛选"),
+				"limit":           map[string]any{"type": "integer", "minimum": 1, "maximum": 200, "description": "最多返回条数，范围 1..200"},
+				"offset":          map[string]any{"type": "integer", "minimum": 0, "description": "跳过条数；仅提供 limit 时可使用"},
+				"summary":         boolean("只返回 id、项目/列、标题、版本和更新时间等摘要字段"),
 			}, "projectId"),
+		},
+		{
+			"name":        "get_task",
+			"description": "读取单张卡片完整详情，包括正文和评论。通常先用 list_tasks(summary=true) 找到目标 id，再调用此工具。",
+			"inputSchema": object(map[string]any{
+				"id": str("卡片 id，必填"),
+			}, "id"),
 		},
 		{
 			"name":        "create_task",
@@ -270,6 +291,20 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 	switch name {
 	case "list_projects":
 		return s.get("/api/projects")
+	case "create_project":
+		projectName, err := requiredString(args, "name")
+		if err != nil {
+			return "", err
+		}
+		body := map[string]any{"name": projectName}
+		if hasArgument(args, "workspacePath") {
+			workspacePath, err := optionalString(args, "workspacePath")
+			if err != nil {
+				return "", err
+			}
+			body["workspacePath"] = workspacePath
+		}
+		return s.send(http.MethodPost, "/api/projects", body, http.StatusCreated)
 	case "list_tasks":
 		projectID, err := requiredString(args, "projectId")
 		if err != nil {
@@ -279,11 +314,42 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		path := "/api/tasks?projectId=" + url.QueryEscape(projectID)
-		if includeArchived {
-			path += "&includeArchived=true"
+		query := url.Values{"projectId": []string{projectID}}
+		for _, field := range []string{"columnId", "assignee"} {
+			if hasArgument(args, field) {
+				value, err := optionalString(args, field)
+				if err != nil {
+					return "", err
+				}
+				query.Set(field, value)
+			}
 		}
-		return s.get(path)
+		for _, field := range []string{"limit", "offset"} {
+			if hasArgument(args, field) {
+				value, err := requiredInt(args, field)
+				if err != nil {
+					return "", err
+				}
+				query.Set(field, fmt.Sprintf("%d", value))
+			}
+		}
+		if hasArgument(args, "summary") {
+			summary, err := optionalBool(args, "summary")
+			if err != nil {
+				return "", err
+			}
+			query.Set("summary", fmt.Sprintf("%t", summary))
+		}
+		if includeArchived {
+			query.Set("includeArchived", "true")
+		}
+		return s.get("/api/tasks?" + query.Encode())
+	case "get_task":
+		id, err := requiredString(args, "id")
+		if err != nil {
+			return "", err
+		}
+		return s.get("/api/tasks/" + url.PathEscape(id))
 	case "create_task":
 		projectID, err := requiredString(args, "projectId")
 		if err != nil {
@@ -535,6 +601,11 @@ func requiredInt(args map[string]json.RawMessage, key string) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer", key)
 	}
 	return v, nil
+}
+
+func hasArgument(args map[string]json.RawMessage, key string) bool {
+	raw, ok := args[key]
+	return ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 func optionalBool(args map[string]json.RawMessage, key string) (bool, error) {

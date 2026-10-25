@@ -20,6 +20,7 @@ func main() {
 	variant := flag.String("variant", "B", "animation variant: A, B, C")
 	auto := flag.Bool("autoplay", false, "play the API scenario on launch")
 	compare := flag.Bool("compare", false, "play A, B and C with identical API timings")
+	single := flag.Bool("single", false, "show one card lifting, moving and settling via API")
 	flag.Parse()
 	mygo.App.SetName("Taskboard Motion Playground")
 	dir, err := os.MkdirTemp("", "taskboard-motion-playground-")
@@ -34,6 +35,10 @@ func main() {
 	b := newBoard(client.New(&client.Discover{Addr: srv.Addr}, "playground"))
 	b.variant = variantName(*variant)
 	b.autoStart, b.compare = *auto || *compare, *compare
+	b.singleAuto = *single
+	if *single {
+		b.autoStart, b.compare = false, false
+	}
 	if *compare {
 		b.variant = variants[0]
 	}

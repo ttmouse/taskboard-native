@@ -1,0 +1,67 @@
+{
+  "team_id": "okmuyvbhzhlhl30z69sgp6hm",
+  "lead": "current session; product choices, shared model/store, integration",
+  "maximum_created": 8,
+  "reserved_retries": 2,
+  "workers": [
+    {
+      "label": "read-api",
+      "worker_id": "rhahunll3lt3iiaf86anbq2h",
+      "session_id": "1f990fca-ccf0-46c4-807f-cff424103d61",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "effort": "xhigh",
+      "ownership": "internal/service/**",
+      "status": "accepted",
+      "attempts": 1,
+      "archived": true
+    },
+    {
+      "label": "read-cli",
+      "worker_id": "iygftxos2a9dhpjzqcfj40ns",
+      "session_id": "b560211d-5dbd-41a4-b4b6-9623a37201b1",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "effort": "xhigh",
+      "ownership": "cmd/tb/**",
+      "status": "accepted",
+      "attempts": 1,
+      "archived": true
+    },
+    {
+      "label": "read-mcp",
+      "worker_id": "ubpidmog8jhgce7sflubd23n",
+      "session_id": "344c95c5-324e-43fd-aa78-c11858a52d91",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "effort": "xhigh",
+      "ownership": "cmd/taskboard-mcp/**",
+      "status": "accepted",
+      "attempts": 1,
+      "archived": true
+    },
+    {
+      "label": "read-check",
+      "worker_id": "j9zbl6bds5md9iyjblgrul3j",
+      "session_id": "e3fd3c27-68aa-4b39-ab7f-c84ad7d8562e",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "effort": "high",
+      "ownership": "read-only; docs/agent-read/check.md report only",
+      "status": "accepted",
+      "attempts": 1,
+      "archived": true
+    }
+  ],
+  "validation": [
+    "go test ./...",
+    "go vet ./...",
+    "isolated CLI/MCP/HTTP end-to-end PASS",
+    "live service read-only CLI/MCP/HTTP PASS",
+    "legacy project/task/comment data unchanged after upgrade"
+  ],
+  "result": "completed",
+  "created_count": 4,
+  "upgrades": 0,
+  "retries": 0
+}

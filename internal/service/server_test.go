@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -131,6 +132,125 @@ func TestBoardIsProjectScoped(t *testing.T) {
 	}
 	if status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=nope", "", nil); status != http.StatusNotFound {
 		t.Fatalf("unknown project tasks = %d %s, want 404", status, raw)
+	}
+}
+
+func TestTaskListFiltersPaginationAndSummary(t *testing.T) {
+	srv := start(t)
+	_, raw := request(t, srv, http.MethodGet, "/api/projects/local/board", "", nil)
+	board := decode[Board](t, raw)
+	todo, doing := board.Columns[0].ID, board.Columns[1].ID
+
+	create := func(column, title, description, assignee string) model.Task {
+		t.Helper()
+		status, raw := request(t, srv, http.MethodPost, "/api/tasks", "task-list-test", map[string]any{
+			"projectId": "local", "columnId": column, "title": title, "description": description, "assignee": assignee,
+		})
+		if status != http.StatusCreated {
+			t.Fatalf("create %q = %d %s", title, status, raw)
+		}
+		return decode[model.Task](t, raw)
+	}
+
+	first := create(todo, "Alice one", "private body marker", "alice")
+	second := create(todo, "Alice two", "second body", "alice")
+	_ = create(doing, "Alice other column", "other body", "alice")
+	_ = create(todo, "Bob", "bob body", "bob")
+	status, raw := request(t, srv, http.MethodPost, "/api/tasks/"+first.ID+"/comments", "commenter", map[string]any{"text": "private comment marker"})
+	if status != http.StatusCreated {
+		t.Fatalf("create comment = %d %s", status, raw)
+	}
+
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=alice&limit=1&offset=1", "", nil)
+	page := decode[[]model.Task](t, raw)
+	if status != http.StatusOK || len(page) != 1 || page[0].ID != second.ID {
+		t.Fatalf("filtered page = %d %s", status, raw)
+	}
+
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=missing", "", nil)
+	if got := decode[[]model.Task](t, raw); status != http.StatusOK || len(got) != 0 || !strings.Contains(string(raw), "[]") {
+		t.Fatalf("empty filtered result = %d %s", status, raw)
+	}
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=alice&limit=1&offset=20", "", nil)
+	if got := decode[[]model.Task](t, raw); status != http.StatusOK || len(got) != 0 {
+		t.Fatalf("out-of-range page = %d %s", status, raw)
+	}
+
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=alice&summary=true", "", nil)
+	var summaries []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &summaries); err != nil {
+		t.Fatalf("decode summary %s: %v", raw, err)
+	}
+	if status != http.StatusOK || len(summaries) != 2 {
+		t.Fatalf("summary list = %d %s", status, raw)
+	}
+	wantKeys := map[string]bool{"id": true, "projectId": true, "columnId": true, "title": true, "version": true, "updatedAt": true, "updatedBy": true, "assignee": true}
+	for _, summary := range summaries {
+		if len(summary) != len(wantKeys) {
+			t.Fatalf("summary contains unexpected fields: %s", raw)
+		}
+		for key := range summary {
+			if !wantKeys[key] {
+				t.Fatalf("summary contains unexpected field %q: %s", key, raw)
+			}
+		}
+	}
+	if bytes.Contains(raw, []byte("private body marker")) || bytes.Contains(raw, []byte("private comment marker")) || bytes.Contains(raw, []byte("description")) || bytes.Contains(raw, []byte("comments")) {
+		t.Fatalf("summary leaked task body or comments: %s", raw)
+	}
+
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks/"+first.ID, "", nil)
+	detail := decode[model.Task](t, raw)
+	if status != http.StatusOK || detail.Description != "private body marker" || len(detail.Comments) != 1 || detail.Comments[0].Text != "private comment marker" {
+		t.Fatalf("single-task detail = %d %+v", status, detail)
+	}
+
+	// The no-filter list remains an unpaginated array of full tasks.
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local", "", nil)
+	all := decode[[]model.Task](t, raw)
+	if status != http.StatusOK || len(all) != 7 {
+		t.Fatalf("legacy full list = %d %s", status, raw)
+	}
+	if all[0].ID != board.Tasks[0].ID || all[0].Description == "" {
+		t.Fatalf("legacy list order or full task shape changed: %+v", all[0])
+	}
+}
+
+func TestTaskListRejectsInvalidFiltersAndForeignColumns(t *testing.T) {
+	srv := start(t)
+	cases := []string{
+		"?projectId=local&columnId=",
+		"?projectId=local&limit=",
+		"?projectId=local&limit=0",
+		"?projectId=local&limit=201",
+		"?projectId=local&limit=abc",
+		"?projectId=local&offset=0",
+		"?projectId=local&limit=1&offset=",
+		"?projectId=local&limit=1&offset=-1",
+		"?projectId=local&summary=TRUE",
+		"?projectId=local&summary=1",
+		"?projectId=local&columnId=x&columnId=y",
+		"?projectId=local&assignee=a&assignee=b",
+		"?projectId=local&limit=1&limit=2",
+		"?projectId=local&summary=true&summary=false",
+	}
+	for _, path := range cases {
+		if status, raw := request(t, srv, http.MethodGet, "/api/tasks"+path, "", nil); status != http.StatusBadRequest {
+			t.Errorf("%s = %d %s, want 400", path, status, raw)
+		}
+	}
+
+	status, raw := request(t, srv, http.MethodPost, "/api/projects", "test", map[string]any{"name": "Other project"})
+	if status != http.StatusCreated {
+		t.Fatalf("create other project = %d %s", status, raw)
+	}
+	other := decode[model.Project](t, raw)
+	foreignColumn := other.Columns[0].ID
+	for _, columnID := range []string{"unknown-column", foreignColumn} {
+		path := "/api/tasks?projectId=local&columnId=" + columnID
+		if status, raw := request(t, srv, http.MethodGet, path, "", nil); status != http.StatusBadRequest {
+			t.Fatalf("foreign/unknown column %q = %d %s, want 400", columnID, status, raw)
+		}
 	}
 }
 
@@ -642,7 +762,7 @@ func TestCreateProject(t *testing.T) {
 		t.Fatalf("create project = %d %s", status, raw)
 	}
 	project := decode[model.Project](t, raw)
-	if project.Name != "工作台" || len(project.Columns) != 4 || project.ID == "local" {
+	if project.Name != "工作台" || len(project.Columns) != 4 || project.ID == "local" || project.WorkspacePath != "" {
 		t.Fatalf("project = %+v", project)
 	}
 
@@ -671,5 +791,73 @@ func TestCreateProject(t *testing.T) {
 	}
 	if status, raw := request(t, srv, http.MethodPost, "/api/projects", "", map[string]any{"name": "  "}); status != http.StatusBadRequest {
 		t.Fatalf("blank project name = %d %s, want 400", status, raw)
+	}
+}
+
+func TestCreateProjectWorkspacePathPersistence(t *testing.T) {
+	srv := start(t)
+	workspace := t.TempDir()
+	requestedPath := workspace + string(filepath.Separator) + "."
+	wantPath := filepath.Clean(requestedPath)
+
+	status, raw := request(t, srv, http.MethodPost, "/api/projects", "cli", map[string]any{
+		"name": "Workspace project", "workspacePath": requestedPath,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create project with path = %d %s", status, raw)
+	}
+	created := decode[model.Project](t, raw)
+	if created.WorkspacePath != wantPath {
+		t.Fatalf("created workspacePath = %q, want %q", created.WorkspacePath, wantPath)
+	}
+
+	status, raw = request(t, srv, http.MethodGet, "/api/projects", "", nil)
+	projects := decode[[]model.Project](t, raw)
+	if status != http.StatusOK {
+		t.Fatalf("list projects = %d %s", status, raw)
+	}
+	found := false
+	for _, project := range projects {
+		if project.ID == created.ID {
+			found = true
+			if project.WorkspacePath != wantPath {
+				t.Fatalf("listed workspacePath = %q, want %q", project.WorkspacePath, wantPath)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("created project %q missing from list", created.ID)
+	}
+
+	status, raw = request(t, srv, http.MethodGet, "/api/projects/"+created.ID+"/board", "", nil)
+	var board struct {
+		Project model.Project `json:"project"`
+	}
+	if err := json.Unmarshal(raw, &board); err != nil {
+		t.Fatalf("decode board %s: %v", raw, err)
+	}
+	if status != http.StatusOK || board.Project.WorkspacePath != wantPath {
+		t.Fatalf("board project workspacePath = %d %q, want %q", status, board.Project.WorkspacePath, wantPath)
+	}
+}
+
+func TestCreateProjectRejectsInvalidWorkspacePath(t *testing.T) {
+	srv := start(t)
+	file := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(file, []byte("file"), 0o600); err != nil {
+		t.Fatalf("create test file: %v", err)
+	}
+	cases := []string{
+		"relative/path",
+		filepath.Join(t.TempDir(), "does-not-exist"),
+		file,
+	}
+	for _, path := range cases {
+		status, raw := request(t, srv, http.MethodPost, "/api/projects", "cli", map[string]any{
+			"name": "Invalid workspace", "workspacePath": path,
+		})
+		if status != http.StatusBadRequest {
+			t.Errorf("workspacePath %q = %d %s, want 400", path, status, raw)
+		}
 	}
 }

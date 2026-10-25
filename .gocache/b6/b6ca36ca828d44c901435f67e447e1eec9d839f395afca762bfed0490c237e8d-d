@@ -1,0 +1,6 @@
+./database.go
+./ffi_unix.go
+./library.go
+./native.go
+./sqlite.go
+./wire.go

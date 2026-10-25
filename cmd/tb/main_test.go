@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -202,6 +204,103 @@ func TestCLIStartsServiceWhenDown(t *testing.T) {
 	}
 	// Stop the detached process so it does not outlive the test.
 	killPort(t, addr)
+}
+
+func TestCLIReadAndProjectCommands(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary")
+	}
+	listQueries := make(chan url.Values, 2)
+	createRequests := make(chan map[string]string, 1)
+	const projectJSON = `[{"id":"local","name":"Local","workspacePath":"/tmp/workspace","columns":[{"id":"col-todo","name":"To do"},{"id":"col-doing","name":"Doing"}]}]`
+	const fullTaskJSON = `{"id":"task-1","projectId":"local","columnId":"col-doing","title":"Detailed","description":"Full body\nSecond line","assignee":"Alice","position":1000,"version":3,"archived":false,"comments":[{"id":"comment-1","author":"Bob","text":"Review note","createdAt":"2026-10-25T00:01:00Z"}],"createdAt":"2026-10-25T00:00:00Z","updatedAt":"2026-10-25T00:02:00Z","updatedBy":"writer"}`
+	const summaryJSON = `[{"id":"task-1","projectId":"local","columnId":"col-doing","title":"Summary","version":2,"updatedAt":"2026-10-25T00:00:00Z","updatedBy":"agent","assignee":"Alice"}]`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/health":
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/projects":
+			_, _ = io.WriteString(w, projectJSON)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/projects":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			createRequests <- body
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"id":"project-new","name":"New board","workspacePath":"/tmp/work","columns":[]}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tasks":
+			query := r.URL.Query()
+			listQueries <- query
+			if query.Get("summary") == "true" {
+				_, _ = io.WriteString(w, summaryJSON)
+			} else {
+				_, _ = io.WriteString(w, `[`+fullTaskJSON+`]`)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tasks/task-1":
+			_, _ = io.WriteString(w, fullTaskJSON)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	addr := strings.TrimPrefix(server.URL, "http://")
+	bin := buildBinary(t)
+
+	stdout, stderr, code := runTB(t, bin, nil, "projects", "--json", "--addr", addr)
+	if code != 0 || !strings.Contains(stdout, `"workspacePath":"/tmp/workspace"`) {
+		t.Fatalf("projects --json exit %d: %s%s", code, stderr, stdout)
+	}
+	stdout, stderr, code = runTB(t, bin, nil, "projects", "--addr", addr)
+	if code != 0 || !strings.Contains(stdout, "local\tLocal\t/tmp/workspace") {
+		t.Fatalf("projects text exit %d: %s%s", code, stderr, stdout)
+	}
+
+	stdout, stderr, code = runTB(t, bin, nil, "list", "--project", "local", "--column", "Doing", "--assignee", "Alice", "--limit", "2", "--offset", "1", "--summary", "--json", "--addr", addr)
+	if code != 0 {
+		t.Fatalf("filtered list exit %d: %s%s", code, stderr, stdout)
+	}
+	var gotSummary []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(stdout), &gotSummary); err != nil || len(gotSummary) != 1 {
+		t.Fatalf("summary JSON = %q, err %v", stdout, err)
+	}
+	for _, forbidden := range []string{"description", "comments", "position", "archived"} {
+		if _, ok := gotSummary[0][forbidden]; ok {
+			t.Fatalf("summary JSON leaked %q: %s", forbidden, stdout)
+		}
+	}
+	query := <-listQueries
+	for key, want := range map[string]string{"projectId": "local", "columnId": "col-doing", "assignee": "Alice", "limit": "2", "offset": "1", "summary": "true"} {
+		if got := query.Get(key); got != want {
+			t.Fatalf("list query %s = %q, want %q", key, got, want)
+		}
+	}
+
+	stdout, stderr, code = runTB(t, bin, nil, "list", "--project", "local", "--addr", addr)
+	if code != 0 || !strings.Contains(stdout, "task-1\tDoing\tDetailed\tv3\twriter") {
+		t.Fatalf("legacy list table exit %d: %s%s", code, stderr, stdout)
+	}
+	<-listQueries
+
+	stdout, stderr, code = runTB(t, bin, nil, "show", "task-1", "--json", "--addr", addr)
+	if code != 0 || !strings.Contains(stdout, `"comments":[{"id":"comment-1"`) {
+		t.Fatalf("show --json exit %d: %s%s", code, stderr, stdout)
+	}
+	stdout, stderr, code = runTB(t, bin, nil, "show", "task-1", "--addr", addr)
+	if code != 0 || !strings.Contains(stdout, "Full body") || !strings.Contains(stdout, "Bob:") || !strings.Contains(stdout, "Review note") {
+		t.Fatalf("show text exit %d: %s%s", code, stderr, stdout)
+	}
+
+	stdout, stderr, code = runTB(t, bin, nil, "project", "add", "New board", "--path", "/tmp/work", "--json", "--addr", addr)
+	if code != 0 || !strings.Contains(stdout, `"id":"project-new"`) {
+		t.Fatalf("project add exit %d: %s%s", code, stderr, stdout)
+	}
+	created := <-createRequests
+	if created["name"] != "New board" || created["workspacePath"] != "/tmp/work" {
+		t.Fatalf("project request body = %#v", created)
+	}
 }
 
 // freeAddr reserves a loopback port and releases it for the CLI to claim.

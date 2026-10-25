@@ -66,16 +66,17 @@ func (s *Store) Projects() ([]model.Project, error) {
 }
 
 func (s *Store) projectsLocked(ctx context.Context) ([]model.Project, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, name, position, created_at, updated_at FROM projects ORDER BY position, created_at`)
+	rows, err := s.db.Query(ctx, `SELECT id, name, position, created_at, updated_at, workspace_path FROM projects ORDER BY position, created_at`)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]model.Project, 0, len(rows.Values))
 	for _, r := range rows.Values {
 		out = append(out, model.Project{
-			ID:        str(r[0]),
-			Name:      str(r[1]),
-			CreatedAt: parseTime(str(r[3])),
+			ID:            str(r[0]),
+			Name:          str(r[1]),
+			CreatedAt:     parseTime(str(r[3])),
+			WorkspacePath: str(r[5]),
 		})
 	}
 	cols, err := s.db.Query(ctx, `SELECT id, project_id, name FROM "columns" ORDER BY position`)
@@ -104,7 +105,7 @@ func (s *Store) Project(id string) (model.Project, error) {
 }
 
 func (s *Store) projectLocked(ctx context.Context, id string) (model.Project, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, name, created_at FROM projects WHERE id = ?`, id)
+	rows, err := s.db.Query(ctx, `SELECT id, name, created_at, workspace_path FROM projects WHERE id = ?`, id)
 	if err != nil {
 		return model.Project{}, err
 	}
@@ -112,7 +113,7 @@ func (s *Store) projectLocked(ctx context.Context, id string) (model.Project, er
 		return model.Project{}, ErrNotFound
 	}
 	r := rows.Values[0]
-	p := model.Project{ID: str(r[0]), Name: str(r[1]), CreatedAt: parseTime(str(r[2]))}
+	p := model.Project{ID: str(r[0]), Name: str(r[1]), CreatedAt: parseTime(str(r[2])), WorkspacePath: str(r[3])}
 	cols, err := s.db.Query(ctx, `SELECT id, name FROM "columns" WHERE project_id = ? ORDER BY position`, id)
 	if err != nil {
 		return model.Project{}, err

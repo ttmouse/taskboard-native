@@ -13,7 +13,7 @@
 ## 数据（SQLite，经 mygo plugins/sqlite）
 
 ```
-projects(id TEXT PK, name TEXT, position INT, created_at TEXT, updated_at TEXT)
+projects(id TEXT PK, name TEXT, workspace_path TEXT DEFAULT '', position INT, created_at TEXT, updated_at TEXT)
 columns(id TEXT PK, project_id TEXT, name TEXT, position INT)
 tasks(id TEXT PK, project_id TEXT, column_id TEXT, title TEXT, body TEXT,
       position INT, version INT, archived INT, last_agent TEXT,
@@ -30,10 +30,11 @@ comments(id TEXT PK, task_id TEXT, author TEXT, body TEXT, created_at TEXT)
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/health` | `{"ok":true}` |
-| GET | `/api/projects` | `[Project]` |
+| GET | `/api/projects` | `[Project]`（含可选 workspacePath） |
+| POST | `/api/projects` | `{name, workspacePath?}` → 201 Project，含默认四列 |
 | GET | `/api/projects/{id}/board` | `Board`（列 + 任务，含 archived=false） |
-| GET | `/api/tasks?projectId=` | `[Task]`，projectId 必填（作用域） |
-| GET | `/api/tasks/{id}` | `Task` |
+| GET | `/api/tasks?projectId=` | `[Task]`，projectId 必填；可选 columnId、assignee、limit、offset、summary |
+| GET | `/api/tasks/{id}` | `Task`（含正文与全部评论） |
 | POST | `/api/tasks` | `NewTask` → 201 `Task`，事件 `task.created` |
 | PATCH | `/api/tasks/{id}` | `TaskPatch`（version 必填）→ 200 `Task`；移动列时事件 `task.moved`（带 from/to），否则 `task.updated` |
 | POST | `/api/tasks/{id}/archive` | `{"version":N}` → 200 `Task`，事件 `task.archived` |
@@ -48,8 +49,10 @@ comments(id TEXT PK, task_id TEXT, author TEXT, body TEXT, created_at TEXT)
 ## CLI（cmd/tb）
 
 ```
-tb projects
-tb list [--project ID]
+tb projects [--json]
+tb project add <name> [--path ABSOLUTE_DIRECTORY] [--json]
+tb list [--project ID] [--column NAME|ID] [--assignee WHO] [--limit N --offset N] [--summary] [--json]
+tb show <taskID> [--json]
 tb add <title> [--project ID] [--column NAME|ID] [--body TEXT]
 tb move <taskID> <column NAME|ID>
 tb comment <taskID> <body>
@@ -63,7 +66,7 @@ tb serve [--addr ...]        # 前台跑服务（--detach 后台）
 ## MCP（cmd/taskboard-mcp，stdio，换行分隔 JSON-RPC 2.0）
 
 - `initialize` → `protocolVersion: "2025-06-18"`、`serverInfo{name:"taskboard-native"}`、tools 能力。
-- `tools/list`：`list_projects`、`list_tasks`（projectId 必填）、`create_task`、`update_task`、`move_task`、`add_comment`、`list_comments`。
+- `tools/list`：`list_projects`、`create_project`（name，workspacePath 可选）、`list_tasks`（projectId 必填，支持 columnId/assignee/limit/offset/summary）、`get_task`（id，正文及评论）、`create_task`、`update_task`、`move_task`、`add_comment`、`list_comments`。
 - `tools/call` → 调 HTTP API，`content:[{type:"text", text:<JSON>}]`。
 - 身份：`TASKBOARD_AGENT`，默认 `mcp`。
 
@@ -80,3 +83,12 @@ tb serve [--addr ...]        # 前台跑服务（--detach 后台）
 - `internal/model/**`、`docs/contracts.md`：orchestrator。
 - `docs/design.md`：乔布斯。`docs/design-review.md` + 截图：Dieter Rams。
 - 禁止 `go get` / `go mod tidy`（依赖已固定）；禁止 git commit/push；禁止跑 `./...` 全量构建/测试（兄弟任务在写）。
+
+
+## Agent 读取与工作区（2026-10-25）
+
+本轮取舍与验收见 `docs/agent-read/plan.md`。项目路径使用 JSON 字段 `workspacePath`、数据库列 `workspace_path`；旧数据库首次打开仅补这一列，旧项目与旧名称创建均兼容。提供路径时，API 校验它是本机存在的绝对目录并规范化；不创建目录、不初始化 Git、不派发执行，不要求路径唯一。路径仅用于后续定位执行目录，本轮不引入自动调度。
+
+读取推荐路径：`list_projects → list_tasks(summary=true, filters...) → get_task(id)`。摘要仅包含 id/projectId/columnId/title/version/updatedAt/updatedBy，assignee 非空时返回；不含正文与评论。需要完整内容时按 ID 获取正文与全部评论，不必拉取整个项目的正文。
+
+`columnId` 必须属于项目；assignee 精确匹配；limit 为 1..200 的整数；offset 为非负整数且必须配合 limit。先过滤再分页，顺序与看板一致；offset 为当前数据的偏移分页，不提供并发变更下的快照保证。summary 仅接受 true/false。未传新参数时保持原有全量数组返回，空结果为 []。

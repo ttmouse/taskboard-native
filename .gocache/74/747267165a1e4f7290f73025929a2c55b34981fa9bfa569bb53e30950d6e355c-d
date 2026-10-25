@@ -1,0 +1,3 @@
+# test log
+getenv TASKBOARD_DB
+open /var/folders/_n/5cp090hd5dxc29l16pfvlh280000gn/T/taskboard-ui-prefs-2524492075/ui-prefs.json

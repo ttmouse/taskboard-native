@@ -12,6 +12,7 @@ import (
 	"taskboard-native/internal/client"
 	"taskboard-native/internal/model"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/plugins/loading"
 	"github.com/egoist/mygo/ui"
 )
@@ -46,9 +47,6 @@ func cardHover(t *ui.Theme) ui.Color {
 	return t.SurfaceHover
 }
 
-// hoverBorder is the card's outline under the pointer: stronger than the
-// resting border so the edge survives on top of a filled face.
-func hoverBorder(t *ui.Theme) ui.Color { return t.Border.Mix(t.Text, 0.35) }
 
 // The column panel itself carries no outline: in either appearance it is
 // one clean step of tone against the window, and the cards carry the
@@ -60,8 +58,6 @@ func fsm(t *ui.Theme) float32 { return t.FontSize - 1 }
 func fmd(t *ui.Theme) float32 { return t.FontSize + 2 }
 func flg(t *ui.Theme) float32 { return t.FontSize + 7 }
 
-// syncText names the stream's state beside the sync dot, so the board's
-// being live is said in words as well as color.
 func syncText(b *board, t *ui.Theme) string {
 	switch b.status {
 	case client.Online:
@@ -99,18 +95,29 @@ func (b *board) view(c *ui.Context) {
 	b.curTheme = t
 	ui.Column(c).Fill().Children(func() {
 		b.topBar(c, t)
-		ui.Divider(c).BorderColor(t.Border)
 		if b.status == client.Offline {
 			b.offlineBanner(c, t)
 		}
-		b.boardArea(c, t)
+		ui.Row(c).Grow(1).AlignItems(ui.Stretch).Children(func() {
+			if len(b.projects) > 0 {
+				b.projectSidebar(c, t)
+			}
+			b.boardArea(c, t)
+		})
 	})
+	// After TrackScroll updates offsets, set thumb visibility for this paint.
+	// MyGo would otherwise keep thumbs visible for the whole hover; we only
+	// show them briefly while scrolling (gutter still reserved).
+	b.applyScrollbarTheme(c, theme)
 
 	if b.detail != nil {
 		b.detailView(c, t)
 	}
 	if b.form != nil {
 		b.formView(c, t)
+	}
+	if b.settings != nil {
+		b.settingsView(c, t)
 	}
 	if b.conflict != nil {
 		b.conflictView(c, t)
@@ -119,70 +126,152 @@ func (b *board) view(c *ui.Context) {
 
 // --- top bar ---
 
+func (b *board) applyScrollbarTheme(c *ui.Context, base *ui.Theme) {
+	cp := *base
+	if b.scrollbarActive() {
+		cp.Scrollbar = base.Scrollbar.Alpha(0.45)
+	} else {
+		cp.Scrollbar = ui.Transparent
+	}
+	c.SetTheme(&cp)
+	b.curTheme = c.Theme()
+}
+
 func (b *board) productionTopBar(c *ui.Context, t *ui.Theme) {
-	ui.Row(c).Height(52).Padding(0, t.Space(4)).Gap(t.Space(3)).
-		AlignItems(ui.Center).BorderWidth(0, 0, 0, 0).Children(func() {
-		ui.MenuButton(c, b.projectName(), func(m *ui.Menu) {
-			for _, p := range b.projects {
-				item := m.Item(p.Name)
-				item.Checked(p.ID == b.cur)
-				if item.Chosen() {
-					b.openProject(p.ID)
-				}
-			}
-			if len(b.projects) > 0 {
-				m.Separator()
-			}
-			if m.Item("新建项目…").Chosen() {
-				b.openForm()
-			}
-		}).Label("项目切换").FontSize(fmd(t)).FontWeight(600)
+	// Compact ~40 DIP toolbar. Do NOT use max(..., bar.Height):
+	// HiddenInset reports ~46–52 and that was the too-tall regression.
+	// Traffic lights via TrafficLightPosition.
+	bar := c.TitleBar()
+	h := t.Space(10) // 40 — room for overlaid traffic lights
+	padL := bar.Left + t.Space(2)
+	if padL < t.Space(14) {
+		padL = t.Space(14)
+	}
+	padR := max(bar.Right, t.Space(2))
+	ui.Row(c).Height(h).Padding(0, padR, 0, padL).Gap(t.Space(2)).
+		AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).DragWindow().Children(func() {
 		if b.switching {
-			loading.Ring(c, loading.Options{Size: 16, Color: t.Accent}).Label("正在切换项目")
+			loading.Ring(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在切换项目")
+		}
+		// Quiet field: no outline — border made the slim bar look noisy.
+		ui.TextInput(c, &b.searchQuery).
+			Placeholder("搜索任务…").Label("搜索任务").
+			Width(t.Space(48)).Padding(t.Space(1.25), t.Space(2.5)).
+			Radius(t.Radius).BorderWidth(0).
+			Background(t.Surface).FontSize(fsm(t)).TextColor(t.Text)
+		if strings.TrimSpace(b.searchQuery) != "" {
+			if ui.Button(c, "清除").Label("清除搜索").
+				Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
+				TextColor(t.TextMuted).Clicked() {
+				b.searchQuery = ""
+			}
 		}
 		ui.Spacer(c)
-		if ui.Button(c, "刷新").Label("刷新看板").Clicked() {
-			b.load()
+		// 新建任务 lives here — never on column headers (sidebar "+" is 新建项目 only).
+		if ui.Button(c, "").Label("新建任务").Tooltip("新建任务").
+			Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
+			TextColor(t.TextMuted).
+			Children(func() { ui.Icon(c, taskPlus).Size(16, 16) }).
+			Clicked() {
+			b.openTaskForm(b.defaultTaskColumnID())
 		}
-		if ui.PrimaryButton(c, "新建项目").Clicked() {
-			b.openForm()
+		// Icon-only settings. No refresh, no sync dot — SSE stays silent in the chrome;
+		// offline still uses the full-width banner below.
+		if ui.Button(c, "").Label("打开设置").Tooltip("设置").
+			Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
+			TextColor(t.TextMuted).
+			Children(func() { ui.Icon(c, settingsSliders).Size(16, 16) }).
+			Clicked() {
+			b.openSettings()
 		}
-		b.syncDot(c, t)
 	})
 }
 
-// syncDot shows the stream's health: a green dot at rest, a pulse just
-// after an event, and a spinner while (re)connecting. While the board's
-// own full-page indicator shows, this one stays a plain dot, so the
-// screen never carries two board-level spinners at once.
-func (b *board) syncDot(c *ui.Context, t *ui.Theme) {
-	// While the first board is still arriving, say nothing about sync:
-	// nothing has been synced yet, and the board's own indicator is the
-	// only one on screen.
-	if b.loading {
-		ui.Box(c).Size(8, 8).Radius(999).Background(t.Border).Label("正在连接本地服务")
-		return
-	}
-	text := syncText(b, t)
-	textColor := t.TextMuted
-	switch b.status {
-	case client.Online:
-		if time.Now().Before(b.pulseTill) {
-			loading.Pulse(c, loading.Options{Size: 10, Color: t.Accent}).Label("正在同步更新")
-			c.After(time.Until(b.pulseTill))
-		} else {
-			ui.Box(c).Size(8, 8).Radius(999).Background(t.Success).Label("实时同步已连接")
-		}
-	case client.Offline:
-		loading.Comet(c, loading.Options{Size: 12, Color: t.Warning}).Label("正在重新连接本地服务")
-		textColor = t.Warning
-	default:
-		loading.Arc(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在连接本地服务")
-	}
-	ui.Text(c, text).FontSize(fsm(t)).TextColor(textColor).Label("实时同步" + text)
+// projectSidebar is a quiet project switcher on L0 (window face), not a
+// second column panel — columns stay the only L1 surfaces.
+func (b *board) projectSidebar(c *ui.Context, t *ui.Theme) {
+	// Surface (not Background): one step off the board pane so the strip
+	// reads as a distinct rail. No vertical Divider — tone does the split.
+	ui.Column(c).Width(b.sidebarWidth(t)).FillHeight().
+		Padding(t.Space(1.5), t.Space(2), t.Space(1.5), t.Space(2)).Gap(t.Space(1.5)).
+		Background(t.Surface).Label("项目列表").Children(func() {
+		ui.Row(c).FillWidth().Height(t.Space(7)).AlignItems(ui.Center).Gap(t.Space(1)).Children(func() {
+			ui.Text(c, "项目").FontSize(fsm(t)).FontWeight(600).TextColor(t.TextMuted).
+				TextAlign(ui.Start).Grow(1)
+			if ui.Button(c, "+").Label("新建项目").Tooltip("新建项目").
+				Padding(t.Space(1), t.Space(1.5)).Radius(t.Radius).BorderWidth(0).
+				Clicked() {
+				b.openForm()
+			}
+		})
+		ui.Scroll(c).Grow(1).Children(func() {
+			ui.Column(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Stretch).Children(func() {
+				// Global entry: all projects' cards in one board (by column name).
+				globalOn := b.cur == curGlobal
+				gRow := ui.Button(c.Key("project-global"), "全部项目").
+					FillWidth().Radius(t.Radius).
+					Padding(t.Space(1.5), t.Space(2)).
+					BorderWidth(0).
+					FontSize(t.FontSize).FontWeight(500).TextColor(t.Text).
+					TextAlign(ui.Start).Justify(ui.Start).
+					Label("切换到全部项目视图")
+				gFace := ui.Transparent
+				gWeight := 500
+				switch {
+				case globalOn && gRow.Pressed():
+					gFace = t.Accent.Alpha(0.18)
+					gWeight = 600
+				case globalOn:
+					gFace = t.Accent.Alpha(0.14)
+					gWeight = 600
+				case gRow.Pressed():
+					gFace = t.SurfacePressed
+				case gRow.Hovered():
+					gFace = t.SurfaceHover
+				}
+				gRow.Background(gFace).FontWeight(gWeight)
+				if gRow.Clicked() && !globalOn {
+					b.openGlobal()
+				}
+				for _, p := range b.projects {
+					p := p
+					active := b.cur != curGlobal && p.ID == b.cur
+					row := ui.Button(c.Key("project-"+p.ID), p.Name).
+						FillWidth().Radius(t.Radius).
+						Padding(t.Space(1.5), t.Space(2)).
+						BorderWidth(0).
+						FontSize(t.FontSize).FontWeight(500).TextColor(t.Text).
+						TextAlign(ui.Start).Justify(ui.Start).
+						Label("切换到项目 " + p.Name)
+					face := ui.Transparent
+					weight := 500
+					switch {
+					case active && row.Pressed():
+						face = t.Accent.Alpha(0.18)
+						weight = 600
+					case active:
+						face = t.Accent.Alpha(0.14)
+						weight = 600
+					case row.Pressed():
+						face = t.SurfacePressed
+					case row.Hovered():
+						face = t.SurfaceHover
+					}
+					row.Background(face).FontWeight(weight)
+					if row.Clicked() && !active {
+						b.openProject(p.ID)
+					}
+				}
+			})
+		})
+	})
 }
 
-// --- offline banner ---
+func (b *board) sidebarWidth(t *ui.Theme) float32 {
+	return t.Space(44) // 176 when Spacing=4 — fits names without crowding the board
+}
+
+
 
 func (b *board) offlineBanner(c *ui.Context, t *ui.Theme) {
 	ui.Row(c).Height(36).Padding(0, t.Space(4)).Gap(t.Space(2)).
@@ -220,17 +309,33 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 		return
 	}
 
-	// Columns split the window evenly, within the design's 240..400
-	// range; a narrower window scrolls instead of squeezing them, and a
+	// Columns split the board pane evenly, within the design's 240..400
+	// range; a narrower pane scrolls instead of squeezing them, and a
 	// wider one centers the board rather than leaving it hanging left.
 	w, _ := c.Size()
+	avail := w
+	if len(b.projects) > 0 {
+		// c.Size may be the window; sidebar already occupies its strip.
+		avail -= b.sidebarWidth(t)
+	}
 	width := b.columnWidth(c, t)
-	board := ui.ScrollHorizontal(c).Grow(1).Padding(t.Space(5)).Gap(t.Space(4)).AlignItems(ui.Stretch)
+	// With a sidebar, keep only a small left gutter — the sidebar is the left edge.
+	padL, padR := t.Space(5), t.Space(5)
+	if len(b.projects) > 0 {
+		padL = t.Space(2)
+	}
+	boardScroll := b.columnScroll("_board")
+	// Column gap is s1 only: borders are gone, so the old s2/s3 gutters
+	// read as empty border leftovers between panels.
+	colGap := t.Space(1)
+	board := ui.ScrollHorizontal(c).Grow(1).Padding(t.Space(1), padR, t.Space(2), padL).Gap(colGap).AlignItems(ui.Stretch).
+		TrackScroll(&boardScroll.state)
+	b.noteScroll(boardScroll)
 	if b.switching {
 		board.Opacity(0.55)
 	}
-	used := float32(len(b.columns))*width + float32(max(len(b.columns)-1, 0))*t.Space(4)
-	lead := max((w-2*t.Space(5)-used)/2, 0)
+	used := float32(len(b.columns))*width + float32(max(len(b.columns)-1, 0))*colGap
+	lead := max((avail-padL-padR-used)/2, 0)
 	board.Children(func() {
 		if lead > 0 {
 			ui.Spacer(c).Width(lead)
@@ -262,7 +367,12 @@ func (b *board) noProjectState(c *ui.Context, t *ui.Theme) {
 // the columns, clamped to the design's 240..400.
 func (b *board) columnWidth(c *ui.Context, t *ui.Theme) float32 {
 	w, _ := c.Size()
-	room := w - 2*t.Space(5) - float32(max(len(b.columns)-1, 0))*t.Space(4)
+	padL, padR := t.Space(5), t.Space(5)
+	if len(b.projects) > 0 {
+		w -= b.sidebarWidth(t)
+		padL = t.Space(2)
+	}
+	room := w - padL - padR - float32(max(len(b.columns)-1, 0))*t.Space(1)
 	if len(b.columns) == 0 {
 		return 320
 	}
@@ -270,13 +380,15 @@ func (b *board) columnWidth(c *ui.Context, t *ui.Theme) float32 {
 	return min(max(width, 240), 400)
 }
 
-// columnView is one column: header, quick add, and its cards. A column
+// columnView is one column: header and its cards. A column
 // enters by rising a step, its neighbors delayed in turn, so a board
 // arriving reads as one motion and a project switch replays it.
 func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width float32, index int) {
 	tasks := b.tasksIn(col.ID)
 	panel := ui.Column(c.Key(col.ID)).Width(width).FillHeight().
-		Padding(t.Space(3)).Gap(t.Space(2)).Radius(t.Radius + 4).
+		// Inner pad s2 (was s3): without column borders the old pad looked like
+		// extra gutter between columns.
+		Padding(t.Space(2)).Gap(t.Space(2)).Radius(t.Radius + 4).
 		Background(colFace(t)).
 		Role(ui.RoleGroup).
 		Label(fmt.Sprintf("%s列", col.Name))
@@ -288,22 +400,15 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 			Delay: time.Duration(index) * 40 * time.Millisecond},
 	})
 
-	// A drag hovering the column turns its edge accent and shows the
-	// exact slot a drop would take, read from the pointer's Y.
-	dropLine := -1
+	// The transient full-height preview owns placement feedback. Tracks
+	// keep their geometry and color while cards make room.
 	dragID, over := ui.DragOver[cardDrag](panel)
-	b.columnDropStyle(panel, t, over)
-	if over {
-		if _, y, ok := panel.PointerPosition(); ok {
-			dropLine = b.insertIndex(tasks, b.dropWindowY(panel, y))
-		}
-	}
 	if id, ok := ui.Drop[cardDrag](panel); ok {
 		b.dropOn(string(id), col, panel)
 	}
 
 	panel.Children(func() {
-		ui.Row(c).Height(36).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Height(t.Space(7)).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, col.Name).FontSize(fmd(t)).FontWeight(600).
 				Role(ui.RoleHeading).Level(2)
 			ui.Text(c, strconv.Itoa(len(tasks))).FontSize(fsm(t)).TextColor(t.TextMuted).
@@ -311,68 +416,33 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 			ui.Spacer(c)
 		})
 
-		b.quickAdd(c, t, col)
-
-		ui.Scroll(c).Grow(1).Children(func() {
-			list := ui.Column(c).FillWidth().Gap(t.Space(2)).Padding(0, 0, t.Space(6), 0).
+		// Scrollbar overlays content by default; reserve a right gutter so
+		// thumbs never cover cards. Same columnView → 待办/进行中/评审/完成.
+		bar := t.ScrollbarWidth
+		if bar <= 0 {
+			bar = 6
+		}
+		gutter := bar + t.Space(2)
+		track := b.columnScroll(col.ID)
+		ui.Scroll(c).Grow(1).TrackScroll(&track.state).Children(func() {
+			list := ui.Column(c).FillWidth().Gap(t.Space(2)).Padding(0, gutter, t.Space(6), 0).
 				FocusGroup(ui.Vertical).Label(col.Name + "列任务")
 			list.Children(func() {
-				b.columnCards(c, t, col, tasks, panel, list, string(dragID), over, dropLine)
+				b.columnCards(c, t, col, tasks, panel, list, string(dragID), over)
 			})
 		})
+		b.noteScroll(track)
 	})
-}
-
-// dropLine is the insertion marker a hovering drag sees: a slim accent
-// bar where the card would land.
-func (b *board) dropLine(c *ui.Context, t *ui.Theme) {
-	ui.Box(c.Key("drop-line")).FillWidth().Height(2).Radius(1).
-		Background(t.Accent).Margin(t.Space(1), 0)
-}
-
-// insertIndex maps a pointer Y to the slot a drop would take: below a
-// card's middle puts the dragged card after it.
-func (b *board) insertIndex(tasks []model.Task, y float32) int {
-	idx := 0
-	for i, task := range tasks {
-		box, has := b.bounds[task.ID]
-		if !has {
-			continue
-		}
-		if y >= box.Y+box.H/2 {
-			idx = i + 1
-		} else {
-			break
-		}
-	}
-	return idx
-}
-
-// quickAdd is the per-column input: Enter creates, and stays for the next.
-func (b *board) quickAdd(c *ui.Context, t *ui.Theme, col *model.Column) {
-	if b.drafts == nil {
-		b.drafts = map[string]string{}
-	}
-	draft := b.drafts[col.ID]
-	in := ui.TextInput(c, &draft).Placeholder("添加任务，回车创建").
-		Label("在「" + col.Name + "」中添加任务")
-	// The input edits its own copy; keep ours in step for the next frame.
-	if draft != b.drafts[col.ID] {
-		b.drafts[col.ID] = draft
-	}
-	if in.Submitted() {
-		title := strings.TrimSpace(draft)
-		if title != "" {
-			b.drafts[col.ID] = ""
-			b.createTop(col.ID, title)
-		}
-	}
 }
 
 // createTop creates a card and lifts it to the head of its column, which
 // is where a quick add puts it.
 func (b *board) createTop(columnID, title string) {
 	proj := b.cur
+	if proj == "" || proj == curGlobal {
+		b.toast("无法创建", "请先在侧栏选一个项目，再添加任务。")
+		return
+	}
 	go func() {
 		t, err := b.api.CreateTask(proj, columnID, title, "", "")
 		if err != nil {
@@ -390,8 +460,9 @@ func (b *board) createTop(columnID, title string) {
 // that wrote it last, and when — because who moved a task is this
 // board's story.
 func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Element {
+	// No resting border: cardFace vs colFace carries the edge (theme tokens).
 	card := ui.Box(c.Key(task.ID)).FillWidth().
-		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius+2).Border(1, t.Border).
+		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius+2).BorderWidth(0).
 		Focusable().Cursor(ui.CursorPointer).Role(ui.RoleButton).
 		Label("打开任务：" + task.Title).
 		Drag(cardDrag(task.ID))
@@ -400,7 +471,6 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 	face := cardFace(t)
 	if card.Hovered() {
 		face = cardHover(t)
-		card.Border(1, hoverBorder(t))
 	}
 	if card.Pressed() {
 		face = t.SurfacePressed
@@ -430,72 +500,75 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		if m.Item("打开详情").Chosen() {
 			b.openDetail(*task)
 		}
+		if m.Item("复制 ID").Chosen() {
+			mygo.Clipboard.WriteText(task.ID)
+			b.toast("已复制 ID", task.ID)
+		}
 		m.Separator()
 		if m.Item("归档").Chosen() {
 			b.archiveTask(task.ID)
 		}
 	})
 
+	approve := false
+	inReview := b.columnName(task.ColumnID) == "评审"
 	card.Children(func() {
-		ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
-			MaxLines(2).Ellipsis("…").Grow(1).Tooltip(task.Title)
-		if summary := firstLines(task.Description, 2); summary != "" {
-			ui.Text(c, summary).FontSize(fsm(t)).TextColor(t.TextMuted).
-				MaxLines(2).Ellipsis("…")
-		}
-		ui.Row(c).Height(20).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
-			if task.Assignee != "" {
-				ui.Avatar(c, task.Assignee, nil).Size(18, 18)
-			}
-			if meta := provenance(task); meta != "" {
-				ui.Text(c, meta).FontSize(fxs(t)).TextColor(t.TextMuted).
-					Grow(1).MaxLines(1).Ellipsis("…").Tooltip(meta)
-			}
-			if n := len(task.Comments); n > 0 {
-				ui.Badge(c, strconv.Itoa(n)).Label(strconv.Itoa(n) + " 条评论")
-			}
-			if b.savingID == task.ID && (b.detail == nil || b.detail.id != task.ID) {
-				loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
+		ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Start).Children(func() {
+			ui.Column(c).Grow(1).Gap(t.Space(2)).Children(func() {
+				ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
+					MaxLines(2).Ellipsis("…").FillWidth().Tooltip(task.Title)
+				if b.cur == curGlobal {
+					if name := b.projectNameByID(task.ProjectID); name != "" {
+						ui.Text(c, name).FontSize(fxs(t)).TextColor(t.TextMuted).
+							MaxLines(1).Ellipsis("…").Label("所属项目 " + name)
+					}
+				}
+				// Title-only mode keeps the title alone so denser columns fit more cards.
+				if !b.prefs.TitleOnlyCards {
+					if summary := firstLines(task.Description, 2); summary != "" {
+						ui.Text(c, summary).FontSize(fsm(t)).TextColor(t.TextMuted).
+							MaxLines(2).Ellipsis("…")
+					}
+					ui.Row(c).Height(20).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+						if task.Assignee != "" {
+							ui.Avatar(c, task.Assignee, nil).Size(18, 18)
+						}
+						if meta := provenance(task); meta != "" {
+							ui.Text(c, meta).FontSize(fxs(t)).TextColor(t.TextMuted).
+								Grow(1).MaxLines(1).Ellipsis("…").Tooltip(meta)
+						}
+						if n := len(task.Comments); n > 0 {
+							ui.Badge(c, strconv.Itoa(n)).Label(strconv.Itoa(n) + " 条评论")
+						}
+						if b.savingID == task.ID && (b.detail == nil || b.detail.id != task.ID) {
+							loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
+						}
+					})
+				}
+			})
+			// 评审 only: hover reveals a lucide check (same stroke/size as
+			// the top-bar settings gear — muted, no green pill).
+			if inReview && card.Hovered() {
+				if ui.Button(c, "").Label("验收通过，移到完成").Tooltip("移到完成").
+					Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
+					TextColor(t.TextMuted).
+					Children(func() { ui.Icon(c, approveCheck).Size(16, 16) }).
+					Clicked() {
+					approve = true
+					if done := b.columnID("完成"); done != "" {
+						// Pin newly completed cards to the top of「完成」.
+						b.moveTask(task.ID, done, "", true)
+					}
+				}
 			}
 		})
 	})
 	b.bounds[task.ID] = card.Bounds()
 
-	if card.Clicked() {
+	if card.Clicked() && !approve {
 		b.openDetail(*task)
 	}
 	return card
-}
-
-// dropOn turns a drop on a column into a move, using the pointer's Y to
-// choose the slot.
-func (b *board) dropOn(dragID string, col *model.Column, panel ui.Element) {
-	if b.dropProjected(dragID, col, panel) {
-		return
-	}
-	_, y, ok := panel.PointerPosition()
-	if !ok {
-		return
-	}
-	b.rememberDrop(dragID, panel)
-	y = b.dropWindowY(panel, y)
-	tasks := b.tasksIn(col.ID)
-	after, atTop := "", len(tasks) > 0
-	for _, task := range tasks {
-		box, has := b.bounds[task.ID]
-		if !has {
-			continue
-		}
-		if y >= box.Y+box.H/2 {
-			after, atTop = task.ID, false
-		} else {
-			break
-		}
-	}
-	if after == dragID {
-		return
-	}
-	b.moveTask(dragID, col.ID, after, atTop)
 }
 
 // --- detail ---
@@ -618,23 +691,106 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 
 // --- forms ---
 
-func (b *board) openForm() { b.form = &form{open: true} }
+func (b *board) openForm() { b.form = &form{open: true, isTask: false} }
+
+func (b *board) openTaskForm(columnID string) {
+	if b.cur == "" || b.cur == curGlobal {
+		b.toast("无法创建", "请先在侧栏选一个项目，再添加任务。")
+		return
+	}
+	if columnID == "" {
+		columnID = b.defaultTaskColumnID()
+	}
+	if columnID == "" {
+		b.toast("无法创建", "当前看板没有可用的列。")
+		return
+	}
+	b.form = &form{open: true, isTask: true, columnID: columnID}
+}
+
+// defaultTaskColumnID prefers 待办, else the first column.
+func (b *board) defaultTaskColumnID() string {
+	if id := b.columnID("待办"); id != "" {
+		return id
+	}
+	if len(b.columns) > 0 {
+		return b.columns[0].ID
+	}
+	return ""
+}
+
+func (b *board) openSettings() { b.settings = &settings{open: true} }
+
+func (b *board) settingsView(c *ui.Context, t *ui.Theme) {
+	s := b.settings
+	open := s.open
+	ui.Modal(c, &open, func() {
+		ui.Column(c).Width(t.Space(80)).Gap(t.Space(3)).Children(func() {
+			ui.Text(c, "设置").FontSize(fmd(t)).FontWeight(600)
+			if ui.Checkbox(c, &b.prefs.TitleOnlyCards, "卡片仅显示标题").
+				Label("卡片仅显示标题").Changed() {
+				_ = saveUIPrefs(b.prefs)
+			}
+			ui.Text(c, "开启后，看板卡片只保留标题，隐藏描述摘要与底部元信息。").
+				FontSize(fsm(t)).TextColor(t.TextMuted)
+			ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
+				if ui.Button(c, "关闭").Label("关闭设置").Clicked() {
+					open = false
+				}
+			})
+		})
+	})
+	if !open {
+		b.settings = nil
+		return
+	}
+	s.open = open
+}
+
 
 func (b *board) formView(c *ui.Context, t *ui.Theme) {
 	f := b.form
 	open := f.open
 	ui.Modal(c, &open, func() {
 		ui.Column(c).Width(t.Space(80)).Gap(t.Space(3)).Children(func() {
-			ui.Text(c, "新建项目").FontSize(fmd(t)).FontWeight(600)
-			ui.TextInput(c, &f.name).Label("项目名").Placeholder("项目名").AutoFocus()
-			ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
-				if ui.Button(c, "取消").Clicked() {
-					open = false
+			if f.isTask {
+				ui.Text(c, "新建任务").FontSize(fmd(t)).FontWeight(600)
+				colName := b.columnName(f.columnID)
+				if colName != "" {
+					ui.Text(c, "将添加到「"+colName+"」列 · 回车可连续添加").FontSize(fsm(t)).TextColor(t.TextMuted)
+				} else {
+					ui.Text(c, "回车可连续添加").FontSize(fsm(t)).TextColor(t.TextMuted)
 				}
-				if ui.PrimaryButton(c, "创建").Clicked() {
-					b.createProject()
-				}
-			})
+				input := ui.TextInput(c, &f.name).Label("任务标题").Placeholder("任务标题，回车继续").AutoFocus()
+				ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
+					if ui.Button(c, "完成").Label("关闭新建任务").Clicked() {
+						open = false
+					}
+					if ui.PrimaryButton(c, "创建").Clicked() || input.Submitted() {
+						title := strings.TrimSpace(f.name)
+						if title == "" {
+							b.toast("无法创建", "任务标题不能为空。")
+							return
+						}
+						// Stay open: clear the field so the next title can be typed right away.
+						b.createTop(f.columnID, title)
+						f.name = ""
+					}
+				})
+			} else {
+				ui.Text(c, "新建项目").FontSize(fmd(t)).FontWeight(600)
+				ui.Text(c, "侧栏「+」只用于新建项目；新建任务用顶栏加号。").
+					FontSize(fsm(t)).TextColor(t.TextMuted)
+				ui.TextInput(c, &f.name).Label("项目名").Placeholder("项目名").AutoFocus()
+				ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
+					if ui.Button(c, "取消").Clicked() {
+						open = false
+					}
+					if ui.PrimaryButton(c, "创建").Clicked() {
+						b.createProject()
+					}
+				})
+			}
 		})
 	})
 	if !open {

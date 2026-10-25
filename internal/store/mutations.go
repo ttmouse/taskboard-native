@@ -355,6 +355,12 @@ func (s *Store) compactLocked(ctx context.Context, projectID, columnID, skipID s
 
 // CreateProject appends a project with the standard four columns.
 func (s *Store) CreateProject(name, by string) (model.Project, error) {
+	return s.CreateProjectWithPath(name, "", by)
+}
+
+// CreateProjectWithPath persists a workspace location without touching
+// the workspace itself. The HTTP boundary validates supplied paths.
+func (s *Store) CreateProjectWithPath(name, workspacePath, by string) (model.Project, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return model.Project{}, invalid("project name required")
@@ -368,10 +374,10 @@ func (s *Store) CreateProject(name, by string) (model.Project, error) {
 	}
 	position := integer(rows.Values[0][0]) + step
 	now := nowUTC()
-	p := model.Project{ID: newID(), Name: name, CreatedAt: now}
+	p := model.Project{ID: newID(), Name: name, WorkspacePath: workspacePath, CreatedAt: now}
 	stmts := []sqlite.Statement{{
-		SQL:  `INSERT INTO projects (id, name, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		Args: []any{p.ID, p.Name, position, timestamp(now), timestamp(now)},
+		SQL:  `INSERT INTO projects (id, name, position, created_at, updated_at, workspace_path) VALUES (?, ?, ?, ?, ?, ?)`,
+		Args: []any{p.ID, p.Name, position, timestamp(now), timestamp(now), p.WorkspacePath},
 	}}
 	for i, column := range DefaultColumns() {
 		column.ID = newID()

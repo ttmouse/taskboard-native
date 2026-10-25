@@ -17,6 +17,8 @@ go run ./cmd/tb move <taskID> 进行中
 go run ./cmd/taskboard-mcp            # stdio MCP，工具见 docs/contracts.md
 ```
 
+Agent 读取建议：先 `tb projects --json` 定位项目与工作路径，再用 `tb list --project ID --column 待办 --limit 20 --summary --json` 读摘要，最后 `tb show TASK_ID --json` 读正文与评论。新增项目可用 `tb project add "项目名" --path /absolute/workspace --json`；MCP 对应 `create_project`、`list_projects`、`list_tasks`、`get_task`。完整流程见 [Agent 读取入口](docs/agent-read/usage.md)。
+
 环境变量：`TASKBOARD_ADDR`、`TASKBOARD_DB`、`TB_AGENT` / `TASKBOARD_AGENT`。`TASKBOARD_SLOW=<duration>` 仅为加载态截图用的测试钩子。
 
 ## 文档
@@ -37,7 +39,7 @@ go build ./... && go vet ./... && go test ./...
 
 ## 连续 API 动效演示
 
-**动效候选目前只在独立原生 Playground 中比较，尚未验收合入正式窗口。** 打开 `build/playground/darwin-arm64/Taskboard Motion Playground.app`，切换方案并播放同一场景。构建和隔离方式见 [playground/README.md](playground/README.md)。
+**正式窗口已接入 B 柔和弹簧与 0 / 40 / 80ms 多卡抬升错峰。** API 并行执行；邻卡只平滑让位，轨道无蓝框。Playground 继续用于比较候选参数。 打开 `build/playground/darwin-arm64/Taskboard Motion Playground.app`，切换方案并播放同一场景。构建和隔离方式见 [playground/README.md](playground/README.md)。
 
 保持 App 打开，在当前 `local` 项目中运行：
 

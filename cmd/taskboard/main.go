@@ -99,15 +99,23 @@ func runWindow() {
 
 	cl := client.New(&client.Discover{Addr: srv.Addr}, "gui")
 	b := newBoard(cl)
+	// TitleBarHiddenInset + empty Title: no macOS title text.
+	// Compact toolbar is 40 DIP (view.go Space(10)); TrafficLightPosition Y
+	// centers the lights in that band (do not size the row to bar.Height —
+	// that re-inflates to ~46–52 and looks too tall).
+	lights := &mygo.Point{X: 14, Y: 14} // close-btn top-left; centers ~12px lights in the 40 DIP toolbar
 
 	mygo.App.WhenReady(func() {
 		b.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:     "taskboard",
-			Width:     1280,
-			Height:    800,
-			MinWidth:  960,
-			MinHeight: 560,
-			Content:   ui.View(b.view),
+			Title:                 "",
+			TitleBarStyle:         mygo.TitleBarHiddenInset,
+			TrafficLightPosition: lights,
+			TitleBarHeight:        32, // page title-bar band (helps Linux/Win; mac uses position)
+			Width:                 1280,
+			Height:                800,
+			MinWidth:              960,
+			MinHeight:             560,
+			Content:               ui.View(b.view),
 		})
 	})
 	mygo.App.OnWindowAllClosed(func() {})

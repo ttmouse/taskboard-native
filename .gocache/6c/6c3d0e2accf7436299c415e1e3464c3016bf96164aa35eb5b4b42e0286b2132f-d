@@ -1,0 +1,10 @@
+./board.go
+./icons.go
+./main.go
+./motion.go
+./motion_default.go
+./motion_lift.go
+./motion_state.go
+./prefs.go
+./sound.go
+./view.go

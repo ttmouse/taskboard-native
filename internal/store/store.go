@@ -44,6 +44,7 @@ const schema = `
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
+  workspace_path TEXT NOT NULL DEFAULT '',
   position INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -142,6 +143,20 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := s.db.Execute(ctx, stmt); err != nil {
 			return fmt.Errorf("store: migrate: %w", err)
 		}
+	}
+	// CREATE TABLE does not add fields to an existing database. Preserve
+	// existing projects and cards while upgrading older installations.
+	columns, err := s.db.Query(ctx, `PRAGMA table_info(projects)`)
+	if err != nil {
+		return fmt.Errorf("store: project schema: %w", err)
+	}
+	for _, column := range columns.Values {
+		if str(column[1]) == "workspace_path" {
+			return nil
+		}
+	}
+	if _, err = s.db.Execute(ctx, `ALTER TABLE projects ADD COLUMN workspace_path TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("store: project workspace migration: %w", err)
 	}
 	return nil
 }

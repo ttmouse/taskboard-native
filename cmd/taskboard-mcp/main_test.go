@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +17,12 @@ import (
 	"taskboard-native/internal/model"
 	"taskboard-native/internal/service"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // buildBinary compiles the MCP server once per test.
 func buildBinary(t *testing.T) string {
@@ -222,7 +231,7 @@ func TestMCPEndToEnd(t *testing.T) {
 			t.Fatalf("tool %s schema = %v", name, tool["inputSchema"])
 		}
 	}
-	want := []string{"list_projects", "list_tasks", "create_task", "update_task", "move_task", "add_comment", "list_comments"}
+	want := []string{"list_projects", "create_project", "list_tasks", "get_task", "create_task", "update_task", "move_task", "add_comment", "list_comments"}
 	if len(tools) != len(want) {
 		t.Fatalf("tools = %v, want %d", names, len(want))
 	}
@@ -348,17 +357,157 @@ func TestMCPEndToEnd(t *testing.T) {
 	if len(comments) != 1 || comments[0].ID != comment.ID {
 		t.Fatalf("comments = %+v", comments)
 	}
+	text, isErr = toolText(t, s.call(12, "tools/call", map[string]any{
+		"name": "get_task", "arguments": map[string]any{"id": created.ID},
+	}))
+	if isErr {
+		t.Fatalf("get_task failed: %s", text)
+	}
+	var detailed model.Task
+	if err := json.Unmarshal([]byte(text), &detailed); err != nil {
+		t.Fatalf("decode task details: %v", err)
+	}
+	if detailed.Description != "来自 MCP" || len(detailed.Comments) != 1 || detailed.Comments[0].ID != comment.ID {
+		t.Fatalf("task details = %+v, want description and comment preserved", detailed)
+	}
 
 	// Unknown tool and unknown method surface as errors, not crashes.
 	// An unknown tool is a tool failure (isError) with a readable message.
-	if text, isErr := toolText(t, s.call(12, "tools/call", map[string]any{"name": "nope"})); !isErr || !strings.Contains(text, "unknown tool") {
+	if text, isErr := toolText(t, s.call(13, "tools/call", map[string]any{"name": "nope"})); !isErr || !strings.Contains(text, "unknown tool") {
 		t.Fatalf("unknown tool = %q (isError %v)", text, isErr)
 	}
-	if resp := s.call(13, "nope", nil); resp["error"] == nil {
+	if resp := s.call(14, "nope", nil); resp["error"] == nil {
 		t.Fatalf("unknown method returned no error: %v", resp)
 	}
-	if _, isErr := toolText(t, s.call(14, "tools/call", map[string]any{"name": "create_task", "arguments": map[string]any{"projectId": "missing", "title": "x"}})); !isErr {
+	if _, isErr := toolText(t, s.call(15, "tools/call", map[string]any{"name": "create_task", "arguments": map[string]any{"projectId": "missing", "title": "x"}})); !isErr {
 		t.Fatalf("create into missing project succeeded")
+	}
+}
+
+func TestMCPToolSchemaAndHTTPForwarding(t *testing.T) {
+	definitions := toolDefinitions()
+	byName := make(map[string]map[string]any, len(definitions))
+	for _, definition := range definitions {
+		byName[definition["name"].(string)] = definition
+	}
+	listSchema := byName["list_tasks"]["inputSchema"].(map[string]any)
+	listProperties := listSchema["properties"].(map[string]any)
+	for _, key := range []string{"projectId", "columnId", "assignee", "limit", "offset", "summary", "includeArchived"} {
+		if _, ok := listProperties[key]; !ok {
+			t.Errorf("list_tasks schema missing %s", key)
+		}
+	}
+	if got := listSchema["required"].([]string); len(got) != 1 || got[0] != "projectId" {
+		t.Errorf("list_tasks required = %v, want projectId only", got)
+	}
+	if limit := listProperties["limit"].(map[string]any); limit["minimum"] != 1 || limit["maximum"] != 200 {
+		t.Errorf("list_tasks limit schema = %v, want range 1..200", limit)
+	}
+	for _, tc := range []struct {
+		name    string
+		field   string
+		wantReq string
+	}{
+		{name: "get_task", field: "id", wantReq: "id"},
+		{name: "create_project", field: "name", wantReq: "name"},
+	} {
+		schema := byName[tc.name]["inputSchema"].(map[string]any)
+		if _, ok := schema["properties"].(map[string]any)[tc.field]; !ok {
+			t.Errorf("%s schema missing %s", tc.name, tc.field)
+		}
+		required := schema["required"].([]string)
+		if len(required) != 1 || required[0] != tc.wantReq {
+			t.Errorf("%s required = %v, want %s", tc.name, required, tc.wantReq)
+		}
+	}
+	if _, ok := byName["create_project"]["inputSchema"].(map[string]any)["properties"].(map[string]any)["workspacePath"]; !ok {
+		t.Error("create_project schema missing workspacePath")
+	}
+	updateSchema := byName["update_task"]["inputSchema"].(map[string]any)
+	if required := updateSchema["required"].([]string); len(required) != 2 || required[0] != "id" || required[1] != "version" {
+		t.Errorf("update_task required = %v, want id and version", required)
+	}
+
+	const detailBody = `{"id":"task-1","projectId":"project-1","columnId":"col-1","title":"A","description":"正文\n保留原样","version":3,"comments":[{"id":"comment-1","author":"mcp","text":"评论原样"}]}`
+	var listQueries []url.Values
+	var gotCreate map[string]any
+	var sawCreate, sawDetail bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/projects":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"project-1","workspacePath":"/tmp/project"}]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/projects":
+			sawCreate = true
+			if err := json.NewDecoder(r.Body).Decode(&gotCreate); err != nil {
+				t.Errorf("decode create_project body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"project-1","workspacePath":"/tmp/project"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tasks":
+			listQueries = append(listQueries, r.URL.Query())
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tasks/task-1":
+			sawDetail = true
+			_, _ = w.Write([]byte(detailBody))
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		return recorder.Result(), nil
+	})}
+	s := &server{agent: "mcp-test", base: "http://taskboard.test", http: httpClient}
+
+	projects, err := s.callTool("list_projects", nil)
+	if err != nil || projects != `[{"id":"project-1","workspacePath":"/tmp/project"}]` {
+		t.Fatalf("list_projects = %q, %v", projects, err)
+	}
+	_, err = s.callTool("create_project", json.RawMessage(`{"name":"No path"}`))
+	if err != nil || gotCreate["name"] != "No path" {
+		t.Fatalf("create_project without path body = %v, err = %v", gotCreate, err)
+	}
+	if _, ok := gotCreate["workspacePath"]; ok {
+		t.Fatalf("create_project without path sent workspacePath: %v", gotCreate)
+	}
+	created, err := s.callTool("create_project", json.RawMessage(`{"name":"Work","workspacePath":"/does/not/exist"}`))
+	if err != nil || !sawCreate || gotCreate["name"] != "Work" || gotCreate["workspacePath"] != "/does/not/exist" {
+		t.Fatalf("create_project body = %v, response = %q, err = %v", gotCreate, created, err)
+	}
+	if !strings.Contains(created, `"workspacePath":"/tmp/project"`) {
+		t.Errorf("create_project response lost workspacePath: %q", created)
+	}
+	_, err = s.callTool("list_tasks", json.RawMessage(`{"projectId":"project 1","columnId":"col/1","assignee":"Ada Lovelace","limit":20,"offset":5,"summary":true}`))
+	if err != nil {
+		t.Fatalf("list_tasks: %v", err)
+	}
+	if len(listQueries) != 1 {
+		t.Fatalf("list_tasks requests = %d, want 1", len(listQueries))
+	}
+	for key, want := range map[string]string{
+		"projectId": "project 1", "columnId": "col/1", "assignee": "Ada Lovelace",
+		"limit": "20", "offset": "5", "summary": "true",
+	} {
+		if got := listQueries[0].Get(key); got != want {
+			t.Errorf("list_tasks %s = %q, want %q", key, got, want)
+		}
+	}
+	_, err = s.callTool("list_tasks", json.RawMessage(`{"projectId":"local","includeArchived":true}`))
+	if len(listQueries) != 2 {
+		t.Fatalf("list_tasks requests = %d, want 2", len(listQueries))
+	}
+	if err != nil || listQueries[1].Get("includeArchived") != "true" || listQueries[1].Get("projectId") != "local" {
+		t.Errorf("legacy includeArchived call: query=%v, err=%v", listQueries[1], err)
+	}
+	gotDetail, err := s.callTool("get_task", json.RawMessage(`{"id":"task-1"}`))
+	if err != nil || gotDetail != detailBody || !sawDetail {
+		t.Fatalf("get_task = %q, err=%v, saw request=%v", gotDetail, err, sawDetail)
+	}
+	if _, err := s.callTool("list_tasks", json.RawMessage(`{"projectId":"local","limit":"20"}`)); err == nil {
+		t.Fatal("list_tasks accepted a non-integer limit")
 	}
 }
 

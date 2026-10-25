@@ -6,10 +6,11 @@ import "time"
 
 // IDs are short random hex strings, prefixed by kind for readability.
 type Project struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Columns   []Column  `json:"columns"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	WorkspacePath string    `json:"workspacePath,omitempty"`
+	Columns       []Column  `json:"columns"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 type Column struct {

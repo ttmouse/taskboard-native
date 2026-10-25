@@ -15,23 +15,13 @@ import (
 
 var variants = []string{"A · 快速缓出", "B · 柔和弹簧", "C · 错峰弹簧"}
 
-type motionState struct {
-	dragging                    map[string]bool
-	previewSlots                map[string]previewSlot
-	flights                     map[string]time.Time
-	dragGrabs                   map[string]ui.Point
-	dropStarts                  map[string]dropStart
-	variant                     string
-	phase                       string
+type playgroundState struct {
+	singleDemo, singleAuto      bool
+	variant, phase              string
 	running, autoStart, compare bool
 	demoCancel                  context.CancelFunc
 	nextStart                   time.Time
 	run                         int
-}
-
-type dropStart struct {
-	box ui.Rect
-	at  time.Time
 }
 
 func variantName(id string) string {
@@ -43,21 +33,11 @@ func variantName(id string) string {
 	return variants[1]
 }
 
-func (b *board) clearMotion() {
-	b.flights = nil
-	b.dragGrabs = nil
-	b.dropStarts = nil
-	b.previewSlots = nil
-	b.dragging = nil
-}
-func (b *board) forgetMotion(id string) {
-	delete(b.flights, id)
-	delete(b.dragGrabs, id)
-	delete(b.dragging, id)
-	delete(b.dropStarts, id)
-}
-
 func (b *board) topBar(c *ui.Context, t *ui.Theme) {
+	if b.singleAuto && !b.loading && !b.running {
+		b.singleAuto = false
+		b.startSingleDemo()
+	}
 	if b.autoStart && !b.loading && !b.running && !c.Now().Before(b.nextStart) {
 		b.autoStart = false
 		b.startDemo()
@@ -89,6 +69,10 @@ func (b *board) topBar(c *ui.Context, t *ui.Theme) {
 			}
 		})
 		ui.Row(c).FillWidth().Gap(t.Space(3)).Children(func() {
+			if ui.Button(c, "单卡 · 抬升 → 移动 → 落稳").Disabled(b.loading || b.running).Clicked() {
+				b.compare, b.autoStart = false, false
+				b.startSingleDemo()
+			}
 			ui.Text(c, b.variant+"  ·  "+b.motionDescription()).FontSize(fsm(t)).TextColor(t.TextMuted)
 			ui.Spacer(c)
 			ui.Text(c, b.phase).FontSize(fsm(t)).TextColor(t.TextMuted)
@@ -101,7 +85,7 @@ func (b *board) motionDescription() string {
 	case variants[0]:
 		return "260ms ease-out · 无错峰"
 	case variants[2]:
-		return "480ms spring · 0.12 回弹 · 55ms 错峰"
+		return "480ms spring · 0.12 回弹 · 抬升错峰 0/40/80ms"
 	default:
 		return "420ms spring · 0.04 回弹 · 无错峰"
 	}
@@ -113,6 +97,9 @@ func (b *board) stopDemo() {
 		b.demoCancel = nil
 	}
 	b.running = false
+	b.liftBatchAt = time.Time{}
+	b.liftBatchCount = 0
+	b.singleDemo, b.singleAuto = false, false
 	b.run++ // stale callbacks from a stopped run cannot change controls
 }
 
@@ -202,7 +189,7 @@ func (b *board) startDemo() {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
-					if e := move(i, name, offset+time.Duration(i)*120*time.Millisecond); e != nil {
+					if e := move(i, name, offset); e != nil {
 						errs <- e
 					}
 				}(i)
@@ -215,7 +202,7 @@ func (b *board) startDemo() {
 			return nil
 		}
 		for i, name := range []string{"进行中", "评审", "完成"} {
-			setPhase("三卡错峰移动 → " + name + " · API 间隔 120ms")
+			setPhase("三卡抬升错峰 0/40/80ms → " + name + " · 并行 API")
 			if err = wave(name, 1600*time.Millisecond+time.Duration(i)*1400*time.Millisecond); err != nil {
 				if ctx.Err() == nil {
 					fail(err)

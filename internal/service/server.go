@@ -265,7 +265,8 @@ func (s *Server) handleProjects(w http.ResponseWriter, _ *http.Request) {
 }
 
 type newProject struct {
-	Name string `json:"name"`
+	Name          string `json:"name"`
+	WorkspacePath string `json:"workspacePath"`
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
@@ -277,7 +278,20 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, "name is required")
 		return
 	}
-	project, err := s.store.CreateProject(req.Name, agent(r))
+	workspacePath := ""
+	if req.WorkspacePath != "" {
+		if !filepath.IsAbs(req.WorkspacePath) {
+			writeBadRequest(w, "workspacePath must be an absolute directory")
+			return
+		}
+		workspacePath = filepath.Clean(req.WorkspacePath)
+		info, err := os.Stat(workspacePath)
+		if err != nil || !info.IsDir() {
+			writeBadRequest(w, "workspacePath must be an existing directory")
+			return
+		}
+	}
+	project, err := s.store.CreateProjectWithPath(req.Name, workspacePath, agent(r))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -300,13 +314,150 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, "projectId is required")
 		return
 	}
+
+	columnID, hasColumn, err := optionalQueryValue(r, "columnId")
+	if err != nil {
+		writeBadRequest(w, "%v", err)
+		return
+	}
+	if hasColumn && columnID == "" {
+		writeBadRequest(w, "columnId must not be empty")
+		return
+	}
+	assignee, hasAssignee, err := optionalQueryValue(r, "assignee")
+	if err != nil {
+		writeBadRequest(w, "%v", err)
+		return
+	}
+	limitValue, hasLimit, err := optionalQueryValue(r, "limit")
+	if err != nil {
+		writeBadRequest(w, "%v", err)
+		return
+	}
+	limit := 0
+	if hasLimit {
+		limit, err = strconv.Atoi(limitValue)
+		if err != nil || limit < 1 || limit > 200 {
+			writeBadRequest(w, "limit must be an integer from 1 to 200")
+			return
+		}
+	}
+	offsetValue, hasOffset, err := optionalQueryValue(r, "offset")
+	if err != nil {
+		writeBadRequest(w, "%v", err)
+		return
+	}
+	if hasOffset && !hasLimit {
+		writeBadRequest(w, "offset requires limit")
+		return
+	}
+	offset := 0
+	if hasOffset {
+		offset, err = strconv.Atoi(offsetValue)
+		if err != nil || offset < 0 {
+			writeBadRequest(w, "offset must be a non-negative integer")
+			return
+		}
+	}
+	summaryValue, hasSummary, err := optionalQueryValue(r, "summary")
+	if err != nil {
+		writeBadRequest(w, "%v", err)
+		return
+	}
+	summary := false
+	if hasSummary {
+		switch summaryValue {
+		case "true":
+			summary = true
+		case "false":
+		default:
+			writeBadRequest(w, "summary must be true or false")
+			return
+		}
+	}
+
 	includeArchived, _ := strconv.ParseBool(r.URL.Query().Get("includeArchived"))
+	if hasColumn {
+		project, err := s.store.Project(projectID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !project.HasColumn(columnID) {
+			writeBadRequest(w, "columnId does not belong to project")
+			return
+		}
+	}
 	tasks, err := s.store.TasksByProject(projectID, includeArchived)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+
+	if hasColumn || hasAssignee {
+		filtered := make([]model.Task, 0, len(tasks))
+		for _, task := range tasks {
+			if hasColumn && task.ColumnID != columnID {
+				continue
+			}
+			if hasAssignee && task.Assignee != assignee {
+				continue
+			}
+			filtered = append(filtered, task)
+		}
+		tasks = filtered
+	}
+	if hasLimit {
+		if offset >= len(tasks) {
+			tasks = tasks[len(tasks):]
+		} else {
+			end := len(tasks)
+			if limit < end-offset {
+				end = offset + limit
+			}
+			tasks = tasks[offset:end]
+		}
+	}
+	if summary {
+		out := make([]taskSummary, 0, len(tasks))
+		for _, task := range tasks {
+			out = append(out, taskSummary{
+				ID:        task.ID,
+				ProjectID: task.ProjectID,
+				ColumnID:  task.ColumnID,
+				Title:     task.Title,
+				Version:   task.Version,
+				UpdatedAt: task.UpdatedAt,
+				UpdatedBy: task.UpdatedBy,
+				Assignee:  task.Assignee,
+			})
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
 	writeJSON(w, http.StatusOK, tasks)
+}
+
+func optionalQueryValue(r *http.Request, key string) (string, bool, error) {
+	values, ok := r.URL.Query()[key]
+	if !ok {
+		return "", false, nil
+	}
+	if len(values) != 1 {
+		return "", false, fmt.Errorf("%s must be provided once", key)
+	}
+	return values[0], true, nil
+}
+
+type taskSummary struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"projectId"`
+	ColumnID  string    `json:"columnId"`
+	Title     string    `json:"title"`
+	Version   int       `json:"version"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	UpdatedBy string    `json:"updatedBy"`
+	Assignee  string    `json:"assignee,omitempty"`
 }
 
 func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {

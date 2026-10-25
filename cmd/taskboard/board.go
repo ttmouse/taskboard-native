@@ -41,6 +41,9 @@ type api interface {
 // cardDrag is the value a dragged card carries between columns.
 type cardDrag string
 
+// curGlobal is the sidebar「全部项目」selection: tasks from every project.
+const curGlobal = "__global__"
+
 // cardMatch gives a card one identity across columns, so MyGo slides it
 // from the source column into the target instead of exit plus enter.
 type cardMatch struct{ ID string }
@@ -75,8 +78,15 @@ func (d *detail) stale() bool { return d.dirty() && d.pushed != nil }
 
 // form is a small dialog: a new task or a new project.
 type form struct {
+	open     bool
+	isTask   bool // true → 新建任务；false → 新建项目
+	name     string
+	columnID string // task form only: target column
+}
+
+// settings is the small preferences sheet (one toggle for now).
+type settings struct {
 	open bool
-	name string
 }
 
 // conflict shows the 409 the service answered, with the server's copy.
@@ -115,17 +125,26 @@ type board struct {
 	detail   *detail
 	form     *form
 	conflict *conflict
+	settings *settings // nil when the settings sheet is closed
+
+	prefs uiPrefs // persisted window preferences (title-only cards, …)
+
+	searchQuery string // top-bar filter: title + description, all columns
+
+	// colScrolls tracks per-column (and board) scroll offsets so the
+	// scrollbar theme can stay transparent until the user scrolls.
+	colScrolls map[string]*colScroll
 
 	frameCtx *ui.Context
 	curTheme *ui.Theme // the theme the current frame builds with
 
-	drafts map[string]string // columnID → quick-add text
+	drafts map[string]string // retained for tests; column quick-add UI removed
 
 	agent       string
 	streaming   bool                 // the SSE reader is running
 	recent      map[string]time.Time // task ID → until when it shows as changed
 	bounds      map[string]ui.Rect
-	motionState // empty in production; experiments are build-tagged
+	motionState // accepted motion shared with the Playground
 }
 
 func newBoard(a api) *board {
@@ -137,6 +156,9 @@ func newBoard(a api) *board {
 		agent:  "gui",
 		recent: map[string]time.Time{},
 		bounds: map[string]ui.Rect{},
+		prefs:  loadUIPrefs(),
+		// Launch into「全部项目」, not a concrete board like local.
+		cur: curGlobal,
 	}
 	b.load()
 	b.startStream()
@@ -189,13 +211,28 @@ func (b *board) load() {
 			return
 		}
 		target := b.cur
-		if target == "" || !hasProject(ps, target) {
+		wantGlobal := target == curGlobal
+		if target == "" {
+			// Empty selection → launch/reload into「全部项目」.
+			wantGlobal = true
+			target = curGlobal
+		} else if !wantGlobal && !hasProject(ps, target) {
 			target = defaultProject(ps)
 		}
-		if target == "" {
+		if target == "" && !wantGlobal {
 			b.post(func() {
 				b.projects, b.cur, b.columns, b.tasks = ps, "", nil, nil
 				b.loading = false
+			})
+			return
+		}
+		if wantGlobal {
+			b.post(func() {
+				b.projects = ps
+				b.loading = false
+				b.switching = false
+				b.cur = "" // force openGlobal to run
+				b.openGlobal()
 			})
 			return
 		}
@@ -214,6 +251,64 @@ func (b *board) load() {
 			if len(b.columns) == 0 {
 				b.columns = bd.Project.Columns
 			}
+			b.sortTasks()
+		})
+	}()
+}
+
+
+// openGlobal loads every project's board and merges cards by column name
+// onto the first board's column set (usually local / primary).
+func (b *board) openGlobal() {
+	if b.cur == curGlobal {
+		return
+	}
+	b.switching = true
+	b.loadErr = ""
+	ps := append([]model.Project(nil), b.projects...)
+	go func() {
+		var cols []model.Column
+		var all []model.Task
+		byName := map[string]string{} // column name → dest id
+		for _, p := range ps {
+			bd, err := b.api.Board(p.ID)
+			if err != nil {
+				continue
+			}
+			src := bd.Columns
+			if len(src) == 0 {
+				src = bd.Project.Columns
+			}
+			if cols == nil && len(src) > 0 {
+				cols = append([]model.Column(nil), src...)
+				for _, c := range cols {
+					byName[c.Name] = c.ID
+				}
+			}
+			idMap := map[string]string{}
+			for _, c := range src {
+				if dest, ok := byName[c.Name]; ok {
+					idMap[c.ID] = dest
+				}
+			}
+			for _, task := range bd.Tasks {
+				if dest, ok := idMap[task.ColumnID]; ok {
+					task.ColumnID = dest
+				}
+				all = append(all, task)
+			}
+		}
+		b.post(func() {
+			b.switching = false
+			if cols == nil {
+				b.loadErr = "没有可合并的项目看板"
+				return
+			}
+			b.cur = curGlobal
+			b.columns = cols
+			b.tasks = all
+			b.detail = nil
+			b.clearMotion()
 			b.sortTasks()
 		})
 	}()
@@ -273,7 +368,8 @@ func (b *board) stop() {
 
 // applyEvent merges one pushed change.
 func (b *board) applyEvent(ev model.Event) {
-	if ev.ProjectID != "" && b.cur != "" && ev.ProjectID != b.cur {
+	// Global view listens to every project; single-project view stays scoped.
+	if ev.ProjectID != "" && b.cur != "" && b.cur != curGlobal && ev.ProjectID != b.cur {
 		return
 	}
 	switch ev.Type {
@@ -281,10 +377,15 @@ func (b *board) applyEvent(ev model.Event) {
 		if ev.Task == nil {
 			return
 		}
-		if !b.upsert(*ev.Task) {
+		task := *ev.Task
+		b.normalizeTaskColumns(&task)
+		if !b.upsert(task) {
 			return
 		}
-		b.touchDetail(*ev.Task)
+		b.touchDetail(task)
+		if ev.Type == model.EventTaskCreated {
+			playCreateCue()
+		}
 		if ev.By != "" && ev.By != b.agent {
 			b.recent[ev.Task.ID] = time.Now().Add(600 * time.Millisecond)
 		}
@@ -321,6 +422,8 @@ func hasProject(ps []model.Project, id string) bool {
 	return false
 }
 
+// defaultProject picks a concrete board when the current id vanished
+// (deleted project). Launch itself defaults to curGlobal, not this.
 func defaultProject(ps []model.Project) string {
 	for _, p := range ps {
 		if p.Name == "local" {
@@ -346,7 +449,19 @@ func (b *board) projectName() string {
 	if p := b.project(); p != nil {
 		return p.Name
 	}
+	if b.cur == curGlobal {
+		return "全部项目"
+	}
 	return "项目"
+}
+
+func (b *board) projectNameByID(id string) string {
+	for _, p := range b.projects {
+		if p.ID == id {
+			return p.Name
+		}
+	}
+	return ""
 }
 
 func (b *board) task(id string) *model.Task {
@@ -358,13 +473,73 @@ func (b *board) task(id string) *model.Task {
 	return nil
 }
 
-// tasksIn returns the column's tasks in board order.
+
+// colScroll remembers a scroll container's place and when its bar should show.
+type colScroll struct {
+	state         ui.ScrollState
+	lastX, lastY  float32
+	armed         bool
+	showUntil     time.Time
+}
+
+func (b *board) columnScroll(id string) *colScroll {
+	if b.colScrolls == nil {
+		b.colScrolls = map[string]*colScroll{}
+	}
+	s, ok := b.colScrolls[id]
+	if !ok {
+		s = &colScroll{}
+		b.colScrolls[id] = s
+	}
+	return s
+}
+
+// noteScroll marks the scrollbar visible for a short time after the offset moves.
+func (b *board) noteScroll(s *colScroll) {
+	if s == nil {
+		return
+	}
+	if !s.armed {
+		s.lastX, s.lastY, s.armed = s.state.X, s.state.Y, true
+		return
+	}
+	if s.state.X == s.lastX && s.state.Y == s.lastY {
+		return
+	}
+	s.lastX, s.lastY = s.state.X, s.state.Y
+	until := time.Now().Add(850 * time.Millisecond)
+	s.showUntil = until
+	go func() {
+		time.Sleep(time.Until(until) + 20*time.Millisecond)
+		b.post(func() {}) // redraw so the bar can hide again
+	}()
+}
+
+func (b *board) scrollbarActive() bool {
+	now := time.Now()
+	for _, s := range b.colScrolls {
+		if now.Before(s.showUntil) {
+			return true
+		}
+	}
+	return false
+}
+
+// tasksIn returns the column's tasks in board order, honoring searchQuery.
 func (b *board) tasksIn(columnID string) []model.Task {
 	var out []model.Task
+	q := strings.ToLower(strings.TrimSpace(b.searchQuery))
 	for _, t := range b.tasks {
-		if t.ColumnID == columnID {
-			out = append(out, t)
+		if t.ColumnID != columnID {
+			continue
 		}
+		if q != "" {
+			hay := strings.ToLower(t.Title + "\n" + t.Description)
+			if !strings.Contains(hay, q) {
+				continue
+			}
+		}
+		out = append(out, t)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Position != out[j].Position {
@@ -373,6 +548,16 @@ func (b *board) tasksIn(columnID string) []model.Task {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
 	return out
+}
+
+// taskMatchesSearch reports whether a task matches the current query
+// (empty query matches everything).
+func (b *board) taskMatchesSearch(t model.Task) bool {
+	q := strings.ToLower(strings.TrimSpace(b.searchQuery))
+	if q == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(t.Title+"\n"+t.Description), q)
 }
 
 func (b *board) sortTasks() {
@@ -407,6 +592,75 @@ func (b *board) columnName(id string) string {
 	return id
 }
 
+// mapToProjectColumnID turns a board (possibly merged) column id into the
+// column id that belongs to projectID. Needed so Move hits the right
+// project in 全部项目 view.
+func (b *board) mapToProjectColumnID(boardColumnID, projectID string) string {
+	if b.cur != curGlobal || boardColumnID == "" || projectID == "" {
+		return boardColumnID
+	}
+	name := b.columnName(boardColumnID)
+	if name == "" || name == boardColumnID {
+		// columnName falls back to id when unknown; try projects directly.
+		for _, p := range b.projects {
+			for _, c := range p.Columns {
+				if c.ID == boardColumnID {
+					name = c.Name
+					break
+				}
+			}
+		}
+	}
+	if name == "" || name == boardColumnID {
+		return boardColumnID
+	}
+	for _, p := range b.projects {
+		if p.ID != projectID {
+			continue
+		}
+		for _, c := range p.Columns {
+			if c.Name == name {
+				return c.ID
+			}
+		}
+	}
+	return boardColumnID
+}
+
+// mapToBoardColumnID remaps a project-local column id onto the merged
+// board columns used while cur == curGlobal.
+func (b *board) mapToBoardColumnID(projectColumnID, projectID string) string {
+	if b.cur != curGlobal || projectColumnID == "" {
+		return projectColumnID
+	}
+	var name string
+	for _, p := range b.projects {
+		if p.ID != projectID {
+			continue
+		}
+		for _, c := range p.Columns {
+			if c.ID == projectColumnID {
+				name = c.Name
+				break
+			}
+		}
+	}
+	if name == "" {
+		return projectColumnID
+	}
+	if id := b.columnID(name); id != "" {
+		return id
+	}
+	return projectColumnID
+}
+
+func (b *board) normalizeTaskColumns(t *model.Task) {
+	if t == nil || b.cur != curGlobal {
+		return
+	}
+	t.ColumnID = b.mapToBoardColumnID(t.ColumnID, t.ProjectID)
+}
+
 func (b *board) columnNames() []string {
 	out := make([]string, len(b.columns))
 	for i, c := range b.columns {
@@ -427,14 +681,16 @@ func (b *board) upsert(t model.Task) bool {
 		if t.Version < b.tasks[i].Version {
 			return false
 		}
+		b.reconcilePlacement(t)
 		b.noteMove(b.tasks[i], t)
 		b.tasks[i] = t
 		b.sortTasks()
 		return true
 	}
-	if b.cur != "" && t.ProjectID != b.cur {
+	if b.cur != "" && b.cur != curGlobal && t.ProjectID != b.cur {
 		return false
 	}
+	b.reconcilePlacement(t)
 	b.tasks = append(b.tasks, t)
 	b.sortTasks()
 	return true
@@ -445,7 +701,9 @@ func (b *board) remove(id string) bool {
 		if b.tasks[i].ID != id {
 			continue
 		}
+		columnID := b.tasks[i].ColumnID
 		b.tasks = append(b.tasks[:i], b.tasks[i+1:]...)
+		b.compactColumn(columnID, "")
 		b.forgetMotion(id)
 		if b.detail != nil && b.detail.id == id {
 			b.detail = nil
@@ -453,6 +711,43 @@ func (b *board) remove(id string) bool {
 		return true
 	}
 	return false
+}
+
+// The service renumbers both affected columns but pushes only the moved
+// card. Reconstruct those sibling positions without changing versions or
+// treating passive neighbors as actively moving cards.
+func (b *board) reconcilePlacement(task model.Task) {
+	if from := b.task(task.ID); from != nil && from.ColumnID != task.ColumnID {
+		b.compactColumn(from.ColumnID, task.ID)
+	}
+	if task.Position <= 0 {
+		return
+	}
+	var others []model.Task
+	for _, item := range b.tasksIn(task.ColumnID) {
+		if item.ID != task.ID {
+			others = append(others, item)
+		}
+	}
+	at := min(max(int(task.Position/1000)-1, 0), len(others))
+	for i, item := range others {
+		position := i + 1
+		if i >= at {
+			position++
+		}
+		b.task(item.ID).Position = float64(position * 1000)
+	}
+}
+
+func (b *board) compactColumn(columnID, excludeID string) {
+	position := 0
+	for _, item := range b.tasksIn(columnID) {
+		if item.ID == excludeID {
+			continue
+		}
+		position++
+		b.task(item.ID).Position = float64(position * 1000)
+	}
 }
 
 func (b *board) appendComment(taskID string, cm model.Comment) bool {
@@ -617,10 +912,16 @@ func (b *board) moveTask(id, toColumn, afterID string, atTop bool) {
 	if t == nil {
 		return
 	}
+	// Completing (bare drop into「完成」) always lands at the column top.
+	if !atTop && afterID == "" && b.columnName(toColumn) == "完成" {
+		atTop = true
+	}
 	if t.ColumnID == toColumn && !atTop && afterID == "" {
 		return
 	}
 	cur := *t
+	// Board columns may be a merged view; the API needs this task's project column id.
+	apiColumn := b.mapToProjectColumnID(toColumn, cur.ProjectID)
 	optimistic := cur
 	optimistic.ColumnID = toColumn
 	optimistic.Version++
@@ -630,7 +931,7 @@ func (b *board) moveTask(id, toColumn, afterID string, atTop bool) {
 		b.detail.column = b.columnName(toColumn)
 	}
 	go func() {
-		_, err := b.api.Move(cur.ID, cur.Version, toColumn, afterID, atTop)
+		_, err := b.api.Move(cur.ID, cur.Version, apiColumn, afterID, atTop)
 		if err != nil {
 			b.post(func() {
 				if fresh, ferr := b.api.Task(cur.ID); ferr == nil {
@@ -705,6 +1006,17 @@ func (b *board) sendComment() {
 	}()
 }
 
+
+// playColumnChangeCue soft-clicks on a real column change; a landing in
+// 「完成」gets the done chime instead. Load/openProject never call this.
+func (b *board) playColumnChangeCue(toColumnID string) {
+	if b.columnName(toColumnID) == "完成" {
+		playDoneCue()
+		return
+	}
+	playMoveCue()
+}
+
 func (b *board) createProject() {
 	f := b.form
 	if f == nil {
@@ -736,17 +1048,20 @@ func (b *board) createProject() {
 
 // replace swaps a task by ID, ignoring copies older than the stored one.
 func (b *board) replace(t model.Task) {
+	b.normalizeTaskColumns(&t)
 	for i := range b.tasks {
 		if b.tasks[i].ID == t.ID {
 			if t.Version < b.tasks[i].Version {
 				return
 			}
+			b.reconcilePlacement(t)
 			b.noteMove(b.tasks[i], t)
 			b.tasks[i] = t
 			b.sortTasks()
 			return
 		}
 	}
+	b.reconcilePlacement(t)
 	b.tasks = append(b.tasks, t)
 	b.sortTasks()
 }

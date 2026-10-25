@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -62,6 +63,10 @@ func run(args []string) int {
 		return cmdProjects(rest)
 	case "list":
 		return cmdList(rest)
+	case "show":
+		return cmdShow(rest)
+	case "project":
+		return cmdProject(rest)
 	case "add":
 		return cmdAdd(rest)
 	case "move":
@@ -84,8 +89,10 @@ func usage() {
 
   tb [--agent WHO] [--addr ADDR] <command>
 
-  tb projects
-  tb list    [--project ID]
+  tb projects [--json]
+  tb project add NAME [--path ABSOLUTE_DIRECTORY] [--json]
+  tb list    [--project ID] [--column NAME|ID] [--assignee WHO] [--limit N --offset N] [--summary] [--json]
+  tb show    <taskID> [--json]
   tb add     <title> [--project ID] [--column NAME|ID] [--body TEXT] [--assignee WHO]
   tb move    <taskID> <column NAME|ID> [--top] [--after CARD_ID]
   tb comment <taskID> <body>
@@ -102,6 +109,7 @@ func cmdProjects(args []string) int {
 	fs.SetOutput(io.Discard)
 	addr := fs.String("addr", "", "service address")
 	agent := fs.String("agent", "", "agent identity")
+	asJSON := fs.Bool("json", false, "output JSON")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "tb projects: %v\n", err)
 		return exitUsage
@@ -110,12 +118,24 @@ func cmdProjects(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	projects, err := c.projects()
+	projectsRaw, err := c.projectsRaw()
 	if err != nil {
 		return fail(err)
 	}
+	if *asJSON {
+		fmt.Println(string(projectsRaw))
+		return exitOK
+	}
+	var projects []projectInfo
+	if err := json.Unmarshal(projectsRaw, &projects); err != nil {
+		return fail(err)
+	}
 	for _, p := range projects {
-		fmt.Printf("%s\t%s\n", p.ID, p.Name)
+		if p.WorkspacePath == "" {
+			fmt.Printf("%s\t%s\n", p.ID, p.Name)
+			continue
+		}
+		fmt.Printf("%s\t%s\t%s\n", p.ID, p.Name, p.WorkspacePath)
 	}
 	return exitOK
 }
@@ -124,10 +144,41 @@ func cmdList(args []string) int {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	project := fs.String("project", "", "project id")
+	column := fs.String("column", "", "column name or id")
+	assignee := fs.String("assignee", "", "exact assignee filter")
+	limit := fs.Int("limit", 0, "maximum number of tasks (1-200)")
+	offset := fs.Int("offset", 0, "number of matching tasks to skip")
+	summary := fs.Bool("summary", false, "return summary fields without descriptions or comments")
+	asJSON := fs.Bool("json", false, "output JSON")
 	addr := fs.String("addr", "", "service address")
 	agent := fs.String("agent", "", "agent identity")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "tb list: %v\n", err)
+		return exitUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "tb list: unexpected positional arguments")
+		return exitUsage
+	}
+	limitSet, offsetSet := false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "limit":
+			limitSet = true
+		case "offset":
+			offsetSet = true
+		}
+	})
+	if limitSet && (*limit < 1 || *limit > 200) {
+		fmt.Fprintln(os.Stderr, "tb list: --limit must be between 1 and 200")
+		return exitUsage
+	}
+	if *offset < 0 {
+		fmt.Fprintln(os.Stderr, "tb list: --offset must be non-negative")
+		return exitUsage
+	}
+	if offsetSet && !limitSet {
+		fmt.Fprintln(os.Stderr, "tb list: --offset requires --limit")
 		return exitUsage
 	}
 	c, err := ensureClient(*addr, *agent)
@@ -135,9 +186,18 @@ func cmdList(args []string) int {
 		return fail(err)
 	}
 	projectID := *project
+	var projects []projectInfo
+	projectsLoaded := false
+	loadProjects := func() error {
+		if projectsLoaded {
+			return nil
+		}
+		projects, err = c.projects()
+		projectsLoaded = true
+		return err
+	}
 	if projectID == "" {
-		projects, err := c.projects()
-		if err != nil {
+		if err := loadProjects(); err != nil {
 			return fail(err)
 		}
 		if len(projects) == 0 {
@@ -146,20 +206,167 @@ func cmdList(args []string) int {
 		}
 		projectID = projects[0].ID
 	}
-	board, err := c.board(projectID)
+	var columns []model.Column
+	if *column != "" || !*asJSON {
+		if err := loadProjects(); err != nil {
+			return fail(err)
+		}
+		if p, ok := findProject(projects, projectID); ok {
+			columns = p.Columns
+		}
+	}
+	query := make(url.Values)
+	query.Set("projectId", projectID)
+	if *column != "" {
+		columnID, err := resolveColumn(columns, *column)
+		if err != nil {
+			return fail(err)
+		}
+		query.Set("columnId", columnID)
+	}
+	if *assignee != "" {
+		query.Set("assignee", *assignee)
+	}
+	if limitSet {
+		query.Set("limit", fmt.Sprint(*limit))
+		query.Set("offset", fmt.Sprint(*offset))
+	}
+	if *summary {
+		query.Set("summary", "true")
+	}
+	tasksRaw, err := c.tasks(query)
 	if err != nil {
 		return fail(err)
 	}
-	names := make(map[string]string, len(board.Columns))
-	for _, col := range board.Columns {
+	if *asJSON {
+		fmt.Println(string(tasksRaw))
+		return exitOK
+	}
+	var tasks []model.Task
+	if err := json.Unmarshal(tasksRaw, &tasks); err != nil {
+		return fail(err)
+	}
+	names := make(map[string]string, len(columns))
+	for _, col := range columns {
 		names[col.ID] = col.Name
 	}
-	for _, t := range board.Tasks {
+	for _, t := range tasks {
 		column := names[t.ColumnID]
 		if column == "" {
 			column = t.ColumnID
 		}
 		fmt.Printf("%s\t%s\t%s\tv%d\t%s\n", t.ID, column, t.Title, t.Version, t.UpdatedBy)
+	}
+	return exitOK
+}
+
+func cmdShow(args []string) int {
+	fs := flag.NewFlagSet("show", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	addr := fs.String("addr", "", "service address")
+	agent := fs.String("agent", "", "agent identity")
+	asJSON := fs.Bool("json", false, "output JSON")
+	if err := fs.Parse(reorderArgs(args, "json")); err != nil {
+		fmt.Fprintf(os.Stderr, "tb show: %v\n", err)
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "tb show: usage: tb show <taskID> [--json]")
+		return exitUsage
+	}
+	c, err := ensureClient(*addr, *agent)
+	if err != nil {
+		return fail(err)
+	}
+	raw, err := c.taskRaw(fs.Arg(0))
+	if err != nil {
+		return fail(err)
+	}
+	if *asJSON {
+		fmt.Println(string(raw))
+		return exitOK
+	}
+	var task model.Task
+	if err := json.Unmarshal(raw, &task); err != nil {
+		return fail(err)
+	}
+	printTask(os.Stdout, task)
+	return exitOK
+}
+
+func printTask(w io.Writer, task model.Task) {
+	fmt.Fprintf(w, "ID:\t%s\nTitle:\t%s\nProject:\t%s\nColumn:\t%s\n", task.ID, task.Title, task.ProjectID, task.ColumnID)
+	if task.Assignee != "" {
+		fmt.Fprintf(w, "Assignee:\t%s\n", task.Assignee)
+	}
+	fmt.Fprintf(w, "Version:\tv%d\nUpdated:\t%s\nUpdated by:\t%s\nDescription:\n", task.Version, task.UpdatedAt.Format(time.RFC3339), task.UpdatedBy)
+	printIndented(w, task.Description, "  ")
+	fmt.Fprintf(w, "Comments (%d):\n", len(task.Comments))
+	for _, comment := range task.Comments {
+		fmt.Fprintf(w, "  [%s] %s:\n", comment.CreatedAt.Format(time.RFC3339), comment.Author)
+		printIndented(w, comment.Text, "    ")
+	}
+}
+
+func printIndented(w io.Writer, text, indent string) {
+	if text == "" {
+		fmt.Fprintf(w, "%s\n", indent)
+		return
+	}
+	for _, line := range strings.Split(text, "\n") {
+		fmt.Fprintf(w, "%s%s\n", indent, line)
+	}
+}
+
+func cmdProject(args []string) int {
+	addAt := 0
+	for addAt < len(args) && args[addAt] != "add" {
+		if (args[addAt] == "--addr" || args[addAt] == "--agent") && addAt+1 < len(args) {
+			addAt += 2
+			continue
+		}
+		break
+	}
+	if addAt >= len(args) || args[addAt] != "add" {
+		fmt.Fprintln(os.Stderr, "tb project: usage: tb project add NAME [--path ABSOLUTE_DIRECTORY] [--json]")
+		return exitUsage
+	}
+	fs := flag.NewFlagSet("project add", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	path := fs.String("path", "", "project workspace path")
+	addr := fs.String("addr", "", "service address")
+	agent := fs.String("agent", "", "agent identity")
+	asJSON := fs.Bool("json", false, "output JSON")
+	commandArgs := append(append([]string{}, args[:addAt]...), args[addAt+1:]...)
+	if err := fs.Parse(reorderArgs(commandArgs, "json")); err != nil {
+		fmt.Fprintf(os.Stderr, "tb project add: %v\n", err)
+		return exitUsage
+	}
+	name := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "tb project add: name required")
+		return exitUsage
+	}
+	c, err := ensureClient(*addr, *agent)
+	if err != nil {
+		return fail(err)
+	}
+	raw, err := c.createProject(name, *path)
+	if err != nil {
+		return fail(err)
+	}
+	if *asJSON {
+		fmt.Println(string(raw))
+		return exitOK
+	}
+	var project projectInfo
+	if err := json.Unmarshal(raw, &project); err != nil {
+		return fail(err)
+	}
+	if project.WorkspacePath == "" {
+		fmt.Printf("%s\t%s\n", project.ID, project.Name)
+	} else {
+		fmt.Printf("%s\t%s\t%s\n", project.ID, project.Name, project.WorkspacePath)
 	}
 	return exitOK
 }
@@ -422,6 +629,15 @@ func resolveColumn(columns []model.Column, want string) (string, error) {
 	return "", fmt.Errorf("unknown column %q (available: %s)", want, strings.Join(names, ", "))
 }
 
+func findProject(projects []projectInfo, id string) (projectInfo, bool) {
+	for _, project := range projects {
+		if project.ID == id {
+			return project, true
+		}
+	}
+	return projectInfo{}, false
+}
+
 func fail(err error) int {
 	fmt.Fprintf(os.Stderr, "tb: %v\n", err)
 	return exitError
@@ -433,6 +649,15 @@ type client struct {
 	base  string
 	agent string
 	http  *http.Client
+}
+
+// projectInfo is the read-only project shape used by the CLI. Keeping the
+// workspace path here also lets older model builds preserve that API field.
+type projectInfo struct {
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	WorkspacePath string         `json:"workspacePath,omitempty"`
+	Columns       []model.Column `json:"columns"`
 }
 
 func clientFor(addr string) *client {
@@ -517,9 +742,21 @@ func (c *client) health() error {
 	return nil
 }
 
-func (c *client) projects() ([]model.Project, error) {
-	var out []model.Project
+func (c *client) projectsRaw() (json.RawMessage, error) {
+	var out json.RawMessage
 	return out, c.get("/api/projects", &out)
+}
+
+func (c *client) projects() ([]projectInfo, error) {
+	raw, err := c.projectsRaw()
+	if err != nil {
+		return nil, err
+	}
+	var out []projectInfo
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *client) board(projectID string) (service.Board, error) {
@@ -530,6 +767,25 @@ func (c *client) board(projectID string) (service.Board, error) {
 func (c *client) task(id string) (model.Task, error) {
 	var out model.Task
 	return out, c.get("/api/tasks/"+id, &out)
+}
+
+func (c *client) taskRaw(id string) (json.RawMessage, error) {
+	var out json.RawMessage
+	return out, c.get("/api/tasks/"+url.PathEscape(id), &out)
+}
+
+func (c *client) tasks(query url.Values) (json.RawMessage, error) {
+	var out json.RawMessage
+	return out, c.get("/api/tasks?"+query.Encode(), &out)
+}
+
+func (c *client) createProject(name, workspacePath string) (json.RawMessage, error) {
+	body := map[string]string{"name": name}
+	if workspacePath != "" {
+		body["workspacePath"] = workspacePath
+	}
+	var out json.RawMessage
+	return out, c.send(http.MethodPost, "/api/projects", body, &out, http.StatusCreated)
 }
 
 func (c *client) createTask(task model.Task) (model.Task, error) {
