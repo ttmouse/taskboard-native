@@ -20,14 +20,12 @@ import (
 
 // --- palette ---
 
-// colFace is the column panel's fill: one step off the window in either
-// appearance.
-func colFace(t *ui.Theme) ui.Color {
-	if t.Dark {
-		return t.Background
-	}
-	return t.Surface
-}
+// colFace is the column panel's fill: none. The board used to paint every
+// column with a tone of its own, which on light became a second, larger
+// block behind the cards. The columns are told apart by their headers, the
+// space between them and the cards' own edges, so the window face runs
+// uninterrupted from the top bar down.
+func colFace(*ui.Theme) ui.Color { return ui.Transparent }
 
 // cardFace is a resting card's fill, cardHover its fill under the pointer.
 // sidebarSelected is the quiet neutral wash for the active project row
@@ -46,20 +44,26 @@ func cardFace(t *ui.Theme) ui.Color {
 	return t.Background
 }
 
+// cardEdge is a resting card's outline. A card that shares the window's
+// face on light has to hold its shape by its edge, which the old column
+// panel used to do for it.
+func cardEdge(t *ui.Theme) ui.Color { return t.Border }
+
 // cardHover is a resting card's fill under the pointer. It must never
-// equal the column's own face: on light, the card is Background over a
-// Surface column, so hover goes one step further to SurfaceHover; on dark,
-// the card is Surface over a Background column, so hover goes lighter.
+// equal the column's own face: with no column tone, a hover that stepped to
+// SurfaceHover in both appearances would be the only block on the board,
+// so the fill moves one step off the card's own face — darker on light,
+// lighter on dark.
 func cardHover(t *ui.Theme) ui.Color {
 	if t.Dark {
 		return t.SurfaceHover
 	}
-	return t.SurfaceHover
+	return t.Surface
 }
 
-// The column panel itself carries no outline: in either appearance it is
-// one clean step of tone against the window, and the cards carry the
-// only borders on the board. The accent appears when a drag hovers.
+// The column panel carries neither fill nor outline: the window face runs
+// behind it, and the cards hold their own edges (cardEdge). The accent
+// appears when a drag hovers.
 
 // typeScale is the design's f-* steps relative to the theme's size.
 func fxs(t *ui.Theme) float32 { return t.FontSize - 2 }
@@ -112,9 +116,10 @@ func (b *board) view(c *ui.Context) {
 	// Window shortcuts wait while a modal is up, so it never fires under
 	// the detail dialog, search, or a form.
 	c.OnShortcut(ui.Cmd, ui.KeyN, func() { b.openTaskForm(b.defaultTaskColumnID()) })
-	// Cmd+Shift+L cycles 外观 (跟随系统 → 浅色 → 深色), the same setting the
-	// settings sheet's 外观 row carries; it works under a modal too, since
-	// changing the appearance of an open sheet is safe.
+	// Cmd+Shift+L cycles 外观 (跟随系统 → 浅色 → 深色), the same choice the
+	// settings sheet's 外观 row carries, for turning it from the keyboard.
+	// Like the other window shortcuts it waits while a dialog is up; the
+	// sheet's own segmented control is the way to switch from inside one.
 	c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyL, b.cycleAppearance)
 	content := func() {
 		ui.Column(c).Fill().Children(func() {
@@ -845,8 +850,10 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 		panel = panel.FillHeight()
 	}
 	panel = panel.
-		// Inner pad: Y s2 / X s1 — tight inter-column air without crowding
-		// cards into the scrollbar gutter (gutter still reserved below).
+		// The panel has no face of its own (colFace), so the inner pad is
+		// air, not a frame: Y s2 keeps the first card off the header, X s1
+		// keeps cards off the scrollbar gutter. Vertical air between the
+		// panel edge and the header comes from the board's own padding.
 		Padding(t.Space(2), t.Space(1)).Gap(t.Space(2)).Radius(t.Radius + 4).
 		Background(colFace(t)).
 		Role(ui.RoleGroup).
@@ -927,9 +934,11 @@ func (b *board) createTop(projectID, columnID, title string) {
 // that wrote it last, and when — because who moved a task is this
 // board's story.
 func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Element {
-	// No resting border: cardFace vs colFace carries the edge (theme tokens).
+	// The column has no tone of its own, so the card's 1 DIP edge is what
+	// draws it on the window (cardEdge).
 	card := ui.Box(c.Key(task.ID)).FillWidth().
-		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius + 2).BorderWidth(0).
+		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius + 2).
+		Border(1, cardEdge(t)).
 		Focusable().Cursor(ui.CursorPointer).Role(ui.RoleButton).
 		Label("打开任务：" + task.Title).
 		Drag(cardDrag(task.ID))
@@ -1162,20 +1171,19 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					// transparent). Swapping Text ↔ input on hover shifted layout
 					// because the widgets disagree on intrinsic padding.
 					//
-					// Padding is zero, not "small": the input's own inset would push
-					// the title and the body a step to the right of the header, the
-					// select and the comment cards, which read as a ragged left
-					// margin down the sheet.
+					// Unfilled title/body fields align directly with the sheet header.
 					ui.TextInput(c, &d.title).Label("任务标题").Placeholder("任务标题").
 						FillWidth().FontSize(fmd(t)).FontWeight(500).
 						BorderWidth(0).Background(ui.Transparent).
 						Padding(0, 0)
 					d.editTitle = false
 
-					ui.TextArea(c, &d.body).Label("任务正文").Placeholder("添加任务描述…").
+					bodyInput := ui.TextArea(c, &d.body).Label("任务正文").Placeholder("添加任务描述，可粘贴图片…").
 						FillWidth().MinHeight(t.Space(30)).
 						BorderWidth(0).Background(ui.Transparent).
 						Padding(0, 0)
+					b.imageInput(bodyInput, d, &d.body, &d.bodyImage, mygo.Clipboard.ReadImage)
+					b.imagePreview(c.Key("body-preview"), &d.body, &d.bodyImage, "正文")
 					d.editBody = false
 
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(t.Space(3)).Children(func() {
@@ -1187,9 +1195,8 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 								d.column = names[0]
 							}
 						}
-						// The select's hairline is the row's left edge, so -Space(1)
-						// moves that edge onto the same line as the text above it.
-						if ui.Select(c, &d.column, names).Label("移动到列").MarginStart(-t.Space(1)).Changed() {
+						// Keep the complete rounded border inside the scroll viewport.
+						if ui.Select(c, &d.column, names).Label("移动到列").Changed() {
 							if colID := b.columnID(d.column); colID != "" {
 								b.moveTask(d.id, colID, "", false)
 							}
@@ -1217,12 +1224,9 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						ui.Column(c).FillWidth().Gap(t.Space(2)).Children(func() {
 							for i := range d.comments {
 								cm := &d.comments[i]
-								// The card's fill, not its inner padding, is the row
-								// that must line up: no inset on the sheet's left, so
-								// the comment's first glyph sits on the same edge as
-								// the title above it.
+								// Align the surface with the sheet; inset its content equally.
 								ui.Box(c.Key("c-"+cm.ID)).FillWidth().
-									Padding(t.Space(2.5), t.Space(3), t.Space(2.5), 0).Gap(t.Space(1.5)).
+									Padding(t.Space(2.5), t.Space(3)).Gap(t.Space(1.5)).
 									Radius(t.Radius + 2).BorderWidth(0).
 									Background(t.SurfaceHover.Alpha(0.55)).Children(func() {
 									ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
@@ -1232,32 +1236,43 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 										ui.Text(c, cm.CreatedAt.Format("01-02 15:04")).
 											FontSize(fxs(t)).TextColor(t.TextMuted)
 									})
-									ui.Text(c, cm.Text).FontSize(t.FontSize).TextColor(t.Text)
+									b.detailMarkdown(c, cm.Text)
 								})
 							}
 						})
 					}
 				})
 			})
-			// The composer's own box edges the sheet on the left (padding 0 in
-			// front) so the placeholder shares the row edge with every other
-			// line; its 写评论 input drops its inner inset for the same reason.
-			ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5), t.Space(2), 0).Gap(t.Space(2)).
+			// The outer surface supplies equal insets; the input adds none.
+			ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5)).Gap(t.Space(2)).
 				Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4)).
 				Children(func() {
 					ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-						input := ui.TextInput(c, &d.comment).Placeholder("写评论，回车发送").Label("写评论").
-							Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent).
+						input := ui.TextArea(c, &d.comment).Placeholder("写评论或粘贴图片，回车发送").Label("写评论").
+							Lines(1, 4).MinHeight(0).Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent).
 							Padding(0, 0)
+						b.imageInput(input, d, &d.comment, &d.commentImage, mygo.Clipboard.ReadImage)
+						input.OnTextKey(func(key ui.TextKey) bool {
+							if key.Key != ui.KeyEnter || key.Mods&ui.Shift != 0 {
+								return false
+							}
+							d.comment = key.Text()
+							b.sendComment()
+							key.SetText(d.comment)
+							return true
+						})
 						if b.commenting {
 							loading.BouncingDots(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在发送评论")
 						}
 						send := ui.Button(c, "发送").Label("发送评论").
 							Padding(t.Space(1.5), t.Space(2.5)).BorderWidth(0).
-							Disabled(b.commenting || strings.TrimSpace(d.comment) == "")
+							Disabled(b.commenting || d.commentImage.busy() || strings.TrimSpace(d.comment) == "")
 						if input.Submitted() || send.Clicked() {
 							b.sendComment()
 						}
+					})
+					ui.Scroll(c).FillWidth().MaxHeight(t.Space(40)).Children(func() {
+						b.imagePreview(c.Key("comment-preview"), &d.comment, &d.commentImage, "评论")
 					})
 				})
 
@@ -1274,7 +1289,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 				if b.saving {
 					loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
 				}
-				if ui.PrimaryButton(c, "保存").Label("保存任务").Disabled(b.saving).Clicked() {
+				if ui.PrimaryButton(c, "保存").Label("保存任务").Disabled(b.saving || d.bodyImage.busy() || d.commentImage.busy()).Clicked() {
 					b.saveDetail()
 				}
 			})
@@ -1439,16 +1454,23 @@ func (b *board) defaultTaskColumnID() string {
 
 func (b *board) openSettings() { b.settings = &settings{open: true} }
 
+// askAppearance hands an appearance to mygo, which turns the whole app:
+// the frame, the window chrome and traffic lights, menus, and the standard
+// controls. It is a variable because mygo's appearance needs a running app,
+// and a render test builds frames without one; the test swaps it for a
+// recorder.
+var askAppearance = func(source mygo.ThemeSource) { mygo.Theme.SetSource(source) }
+
 // setAppearance makes a the chrome's 外观, now and on the next launch. The
-// frame follows on the next build (b.view asks mygo's appearance override
-// on every frame), so the board, its modals and this sheet all turn on the
-// same click.
+// frame follows from the next build on, since a frame asks the app's
+// appearance every time, so the board, its dialogs and this sheet all turn
+// on the same click.
 func (b *board) setAppearance(a appearance) {
 	if !a.valid() || a == b.prefs.Appearance {
 		return
 	}
 	b.prefs.Appearance = a
-	mygo.Theme.SetSource(a.source())
+	askAppearance(a.source())
 	_ = saveUIPrefs(b.prefs)
 	if b.frameCtx != nil {
 		b.frameCtx.Invalidate()
@@ -1699,15 +1721,35 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 							return true
 						}
 						stay := k.Mods&ui.Shift != 0
-						b.createTop(f.projectID, f.columnID, title)
 						k.SetText("")
 						f.name = ""
+						// The card goes in from here, not from the submit
+						// observer: clearing the field would make that one
+						// read an empty title and skip the create.
+						b.createTop(f.projectID, f.columnID, title)
 						if !stay {
-							*open = false
+							// Plain Enter: the engine marks this key as a
+							// submit right after the callback, so the build
+							// below closes the sheet on it — Enter dismisses
+							// the prompt instead of only clearing the field.
+							b.pendingCompose = &composeSubmit{projectID: f.projectID, columnID: f.columnID, title: title}
 						}
-						return true
+						// Shift+Enter consumes the key to stay for the next
+						// title; plain Enter lets it through to the engine.
+						return stay
 					})
-				_ = input
+				// The engine's Enter arrives as a submit as well as through
+				// the key callback, which already took the title out of the
+				// field and left it in b.pendingCompose. Reading the submit
+				// here closes the sheet on the frame the key landed, so Enter
+				// dismisses the prompt instead of only clearing it.
+				// takeComposeSubmit runs every build so a submit that never
+				// arrives cannot leave a stale title behind.
+				submit := b.takeComposeSubmit()
+				if input.Submitted() && submit != nil {
+					f.name = ""
+					*open = false
+				}
 				send := ui.Button(c, "").Label("创建任务").
 					Tooltip("回车创建并关闭 · Shift+回车继续").
 					Width(t.Space(8)).Height(t.Space(8)).
@@ -1796,6 +1838,7 @@ func stamp(t time.Time) string {
 
 // firstLines returns the first n non-empty lines of s.
 func firstLines(s string, n int) string {
+	s = localImageMarkdown.ReplaceAllString(s, "[图片]")
 	var out []string
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)

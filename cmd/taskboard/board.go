@@ -19,6 +19,7 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"github.com/egoist/mygo/ui/markdown"
 )
 
 // api is the slice of the service the window uses. client.Client
@@ -53,15 +54,18 @@ type cardMatch struct{ ID string }
 
 // detail is the open task detail, with the edits not yet saved.
 type detail struct {
-	open     bool
-	id       string
-	title    string
-	body     string
-	assignee string
-	column   string // selected column name in the move select
-	comment  string
-	comments []model.Comment
-	loading  bool // comments still arriving
+	open         bool
+	id           string
+	title        string
+	body         string
+	assignee     string
+	column       string // selected column name in the move select
+	comment      string
+	comments     []model.Comment
+	loading      bool // comments still arriving
+	bodyImage    imageEdit
+	commentImage imageEdit
+	markdown     *markdown.Options
 
 	// editTitle / editBody keep the field in input mode while focused
 	// (even after the pointer leaves); cleared on blur when not hovered.
@@ -77,7 +81,7 @@ type detail struct {
 
 // dirty reports whether the dialog holds edits the user has not saved.
 func (d *detail) dirty() bool {
-	return strings.TrimSpace(d.title) != d.snap.Title || d.body != d.snap.Description
+	return d.bodyImage.busy() || strings.TrimSpace(d.title) != d.snap.Title || d.body != d.snap.Description
 }
 
 // stale reports whether an agent pushed a newer version while the dialog
@@ -86,15 +90,25 @@ func (d *detail) stale() bool { return d.dirty() && d.pushed != nil }
 
 // form is a small dialog: a new task or a new project.
 type form struct {
-	open          bool
-	isTask        bool // true → 新建任务；false → 新建项目
-	name          string
-	workspacePath string // project form: local working directory
-	columnID      string // task form only: target column
-	projectID     string // task form only: which project receives the card
+	open             bool
+	isTask           bool // true → 新建任务；false → 新建项目
+	name             string
+	workspacePath    string // project form: local working directory
+	pickingWorkspace bool   // one native directory picker at a time
+	columnID         string // task form only: target column
+	projectID        string // task form only: which project receives the card
 	// editingProjectID non-empty turns the project form into an edit sheet
 	// for that project (name pre-filled, save instead of create).
 	editingProjectID string
+}
+
+// composeSubmit is the title an Enter press in the create-task pill took
+// out of the field, held for the same frame's submit to close the sheet
+// and create the card.
+type composeSubmit struct {
+	projectID string
+	columnID  string
+	title     string
 }
 
 // settings is the small preferences sheet (one toggle for now).
@@ -137,6 +151,9 @@ type board struct {
 
 	detail   *detail
 	form     *form
+	// pendingCompose carries a create-task Enter from the key callback to
+	// the submit check in the same build pass; takeComposeSubmit clears it.
+	pendingCompose *composeSubmit
 	conflict *conflict
 	settings *settings // nil when the settings sheet is closed
 
@@ -148,10 +165,13 @@ type board struct {
 	// Position+Size transitions would lag behind the pane and got clipped at
 	// its left edge, so paneResize asks them to follow the pane exactly
 	// instead of tweening toward it. paneW is last frame's pane width.
-	paneW       float32
-	paneResize  bool
-	railStarted bool    // the rail's animated width exists after the first frame
-	railNow     float32 // the rail's width as the frame being built shows it
+	paneW      float32
+	paneResize bool
+	railArmed  bool      // the rail is on screen, so a change can animate
+	railNow    float32   // the rail's width as this frame shows it
+	railAt     time.Time // when the current slide began
+	railFrom   float32   // the width it began at
+	railTo     float32   // the width it heads for
 
 	searchQuery string // filter: title + description, all columns
 	searchOpen  bool   // sidebar search button → immersive centered search overlay
@@ -165,12 +185,20 @@ type board struct {
 
 	drafts map[string]string // retained for tests; column quick-add UI removed
 
-	agent       string
-	streaming   bool                 // the SSE reader is running
-	recent      map[string]time.Time // task ID → until when it shows as changed
-	bounds      map[string]ui.Rect
+	agent        string
+	streaming    bool                 // the SSE reader is running
+	recent       map[string]time.Time // task ID → until when it shows as changed
+	bounds       map[string]ui.Rect
 	sfxMuteUntil map[string]time.Time // per-task debounce for column-change cues
-	motionState // accepted motion shared with the Playground
+	motionState                       // accepted motion shared with the Playground
+}
+
+// takeComposeSubmit consumes the title An Enter press in the pill left
+// behind, so one press creates one card.
+func (b *board) takeComposeSubmit() *composeSubmit {
+	p := b.pendingCompose
+	b.pendingCompose = nil
+	return p
 }
 
 func newBoard(a api) *board {
@@ -281,7 +309,6 @@ func (b *board) load() {
 		})
 	}()
 }
-
 
 // openGlobal loads every project's board and merges cards by column name
 // onto the first board's column set (usually local / primary).
@@ -503,13 +530,12 @@ func (b *board) task(id string) *model.Task {
 	return nil
 }
 
-
 // colScroll remembers a scroll container's place and when its bar should show.
 type colScroll struct {
-	state         ui.ScrollState
-	lastX, lastY  float32
-	armed         bool
-	showUntil     time.Time
+	state        ui.ScrollState
+	lastX, lastY float32
+	armed        bool
+	showUntil    time.Time
 }
 
 func (b *board) columnScroll(id string) *colScroll {
@@ -893,7 +919,7 @@ func (b *board) openDetail(t model.Task) {
 // saveDetail patches the task's text and closes the dialog.
 func (b *board) saveDetail() {
 	d := b.detail
-	if d == nil || b.saving {
+	if d == nil || b.saving || d.bodyImage.busy() || d.commentImage.busy() {
 		return
 	}
 	t := b.task(d.id)
@@ -1069,7 +1095,7 @@ func (b *board) dispatchTask(id string) {
 
 func (b *board) sendComment() {
 	d := b.detail
-	if d == nil || b.commenting {
+	if d == nil || b.commenting || d.commentImage.busy() {
 		return
 	}
 	text := strings.TrimSpace(d.comment)
@@ -1091,7 +1117,6 @@ func (b *board) sendComment() {
 		})
 	}()
 }
-
 
 // playColumnChangeCue soft-clicks on a real column change; a landing in
 // 「完成」gets the done chime instead. Load/openProject never call this.
