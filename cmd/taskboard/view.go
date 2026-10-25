@@ -361,7 +361,8 @@ var railKey railKeyType
 // not run their own Position+Size tween, or they lag behind the pane they live
 // in and show clipped at its left edge.
 func (b *board) notePaneWidth(c *ui.Context, rail float32) float32 {
-	w, _ := c.Size()
+	w, h := c.Size()
+	b.frameH = h
 	pane := w - rail
 	b.paneResize = b.paneW > 0 && absDiff(pane, b.paneW) > 0.5
 	b.paneW = pane
@@ -757,7 +758,6 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 	// The pane's width for this frame, not the resting one: while the rail
 	// slides, laying the columns out for the resting width would push them
 	// past the pane's right edge.
-	_, h := c.Size()
 	avail := b.paneW
 	padL, padR := t.Space(5), t.Space(5)
 	if b.sidebarVisible() {
@@ -767,12 +767,11 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 	boardScroll := b.columnScroll("_board")
 
 	if b.prefs.BoardVertical {
-		// Stack status columns as full-width rows; each row gets a share of
-		// the viewport height (min 220) and the board scrolls vertically.
-		n := max(len(b.columns), 1)
-		chrome := t.Space(12) // top bar approx
-		rowH := max((h-chrome)/float32(n), 220)
-		board := ui.Scroll(c).Grow(1).Padding(t.Space(1), padR, t.Space(2), padL).Gap(colGap).
+		// Stack status columns as full-width rows, and let each row be as
+		// tall as its cards need: the board scrolls vertically to reach the
+		// rest. Giving a row a share of the viewport and clipping its list
+		// cut cards off part-way instead of showing them whole.
+		board := ui.Scroll(c).Grow(1).Padding(t.Space(1), padR, t.Space(2), padL).Gap(t.Space(2)).
 			TrackScroll(&boardScroll.state)
 		b.noteScroll(boardScroll)
 		if b.switching {
@@ -780,7 +779,7 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 		}
 		board.Children(func() {
 			for i := range b.columns {
-				b.columnView(c, t, &b.columns[i], avail-padL-padR, i, rowH)
+				b.columnView(c, t, &b.columns[i], avail-padL-padR, i, b.verticalRowHeight(t, i))
 			}
 		})
 		return
@@ -838,6 +837,16 @@ func (b *board) columnWidth(c *ui.Context, t *ui.Theme) float32 {
 	return min(max(width, 240), 400)
 }
 
+// verticalRowHeight is the floor a stacked status row gets on the board:
+// one share of the viewport (min 220), so a short column still reads as a
+// band of its own. The row grows past it whenever its cards need more.
+func (b *board) verticalRowHeight(t *ui.Theme, index int) float32 {
+	h := b.frameH
+	n := max(len(b.columns), 1)
+	chrome := t.Space(12) // top bar approx
+	return max((h-chrome)/float32(n), 220)
+}
+
 // columnView is one column: header and its cards. A column
 // enters by rising a step, its neighbors delayed in turn, so a board
 // arriving reads as one motion and a project switch replays it.
@@ -845,7 +854,9 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 	tasks := b.tasksIn(col.ID)
 	panel := ui.Column(c.Key(col.ID)).Width(width)
 	if rowHeight > 0 {
-		panel = panel.Height(rowHeight)
+		// A stacked row is as tall as its cards: the height stays a hint
+		// for the row, never a frame the cards are cut off by.
+		panel = panel.MinHeight(rowHeight)
 	} else {
 		panel = panel.FillHeight()
 	}
@@ -998,6 +1009,14 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		// Title body. In title-only mode the ✓ must NOT sit in-flow: its 28×28
 		// chip was stretching 评审 cards taller than other columns. Overlay it.
 		titleOnly := b.prefs.TitleOnlyCards
+		// A stacked board shows cards whole: a line of title or body wraps
+		// as far as it goes instead of being cut at two lines, so a row is
+		// exactly as tall as what the card actually says.
+		whole := b.prefs.BoardVertical
+		titleLines, bodyLines := 2, 2
+		if whole {
+			titleLines, bodyLines = 0, 0
+		}
 		ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
 			// Title-only 评审 cards carry ✓ as a card overlay; reserve its
 			// zone in the resting layout too, so hover never re-truncates
@@ -1008,8 +1027,11 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 				titleCol = titleCol.MarginEnd(t.Space(4))
 			}
 			titleCol.Children(func() {
-				ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
-					MaxLines(2).Ellipsis("…").FillWidth().Tooltip(task.Title)
+				title := ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
+					FillWidth().Tooltip(task.Title)
+				if titleLines > 0 {
+					title = title.MaxLines(titleLines).Ellipsis("…")
+				}
 				if b.cur == curGlobal {
 					if name := b.projectNameByID(task.ProjectID); name != "" {
 						ui.Text(c, name).FontSize(fxs(t)).TextColor(t.TextMuted).
@@ -1018,9 +1040,16 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 				}
 				// Title-only mode keeps the title alone so denser columns fit more cards.
 				if !titleOnly {
-					if summary := firstLines(task.Description, 2); summary != "" {
-						ui.Text(c, summary).FontSize(fsm(t)).TextColor(t.TextMuted).
-							MaxLines(2).Ellipsis("…")
+					summary := firstLines(task.Description, bodyLines)
+					if whole {
+						summary = cardText(task.Description)
+					}
+					if summary != "" {
+						text := ui.Text(c, summary).FontSize(fsm(t)).TextColor(t.TextMuted).FillWidth()
+						if !whole {
+							text = text.MaxLines(bodyLines).Ellipsis("…")
+						}
+
 					}
 					ui.Row(c).Height(20).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
 						if task.Assignee != "" {
@@ -1834,6 +1863,20 @@ func stamp(t time.Time) string {
 		return t.Format("15:04")
 	}
 	return t.Format("01-02")
+}
+
+// cardText is a card's summary on a stacked board: every line, with the
+// description's local images named rather than drawn, so the card reads as
+// the whole note.
+func cardText(s string) string {
+	s = localImageMarkdown.ReplaceAllString(s, "[图片]")
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // firstLines returns the first n non-empty lines of s.

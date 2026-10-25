@@ -151,11 +151,12 @@ type board struct {
 
 	detail   *detail
 	form     *form
+	conflict *conflict
+	settings *settings // nil when the settings sheet is closed
+
 	// pendingCompose carries a create-task Enter from the key callback to
 	// the submit check in the same build pass; takeComposeSubmit clears it.
 	pendingCompose *composeSubmit
-	conflict *conflict
-	settings *settings // nil when the settings sheet is closed
 
 	prefs    uiPrefs // persisted window preferences (title-only cards, …)
 	sidebarW float32 // live sidebar width; 0 until first layout
@@ -166,6 +167,7 @@ type board struct {
 	// its left edge, so paneResize asks them to follow the pane exactly
 	// instead of tweening toward it. paneW is last frame's pane width.
 	paneW      float32
+	frameH     float32 // the window height this frame laid out at
 	paneResize bool
 	railArmed  bool      // the rail is on screen, so a change can animate
 	railNow    float32   // the rail's width as this frame shows it
