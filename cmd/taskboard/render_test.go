@@ -120,9 +120,22 @@ func settle(t *testing.T, tt *ui.Tester) {
 	tt.Frame()
 }
 
+// isolatePrefs points the app's user-data path and TASKBOARD_DB at a temp
+// dir for one test, so a frame that saves ui-prefs.json (a sidebar resize,
+// a toggle) cannot leak into the developer's real prefs and change what the
+// next test renders.
+func isolatePrefs(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+}
+
 // TestRenderBoardLightAndDark renders the full board in both appearances
 // and checks the Chinese chrome is on screen.
 func TestRenderBoardLightAndDark(t *testing.T) {
+	isolatePrefs(t)
 	fake := seedBoard()
 	b := newBoard(fake)
 	tt := newBoardTester(b)
@@ -259,6 +272,7 @@ func TestClickCardOpensAndSwitchesDetail(t *testing.T) {
 // TestSSEEventUpdatesInPlace checks a pushed change lands on the board
 // without refetching: the card appears in its column, then moves.
 func TestSSEEventUpdatesInPlace(t *testing.T) {
+	isolatePrefs(t)
 	fake := seedBoard()
 	b := newBoard(fake)
 	tt := newBoardTester(b)
@@ -501,6 +515,7 @@ func TestEditMoveArchiveAndComment(t *testing.T) {
 // TestProjectSwitchAndCreateTask checks the project sidebar switches boards and
 // that the column input creates a card.
 func TestProjectSwitchAndCreateTask(t *testing.T) {
+	isolatePrefs(t)
 	fake := seedBoard()
 	fake.projects = append(fake.projects, model.Project{ID: "p-2", Name: "工作",
 		Columns: []model.Column{{ID: "c2-todo", Name: "待办"}}, CreatedAt: fake.now})
@@ -524,7 +539,7 @@ func TestProjectSwitchAndCreateTask(t *testing.T) {
 	}
 
 	// Creating a card (sidebar/API path) still lands it in the column.
-	b.post(func() { b.createTop("c2-todo", "从侧栏路径新建的卡片") })
+	b.post(func() { b.createTop(b.cur, "c2-todo", "从侧栏路径新建的卡片") })
 	waitFor(t, tt, "新建卡片", func() bool { return tt.HasText("从侧栏路径新建的卡片") })
 }
 

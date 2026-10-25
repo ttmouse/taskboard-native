@@ -1,4 +1,5 @@
 build/
 .jez/
 .mygo/
+.gocache/
 *.bak.*

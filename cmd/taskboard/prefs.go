@@ -11,7 +11,10 @@ import (
 // uiPrefs is the small set of window preferences persisted next to
 // taskboard.db under Application Support/taskboard/.
 type uiPrefs struct {
-	TitleOnlyCards bool `json:"titleOnlyCards"`
+	TitleOnlyCards bool    `json:"titleOnlyCards"`
+	BoardVertical  bool    `json:"boardVertical,omitempty"` // true → columns stacked as rows
+	SidebarWidth     float32 `json:"sidebarWidth,omitempty"` // DIP; 0 → theme default
+	SidebarCollapsed bool    `json:"sidebarCollapsed,omitempty"` // true → narrow reopen rail
 }
 
 const uiPrefsFile = "ui-prefs.json"

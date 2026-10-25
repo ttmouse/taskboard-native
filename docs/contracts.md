@@ -32,6 +32,7 @@ comments(id TEXT PK, task_id TEXT, author TEXT, body TEXT, created_at TEXT)
 | GET | `/api/health` | `{"ok":true}` |
 | GET | `/api/projects` | `[Project]`（含可选 workspacePath） |
 | POST | `/api/projects` | `{name, workspacePath?}` → 201 Project，含默认四列 |
+| PATCH | `/api/projects/{id}` | `{name?, workspacePath?}`（提供即更新）→ 200 Project，事件 `project.changed`；`name` 须非空，`workspacePath` 空字符串清除路径、非空须为本机存在的绝对目录；不迁移卡片、不创建目录 |
 | GET | `/api/projects/{id}/board` | `Board`（列 + 任务，含 archived=false） |
 | GET | `/api/tasks?projectId=` | `[Task]`，projectId 必填；可选 columnId、assignee、limit、offset、summary |
 | GET | `/api/tasks/{id}` | `Task`（含正文与全部评论） |
@@ -40,9 +41,12 @@ comments(id TEXT PK, task_id TEXT, author TEXT, body TEXT, created_at TEXT)
 | POST | `/api/tasks/{id}/archive` | `{"version":N}` → 200 `Task`，事件 `task.archived` |
 | GET | `/api/tasks/{id}/comments` | `[Comment]` |
 | POST | `/api/tasks/{id}/comments` | `NewComment` → 201 `Comment`，事件 `comment.added` |
+| POST | `/api/tasks/{id}/dispatch` | `{"runtime":"dsh"}` → 202 `{"taskId","runtime"}`；服务进程内异步起 `dsh headless`（cwd=项目 workspacePath），进度与结果经既有评论/移动事件回写 |
 | GET | `/api/events?projectId=` | SSE：`event: <type>` + `data: <Event JSON>`；每 15s `: ping` |
 
 错误：`400` 参数缺失；`404` 不存在；`409` `Conflicterror:"version_conflict", task}`。版本冲突时客户端拉一次详情再对齐。
+
+Dispatch 语义（2026-10-25）：`runtime` 当前仅 `dsh`（`dsh headless "<任务文本>"`，单回答进程，退出即完成）。任务文本由卡标题+正文+项目名+工作目录自包含组装；派发时自动评论「派发 DSH 执行」并把卡移到进行中；退出码 0 → 评论结果摘要（stdout 尾部）并移到评审；非 0 → 评论失败摘要，留在原列。`400`：runtime 未知、项目无 workspacePath 或路径不是本机目录；`409`（body `{"error":"dispatch_in_progress"}`）：该卡已有执行在跑。服务 Close 时取消全部执行进程。不做多主机配置/路由/自动认领（后续）。
 
 类型定义唯一来源：`internal/model/model.go`（JSON tag 即线格式）。
 

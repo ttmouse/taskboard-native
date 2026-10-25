@@ -262,8 +262,26 @@ func (c *Client) Projects() ([]model.Project, error) {
 
 // CreateProject adds a project with the service's default columns.
 func (c *Client) CreateProject(name string) (model.Project, error) {
+	return c.CreateProjectWithPath(name, "")
+}
+
+// CreateProjectWithPath adds a project and optionally binds a local workspace directory.
+func (c *Client) CreateProjectWithPath(name, workspacePath string) (model.Project, error) {
 	var p model.Project
-	err := c.do(context.Background(), "POST", "/api/projects", map[string]string{"name": name}, &p)
+	body := map[string]string{"name": name}
+	if workspacePath != "" {
+		body["workspacePath"] = workspacePath
+	}
+	err := c.do(context.Background(), "POST", "/api/projects", body, &p)
+	return p, err
+}
+
+// UpdateProject saves a project's name and workspace path (the GUI edit
+// form sends both). An empty workspacePath clears the path.
+func (c *Client) UpdateProject(id, name, workspacePath string) (model.Project, error) {
+	var p model.Project
+	err := c.do(context.Background(), "PATCH", "/api/projects/"+url.PathEscape(id),
+		map[string]string{"name": name, "workspacePath": workspacePath}, &p)
 	return p, err
 }
 
@@ -428,6 +446,19 @@ func (c *Client) AddComment(taskID, text string) (model.Comment, error) {
 	err := c.do(context.Background(), "POST", "/api/tasks/"+url.PathEscape(taskID)+"/comments",
 		map[string]string{"text": text}, &cm)
 	return cm, err
+}
+
+// Dispatch starts an async execution of the task on an execution runtime
+// ("dsh"). It returns as soon as the service has launched the run; progress
+// lands as task comments and column moves. An empty runtime means the
+// service's default.
+func (c *Client) Dispatch(taskID, runtime string) error {
+	body := map[string]string{}
+	if runtime != "" {
+		body["runtime"] = runtime
+	}
+	return c.do(context.Background(), "POST", "/api/tasks/"+url.PathEscape(taskID)+"/dispatch",
+		body, nil)
 }
 
 // --- SSE ---

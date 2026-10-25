@@ -213,7 +213,7 @@ func (s *Store) Comments(taskID string) ([]model.Comment, error) {
 }
 
 func (s *Store) commentsLocked(ctx context.Context, taskID string) ([]model.Comment, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, author, body, created_at FROM comments WHERE task_id = ? ORDER BY created_at, id`, taskID)
+	rows, err := s.db.Query(ctx, `SELECT id, author, body, created_at FROM comments WHERE task_id = ? ORDER BY created_at, rowid`, taskID)
 	if err != nil {
 		return nil, err
 	}

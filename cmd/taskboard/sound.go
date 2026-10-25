@@ -59,13 +59,13 @@ func synth(d float64, f func(t float64) float64) *audio.Sound {
 }
 
 func playCreateCue() {
-	boardSFX().create.NewPlayer().SetVolume(0.45).Play()
+	boardSFX().create.NewPlayer().SetLoop(false).SetVolume(0.45).Play()
 }
 
 func playMoveCue() {
-	boardSFX().move.NewPlayer().SetVolume(0.4).Play()
+	boardSFX().move.NewPlayer().SetLoop(false).SetVolume(0.4).Play()
 }
 
 func playDoneCue() {
-	boardSFX().done.NewPlayer().SetVolume(0.5).Play()
+	boardSFX().done.NewPlayer().SetLoop(false).SetVolume(0.5).Play()
 }

@@ -16,7 +16,7 @@
 | 标题栏 | 系统标题栏（默认样式） | 不设 `TitleBarStyle`；视图自绘的顶栏不承担拖窗 |
 | 顶栏高 | 52 | `ui.Row(c).Height(52).Padding(0, t.Space(4)).AlignItems(ui.Center)` + 下方 `ui.Divider(c)` |
 | 看板边距 | s5 | `ui.ScrollHorizontal(c).Padding(t.Space(5))` |
-| 列间距 | s1 | 列间 `Gap(t.Space(1))`（无描边后不再留 s2/s3 边框空档） |
+| 列间距 | s0.25 | 列间 `Gap(t.Space(0.25))`，压缩横向与纵向列间留白 |
 | 列宽 | 等分，最小 240，最大 400 | `ui.Column(c).Width(w)`；宽窗口列宽到顶后整板居中，不左悬 |
 | 列内边距 / 卡片间距 | s2 / s2 | `Padding(t.Space(2)).Gap(t.Space(2))` |
 | 卡片内边距 / 内部间距 | s3.5 / s2 | `Padding(t.Space(3.5)).Gap(t.Space(2))` |
@@ -26,10 +26,36 @@
 - 1280 窗口四列各 298（1280 − 2×20 − 3×16 = 1192）；960 窗口降到 240 以下即触发整板横向滚动：
   外层 `ui.ScrollHorizontal(c).Grow(1)` 管横向，列内 `ui.Scroll(c).Grow(1)` 管纵向，两层各管一个方向。
 - 列数由 `model.Project.Columns` 决定，三到四列是正常形态，**不写死 4**；超过 5 列横向滚动。
-- 顶栏内容：左当前项目名文本（无下拉），切换中显示 `loading.Ring`；左侧常驻项目侧栏点选切换；中 `ui.Spacer`，
-  右 `ui.Button("刷新")` + `ui.PrimaryButton("新建项目")`，最右同步点 + 同步状态词（见 §7 第 5 行）。
+- 顶栏内容：左「首页 › 当前看板 ▾」面包屑（规格见 §1b），切换中在面包屑右侧显示 `loading.Ring`；
+  中 `ui.Spacer`；最右同步点 + 同步状态词（见 §7 第 5 行）。无项目时不渲染面包屑，左内边距让位系统红绿灯。
 - 项目侧栏：常驻左侧安静切换器，规格见 §2；新建仍只在顶栏 `PrimaryButton`。
 - 有侧栏时看板左内边距用 s2（右/上下仍 s5），列宽按「窗口宽 − 侧栏宽 − 左右内边距 − 列间距」计算并居中，避免侧栏+整窗边距叠出横向滚动条。
+
+## 1b. 顶栏面包屑 anatomy
+
+顶栏左侧一条路径，像 Finder 的路径条：知道自己现在在哪块看板上，并能就地换。
+
+```
+Row(Height 40, Padding(0, max(bar.Right, s2), 0, s2), Gap s2, AlignItems Center, DragWindow)
+├─ ButtonBase(key="crumb-home")   🏠 首页        ← 回到「全部项目」；已在全部项目时点击无副作用
+├─ Icon(chevronRight, 14, TextMuted.Alpha(0.7))
+└─ ButtonBase(key="crumb-board")  当前看板名 ▾   ← Element.Menu 列出所有看板，当前项 Checked
+```
+
+| 项 | 值 |
+| --- | --- |
+| 首页标签 | `Padding(s1, s1.5)`、`Radius(t.Radius)`、`BorderWidth(0)`、图标 16 + `Text("首页", f-base, 500)` |
+| 当前看板 | 同上内边距，`Text(名字, f-base, 600)` + `Icon(chevronDown, 14)`；`MaxWidth(s56)`，超出 `Ellipsis("…")`，`Tooltip(全名)` |
+| 静止底色 | `ui.Transparent` |
+| 悬停 / 按下 | `t.Text.Alpha(0.10)` / `t.SurfacePressed`（灰阶 chrome，不用强调色，与侧栏选中同源） |
+| 分隔 | `chevronRight` 14px，`t.TextMuted.Alpha(0.7)`，不写文字「/」 |
+| 切换中 | 面包屑右侧 `loading.Ring`（§7 第 2 行），面包屑本身不置灰 |
+| 读屏 | 首页 `Label("首页，回到全部项目")`；当前看板 `Label("切换看板，当前 <名字>")` |
+
+- 「首页」的落点是 `cur == curGlobal` 的合并看板；已在全部项目时点击不触发重新加载。
+- 菜单项顺序：`全部项目` 在前，随后按侧栏顺序列各项目；当前项 `Checked(true)`，选中即切换并关闭菜单。
+- 面包屑与侧栏是同一件事的两个入口：侧栏管常驻浏览，面包屑管「我在哪 + 快速换」，状态同源，不做重复强调。
+- 禁止把整条面包屑做成一个下拉按钮（首页必须可单独点），禁止引入第二层以上的路径（本项目只有「全部项目 / 单项目」两级）。
 
 ## 2. 项目侧栏 anatomy
 
@@ -66,6 +92,8 @@ Button(key="project-"+id, name).FillWidth().Radius(t.Radius)
 - 新建入口不在侧栏：只在顶栏 `ui.PrimaryButton("新建项目")`。
 - 读屏：容器 `Label("项目列表")`；行 `Label("切换到项目 "+name)`；选中只靠视觉（淡 Accent + 字重），不另加可见「当前」标签。
 - 无项目时不渲染侧栏（空态走 §9）。
+- **折叠（`⌘B` 或顶栏面板图标）是彻底隐藏**：整条侧栏不占位、不保留窄轨道，看板立刻占满窗口宽度（列宽按无侧栏重算，左内边距回到 s5）。恢复入口转移到顶栏左端：面板图标（`展开侧栏`）→ 面包屑；侧栏原有的 `新建任务 / 搜索 / 设置` 同批移到顶栏右端，作为 28×28 的图标按钮（`topBarAction`），保证折叠后没有动作被埋掉。折叠状态持久化在 `ui-prefs.json` 的 `sidebarCollapsed`。
+- 折叠时顶栏左内边距让位系统红绿灯（同无项目态），避免面包屑压在灯上。
 
 ## 3. Tokens
 
@@ -170,7 +198,7 @@ Box(clickable, key=task.ID, radius t.Radius+2, border 1 t.Border,
 | 右键移动 | 卡片 `.ContextMenu(func(m *ui.Menu){…})`：`m.Submenu("移动到", func(s *ui.Menu){ 每列 s.Item(列名).Checked(当前列).Chosen() })`、`m.Separator()`、`m.Item("打开详情").Chosen()`、`m.Item("归档").Chosen()` |
 | 列内新建 | 列头下方输入框，Enter 提交并清空（保持焦点），Escape 放弃；创建成功后列内顶部插入新卡 |
 | 详情弹层 | 内容宽 s130（520 DIP），最大为窗口宽减 s20；标题 f-md/500，正文最小高 s30；标题、正文、选列和评论共用一个纵向滚动区（最大高为窗口高减 s56），顶部关闭、底部评论输入和保存固定可见。输入框用 Placeholder 与读屏 Label，不另加可见字段名。选列右侧右对齐显示任务出处 |
-| 评论 | 作者 f-sm 600 + 时间 f-xs `TextMuted` + 正文 f-base；长作者名单行省略并提供 Tooltip。固定输入框 + 次级 `Button("发送")`，回车与点击共用提交入口；发送中禁用输入和按钮并阻止重复提交，失败恢复草稿；保存是详情内唯一主按钮 |
+| 评论 | 每条为轻量气泡：`SurfaceHover` 淡底 + `Radius+2`，头像 20 + 作者 f-sm 600 + 时间 f-xs `TextMuted` + 正文 f-base；条目间无分割线，靠间距分开。底部作曲区同色淡底包裹输入与次级「发送」；回车与点击共用提交；发送中禁用并防重复；保存仍是详情唯一主按钮 |
 | 归档 | 不弹确认：`c.ToastAction("已归档「X」", "撤销", undo)`，撤销走 PATCH 还原 `archived=false` |
 | 变更高亮 | 收到他人更新后 600ms 内把 `AnimateColor("flash", t.Accent.Alpha(0.12), ui.Animation{Duration: 600 * time.Millisecond})` 的目标设为强调色淡底，随后把目标切回 `cardFace(t)`，颜色平滑回落 |
 

@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,15 @@ func colFace(t *ui.Theme) ui.Color {
 }
 
 // cardFace is a resting card's fill, cardHover its fill under the pointer.
+// sidebarSelected is the quiet neutral wash for the active project row
+// (not Accent blue — sidebar chrome stays grayscale).
+func sidebarSelected(t *ui.Theme, pressed bool) ui.Color {
+	if pressed {
+		return t.Text.Alpha(0.14)
+	}
+	return t.Text.Alpha(0.09)
+}
+
 func cardFace(t *ui.Theme) ui.Color {
 	if t.Dark {
 		return t.Surface
@@ -46,7 +56,6 @@ func cardHover(t *ui.Theme) ui.Color {
 	}
 	return t.SurfaceHover
 }
-
 
 // The column panel itself carries no outline: in either appearance it is
 // one clean step of tone against the window, and the cards carry the
@@ -93,17 +102,77 @@ func (b *board) view(c *ui.Context) {
 
 	t := theme
 	b.curTheme = t
-	ui.Column(c).Fill().Children(func() {
-		b.topBar(c, t)
-		if b.status == client.Offline {
-			b.offlineBanner(c, t)
-		}
-		ui.Row(c).Grow(1).AlignItems(ui.Stretch).Children(func() {
-			if len(b.projects) > 0 {
-				b.projectSidebar(c, t)
+	// Grok Bolt–style chrome: sidebar is the left unit (traffic lights +
+	// search / new; settings at foot). Board pane on the right. Drag the
+	// Drag the edge grip to resize; width persists in ui-prefs.
+	b.ensureSidebarWidth(t)
+	// Cmd+B toggles the project sidebar (same as the panel icon chip).
+	c.OnShortcut(ui.Cmd, ui.KeyB, func() { b.toggleSidebar() })
+	content := func() {
+		ui.Column(c).Fill().Children(func() {
+			b.topBar(c, t)
+			if b.status == client.Offline {
+				b.offlineBanner(c, t)
 			}
 			b.boardArea(c, t)
 		})
+	}
+	// Custom split: one keyed rail and one keyed board pane, so both keep
+	// their identity as the rail slides. The rail's box is the animated
+	// value: it opens and collapses in ~160 ms, and its content is laid out
+	// at the resting width the whole time — the box clips it — so it reads
+	// as a drawer sliding under the edge, never as squeezed or re-flowed
+	// content. The board pane takes the widening on the same beat, and
+	// b.notePaneWidth tells the columns and cards to follow it without their
+	// own positional tween (which would drag them out past the pane's clip).
+	split := ui.Row(c).Fill().Label("侧栏与看板")
+	rail := b.railWidth(split, c, t)
+	pane := b.notePaneWidth(c, rail)
+	split.Children(func() {
+		if rail > 0 {
+			ui.Box(c).Key("project-sidebar").Width(rail).FillHeight().Clip().Children(func() {
+				// Content at its resting width inside the narrower box.
+				ui.Box(c).Width(b.sidebarWidth(t)).FillHeight().Children(func() {
+					b.projectSidebar(c, t)
+				})
+			})
+		}
+		ui.Box(c).Key("board-pane").Width(pane).FillHeight().Children(content)
+		if b.sidebarW > 0 && rail >= b.sidebarW-0.5 {
+			const grip = float32(7) // hit target; paint stays 1px
+			handle := ui.Box(c).Key("sidebar-resize").Absolute().
+				Top(0).Bottom(0).
+				Left(rail - (grip-1)/2).Width(grip).
+				Cursor(ui.CursorResizeEW).
+				Role(ui.RoleSplitter).Label("调整侧栏宽度")
+			dx, _, held := handle.Dragged()
+			if held && dx != 0 {
+				w := b.sidebarW + dx
+				if w < 160 {
+					w = 160
+				}
+				if w > 360 {
+					w = 360
+				}
+				if w != b.sidebarW {
+					b.sidebarW = w
+					b.prefs.SidebarWidth = w
+					_ = saveUIPrefs(b.prefs)
+				}
+			}
+			showLine := held || handle.Hovered()
+			handle.Draw(func(p *ui.Painter, r ui.Rect) {
+				if !showLine {
+					return
+				}
+				line := t.Text.Alpha(0.28)
+				if held {
+					line = t.Text.Alpha(0.42)
+				}
+				x := r.X + (r.W-1)/2
+				p.Fill(ui.Rect{X: x, Y: r.Y, W: 1, H: r.H}, line, 0)
+			})
+		}
 	})
 	// After TrackScroll updates offsets, set thumb visibility for this paint.
 	// MyGo would otherwise keep thumbs visible for the whole hover; we only
@@ -112,6 +181,9 @@ func (b *board) view(c *ui.Context) {
 
 	if b.detail != nil {
 		b.detailView(c, t)
+	}
+	if b.searchOpen {
+		b.searchView(c, t)
 	}
 	if b.form != nil {
 		b.formView(c, t)
@@ -138,140 +210,481 @@ func (b *board) applyScrollbarTheme(c *ui.Context, base *ui.Theme) {
 }
 
 func (b *board) productionTopBar(c *ui.Context, t *ui.Theme) {
-	// Compact ~40 DIP toolbar. Do NOT use max(..., bar.Height):
-	// HiddenInset reports ~46–52 and that was the too-tall regression.
-	// Traffic lights via TrafficLightPosition.
+	// Content chrome only. Traffic lights + search/new live in the sidebar rail
+	// (Grok Bolt–style), and move here when the rail is collapsed. Search opens
+	// an immersive overlay (searchView), not an inline field — keep this strip
+	// borderless under the content.
 	bar := c.TitleBar()
-	h := t.Space(10) // 40 — room for overlaid traffic lights
-	padL := bar.Left + t.Space(2)
-	if padL < t.Space(14) {
-		padL = t.Space(14)
-	}
+	h := t.Space(10) // 40 — aligns with sidebar icon rail
+	// The bar lives inside the pane, so it needs nothing extra on the left
+	// while the rail is there. As the rail slides away the pane reaches the
+	// window edge and the traffic lights must not land on the crumbs: pad in
+	// proportion to how far the rail has actually gone, not on one frame.
+	padL := t.Space(2)
 	padR := max(bar.Right, t.Space(2))
+	if len(b.projects) > 0 {
+		if gone := 1 - b.railFraction(); gone > 0 {
+			need := bar.Left + t.Space(2)
+			if need < t.Space(14) {
+				need = t.Space(14)
+			}
+			padL += (need - padL) * gone
+		}
+	} else {
+		padL = bar.Left + t.Space(2)
+		if padL < t.Space(14) {
+			padL = t.Space(14)
+		}
+	}
+	railHidden := b.prefs.SidebarCollapsed && len(b.projects) > 0
 	ui.Row(c).Height(h).Padding(0, padR, 0, padL).Gap(t.Space(2)).
-		AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).DragWindow().Children(func() {
+		AlignItems(ui.Center).BorderWidth(0).DragWindow().Children(func() {
+		if railHidden {
+			b.sidebarCollapseChip(c, t, false)
+		}
+		if len(b.projects) > 0 {
+			b.topCrumbs(c, t)
+		}
 		if b.switching {
 			loading.Ring(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在切换项目")
 		}
-		// Quiet field: no outline — border made the slim bar look noisy.
-		ui.TextInput(c, &b.searchQuery).
-			Placeholder("搜索任务…").Label("搜索任务").
-			Width(t.Space(48)).Padding(t.Space(1.25), t.Space(2.5)).
-			Radius(t.Radius).BorderWidth(0).
-			Background(t.Surface).FontSize(fsm(t)).TextColor(t.Text)
-		if strings.TrimSpace(b.searchQuery) != "" {
-			if ui.Button(c, "清除").Label("清除搜索").
-				Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
-				TextColor(t.TextMuted).Clicked() {
-				b.searchQuery = ""
-			}
-		}
 		ui.Spacer(c)
-		// 新建任务 lives here — never on column headers (sidebar "+" is 新建项目 only).
-		if ui.Button(c, "").Label("新建任务").Tooltip("新建任务").
-			Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
-			TextColor(t.TextMuted).
-			Children(func() { ui.Icon(c, taskPlus).Size(16, 16) }).
-			Clicked() {
-			b.openTaskForm(b.defaultTaskColumnID())
+		// The rail carries 新建任务 / 搜索 / 设置; with it hidden they move
+		// here so collapsing never strands an action.
+		if railHidden {
+			b.topBarAction(c, t, "新建任务", taskCompose, func() {
+				b.openTaskForm(b.defaultTaskColumnID())
+			})
+			b.topBarAction(c, t, "搜索任务", searchGlass, func() { b.searchOpen = true })
+			b.topBarAction(c, t, "打开设置", settingsSliders, func() { b.openSettings() })
 		}
-		// Icon-only settings. No refresh, no sync dot — SSE stays silent in the chrome;
-		// offline still uses the full-width banner below.
-		if ui.Button(c, "").Label("打开设置").Tooltip("设置").
-			Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
-			TextColor(t.TextMuted).
-			Children(func() { ui.Icon(c, settingsSliders).Size(16, 16) }).
-			Clicked() {
-			b.openSettings()
+		// Empty workspace: 新建项目 stands alone, and the rail is absent by
+		// definition.
+		if len(b.projects) == 0 {
+			if ui.PrimaryButton(c, "新建项目").Label("新建项目").Clicked() {
+				b.openForm()
+			}
+			b.topBarAction(c, t, "打开设置", settingsSliders, func() { b.openSettings() })
 		}
 	})
+}
+
+// railEase is how the sidebar arrives: fast out, so the board gets its room
+// back almost at once, and short enough to read as a snap rather than a slide.
+const (
+	railOpenFor     = 150 * time.Millisecond
+	railCollapseFor = 130 * time.Millisecond
+)
+
+// railWidth is the sidebar's width for this frame, animated as a drawer: it
+// must be asked on an element (split) so MyGo can keep the value between
+// frames. Reduce Motion lands it at once.
+func (b *board) railWidth(split ui.Element, c *ui.Context, t *ui.Theme) float32 {
+	open := b.sidebarVisible()
+	b.ensureSidebarWidth(t)
+	target := float32(0)
+	if open {
+		target = b.sidebarW
+	}
+	if b.sidebarW <= 0 {
+		return target
+	}
+	if !b.railStarted {
+		// First frame: no animation, the window opens with the rail in place.
+		// Jump plants the value so the first toggle animates from here
+		// instead of starting at its target.
+		b.railStarted = true
+		return split.Jump(railKey, target)
+	}
+	d := railOpenFor
+	if !open {
+		d = railCollapseFor
+	}
+	v := split.AnimateWith(railKey, target, d, ui.EaseOut)
+	// Land exactly on the target: the last sub-DIP frames would otherwise
+	// leave a 0.4 DIP sliver of rail behind.
+	if absDiff(v, target) < 0.75 {
+		v = target
+	}
+	b.railNow = v
+	return v
+}
+
+// railFraction is how much of the rail is on screen, 0 to 1, as the frame
+// being built shows it: the top bar uses it to take over the traffic lights'
+// room gradually rather than on one frame.
+func (b *board) railFraction() float32 {
+	if b.sidebarW <= 0 {
+		return 0
+	}
+	return min(max(b.railNow/b.sidebarW, 0), 1)
+}
+
+// railKey names the rail's animated width.
+type railKeyType struct{}
+
+var railKey railKeyType
+
+// notePaneWidth gives the board pane the width the rail leaves it, and tells
+// the columns and cards whether that width is sliding: while it is, they must
+// not run their own Position+Size tween, or they lag behind the pane they live
+// in and show clipped at its left edge.
+func (b *board) notePaneWidth(c *ui.Context, rail float32) float32 {
+	w, _ := c.Size()
+	pane := w - rail
+	b.paneResize = b.paneW > 0 && absDiff(pane, b.paneW) > 0.5
+	b.paneW = pane
+	return pane
+}
+
+// absDiff is |a-b| for the layout's float measures.
+func absDiff(a, b float32) float32 {
+	if a < b {
+		return b - a
+	}
+	return a - b
+}
+
+// topBarAction is one icon-only action in the content bar: the same look the
+// sidebar rows carry, sized for a 40 DIP strip.
+func (b *board) topBarAction(c *ui.Context, t *ui.Theme, label string, icon *ui.SVG, onClick func()) {
+	btn := ui.ButtonBase(c.Key("topbar-"+label)).
+		Label(label).Tooltip(label).
+		Size(t.Space(7), t.Space(7)).Padding(0).Gap(0).BorderWidth(0).
+		Radius(t.Radius + 2).Center().
+		Children(func() { ui.Icon(c, icon).Size(16, 16) })
+	ink := t.TextMuted
+	face := ui.Transparent
+	switch {
+	case btn.Pressed():
+		ink, face = t.Text, t.SurfacePressed
+	case btn.Hovered():
+		ink, face = t.Text, t.Text.Alpha(0.10)
+	}
+	btn.Background(face).TextColor(ink)
+	if btn.Clicked() {
+		onClick()
+	}
+}
+
+// topCrumbs is the board's path, as Finder's path bar: 首页, then the board
+// this window shows, whose arrow opens a switcher for every board. It sits
+// at the left of the content bar, directly above the board it names.
+func (b *board) topCrumbs(c *ui.Context, t *ui.Theme) {
+	home := ui.ButtonBase(c.Key("crumb-home")).
+		Label("首页，回到全部项目").Tooltip("全部项目").
+		Padding(t.Space(1), t.Space(1.5)).Gap(t.Space(1.5)).
+		Radius(t.Radius).BorderWidth(0).
+		Children(func() {
+			ui.Icon(c, houseHome).Size(16, 16)
+			ui.Text(c, "首页").FontSize(t.FontSize).FontWeight(500)
+		})
+	home.Background(crumbFace(t, home)).TextColor(t.TextMuted)
+	if home.Clicked() && b.cur != curGlobal {
+		b.openGlobal()
+	}
+
+	ui.Icon(c, chevronRight).Size(14, 14).TextColor(t.TextMuted.Alpha(0.7))
+
+	name := b.projectName()
+	switcher := ui.ButtonBase(c.Key("crumb-board")).
+		Label("切换看板，当前 "+name).Tooltip(name).
+		MaxWidth(t.Space(56)).
+		Padding(t.Space(1), t.Space(1.5)).Gap(t.Space(1)).
+		Radius(t.Radius).BorderWidth(0)
+	switcher.Background(crumbFace(t, switcher))
+	switcher.Children(func() {
+		ui.Text(c, name).FontSize(t.FontSize).FontWeight(600).
+			TextColor(t.Text).MaxLines(1).Ellipsis("…")
+		ui.Icon(c, chevronDown).Size(14, 14).TextColor(t.TextMuted)
+	})
+	switcher.Menu(func(m *ui.Menu) {
+		if m.Item("全部项目").Checked(b.cur == curGlobal).Chosen() {
+			b.openGlobal()
+		}
+		for _, p := range b.projects {
+			if m.Item(p.Name).Checked(b.cur == p.ID).Chosen() {
+				b.openProject(p.ID)
+			}
+		}
+	})
+}
+
+// crumbFace is a breadcrumb link's fill: quiet until the pointer is on it.
+func crumbFace(t *ui.Theme, e ui.Element) ui.Color {
+	switch {
+	case e.Pressed():
+		return t.SurfacePressed
+	case e.Hovered():
+		return t.Text.Alpha(0.10)
+	}
+	return ui.Transparent
+}
+
+// sidebarCollapseChip is an Orca-style panel icon on a ButtonBase chip.
+// collapsing=true shows panel-left-close; false shows panel-left-open.
+func (b *board) sidebarCollapseChip(c *ui.Context, t *ui.Theme, collapsing bool) {
+	chipSize := float32(28)
+	icon := panelLeftOpen
+	label, tip := "展开侧栏", "展开侧栏 (⌘B)"
+	if collapsing {
+		icon = panelLeftClose
+		label, tip = "收起侧栏", "收起侧栏 (⌘B)"
+	}
+	chip := ui.ButtonBase(c.Key("sidebar-collapse")).
+		Label(label).Tooltip(tip).
+		Size(chipSize, chipSize).Padding(0).Gap(0).BorderWidth(0).
+		Radius(t.Radius + 2).Center().
+		Children(func() {
+			ui.Icon(c, icon).Size(16, 16)
+		})
+	ink := t.TextMuted
+	face := ui.Transparent
+	switch {
+	case chip.Pressed():
+		ink = t.Text
+		face = t.SurfacePressed
+	case chip.Hovered():
+		ink = t.Text
+		face = t.Text.Alpha(0.10)
+	}
+	chip.Background(face).TextColor(ink)
+	if chip.Clicked() {
+		b.toggleSidebar()
+	}
 }
 
 // projectSidebar is a quiet project switcher on L0 (window face), not a
 // second column panel — columns stay the only L1 surfaces.
 func (b *board) projectSidebar(c *ui.Context, t *ui.Theme) {
-	// Surface (not Background): one step off the board pane so the strip
-	// reads as a distinct rail. No vertical Divider — tone does the split.
-	ui.Column(c).Width(b.sidebarWidth(t)).FillHeight().
-		Padding(t.Space(1.5), t.Space(2), t.Space(1.5), t.Space(2)).Gap(t.Space(1.5)).
+	// Grok Bolt–style rail: traffic lights only in the title strip; primary
+	// actions are full-width icon+label rows (like Grok「新对话 / 搜索」).
+	// No standing right border — the resize grip paints a 1px line on hover.
+	ui.Column(c).Fill().FillHeight().
 		Background(t.Surface).Label("项目列表").Children(func() {
-		ui.Row(c).FillWidth().Height(t.Space(7)).AlignItems(ui.Center).Gap(t.Space(1)).Children(func() {
-			ui.Text(c, "项目").FontSize(fsm(t)).FontWeight(600).TextColor(t.TextMuted).
-				TextAlign(ui.Start).Grow(1)
-			if ui.Button(c, "+").Label("新建项目").Tooltip("新建项目").
-				Padding(t.Space(1), t.Space(1.5)).Radius(t.Radius).BorderWidth(0).
-				Clicked() {
-				b.openForm()
-			}
+		bar := c.TitleBar()
+		lightsW := bar.Left
+		if lightsW < t.Space(16) {
+			lightsW = t.Space(16) // ~64 — room for ●●●
+		}
+		ui.Row(c).FillWidth().Height(t.Space(10)).
+			Padding(0, t.Space(1.5), 0, 0).
+			AlignItems(ui.Center).DragWindow().Children(func() {
+			ui.Box(c).Width(lightsW).Height(t.Space(8))
+			ui.Spacer(c)
+			b.sidebarCollapseChip(c, t, true)
 		})
-		ui.Scroll(c).Grow(1).Children(func() {
-			ui.Column(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Stretch).Children(func() {
-				// Global entry: all projects' cards in one board (by column name).
-				globalOn := b.cur == curGlobal
-				gRow := ui.Button(c.Key("project-global"), "全部项目").
-					FillWidth().Radius(t.Radius).
-					Padding(t.Space(1.5), t.Space(2)).
-					BorderWidth(0).
-					FontSize(t.FontSize).FontWeight(500).TextColor(t.Text).
-					TextAlign(ui.Start).Justify(ui.Start).
-					Label("切换到全部项目视图")
-				gFace := ui.Transparent
-				gWeight := 500
-				switch {
-				case globalOn && gRow.Pressed():
-					gFace = t.Accent.Alpha(0.18)
-					gWeight = 600
-				case globalOn:
-					gFace = t.Accent.Alpha(0.14)
-					gWeight = 600
-				case gRow.Pressed():
-					gFace = t.SurfacePressed
-				case gRow.Hovered():
-					gFace = t.SurfaceHover
-				}
-				gRow.Background(gFace).FontWeight(gWeight)
-				if gRow.Clicked() && !globalOn {
-					b.openGlobal()
-				}
-				for _, p := range b.projects {
-					p := p
-					active := b.cur != curGlobal && p.ID == b.cur
-					row := ui.Button(c.Key("project-"+p.ID), p.Name).
-						FillWidth().Radius(t.Radius).
-						Padding(t.Space(1.5), t.Space(2)).
-						BorderWidth(0).
-						FontSize(t.FontSize).FontWeight(500).TextColor(t.Text).
-						TextAlign(ui.Start).Justify(ui.Start).
-						Label("切换到项目 " + p.Name)
-					face := ui.Transparent
-					weight := 500
-					switch {
-					case active && row.Pressed():
-						face = t.Accent.Alpha(0.18)
-						weight = 600
-					case active:
-						face = t.Accent.Alpha(0.14)
-						weight = 600
-					case row.Pressed():
-						face = t.SurfacePressed
-					case row.Hovered():
-						face = t.SurfaceHover
+		ui.Column(c).FillWidth().Grow(1).
+			Padding(t.Space(1), t.Space(2), t.Space(1.5), t.Space(2)).Gap(t.Space(1)).
+			Children(func() {
+				// Primary nav: icon + label, comfortable vertical padding.
+				b.sidebarNavRow(c, t, "新建任务", taskCompose, func() {
+					b.openTaskForm(b.defaultTaskColumnID())
+				})
+				b.sidebarNavRow(c, t, "搜索", searchGlass, func() {
+					b.searchOpen = true
+				})
+				// Align「项目」with project-row icons (rows use Padding X Space(2)).
+				hdr := ui.Row(c.Key("projects-hdr")).FillWidth().Height(t.Space(7)).
+					AlignItems(ui.Center).Gap(t.Space(1)).
+					Padding(t.Space(1), t.Space(2))
+				hdr.Children(func() {
+					ui.Text(c, "项目").FontSize(fsm(t)).FontWeight(600).TextColor(t.TextMuted).
+						TextAlign(ui.Start).Grow(1)
+					plus := ui.Button(c.Key("projects-hdr-add"), "+").Label("新建项目").Tooltip("新建项目").
+						Padding(t.Space(1), t.Space(1.5)).Radius(t.Radius).BorderWidth(0)
+					showPlus := hdr.Hovered() || plus.Hovered() || plus.Pressed()
+					if !showPlus {
+						plus.Opacity(0).PassThrough()
 					}
-					row.Background(face).FontWeight(weight)
-					if row.Clicked() && !active {
-						b.openProject(p.ID)
+					if plus.Clicked() {
+						b.openForm()
 					}
-				}
+				})
+				ui.Scroll(c).Grow(1).Children(func() {
+					ui.Column(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Stretch).Children(func() {
+						// Global entry: all projects' cards in one board (by column name).
+						// Fixed Height: project rows always reserve a 24×24 hover "+" in layout
+						// (Opacity 0 still takes space); without it, 全部项目 paints shorter.
+						const projectRowH = float32(30) // compact row; workspace path lives in tooltip
+						const projectPlus = float32(24)
+						globalOn := b.cur == curGlobal
+						gRow := ui.Button(c.Key("project-global"), "").
+							FillWidth().Height(projectRowH).Radius(t.Radius).
+							Padding(0, t.Space(2)).
+							BorderWidth(0).
+							TextAlign(ui.Start).Justify(ui.Start).
+							AlignItems(ui.Center).
+							Label("切换到全部项目视图").
+							Children(func() {
+								ui.Row(c).FillWidth().Height(projectRowH).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+									ui.Icon(c, layersAll).Size(14, 14).TextColor(t.TextMuted)
+									ui.Text(c, "全部项目").FontSize(t.FontSize).FontWeight(500).
+										TextColor(t.Text).Grow(1).MaxLines(1).Ellipsis("…")
+									// Spacer = project-row "+" footprint so label column aligns.
+									ui.Box(c).Width(projectPlus).Height(projectPlus)
+								})
+							})
+						gFace := ui.Transparent
+						switch {
+						case globalOn && gRow.Pressed():
+							gFace = sidebarSelected(t, true)
+						case globalOn:
+							gFace = sidebarSelected(t, false)
+						case gRow.Pressed():
+							gFace = t.SurfacePressed
+						case gRow.Hovered():
+							gFace = t.SurfaceHover
+						}
+						gRow.Background(gFace)
+						if gRow.Clicked() && !globalOn {
+							b.openGlobal()
+						}
+						for _, p := range b.projects {
+							p := p
+							active := b.cur != curGlobal && p.ID == b.cur
+							addTask := false
+							rowTip := p.Name
+							if wp := strings.TrimSpace(p.WorkspacePath); wp != "" {
+								rowTip = p.Name + " — " + wp
+							}
+							row := ui.Box(c.Key("project-"+p.ID)).FillWidth().Height(projectRowH).Radius(t.Radius).
+								Padding(0, t.Space(2)).BorderWidth(0).
+								Cursor(ui.CursorPointer).Role(ui.RoleButton).
+								Label("切换到项目 " + p.Name).Tooltip(rowTip)
+							face := ui.Transparent
+							switch {
+							case active && row.Pressed():
+								face = sidebarSelected(t, true)
+							case active:
+								face = sidebarSelected(t, false)
+							case row.Pressed():
+								face = t.SurfacePressed
+							case row.Hovered():
+								face = t.SurfaceHover
+							}
+							row.Background(face)
+							row.ContextMenu(func(m *ui.Menu) {
+								if m.Item("编辑项目").Chosen() {
+									b.openProjectEdit(p)
+								}
+							})
+							row.Children(func() {
+								ui.Row(c).FillWidth().Height(projectRowH).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+									ui.Icon(c, folderClosed).Size(14, 14).TextColor(t.TextMuted)
+									ui.Text(c, p.Name).FontSize(t.FontSize).FontWeight(500).
+										TextColor(t.Text).Grow(1).MaxLines(1).Ellipsis("…")
+									plus := ui.Button(c.Key("project-"+p.ID+"-add"), "").
+										Label("在此项目新建任务").Tooltip("新建任务").
+										Width(projectPlus).Height(projectPlus).Padding(0).BorderWidth(0).
+										Radius(t.Radius).
+										AlignItems(ui.Center).Justify(ui.Center).
+										Children(func() { ui.Icon(c, taskPlus).Size(14, 14) })
+									showPlus := row.Hovered() || plus.Hovered() || plus.Pressed()
+									ink := t.TextMuted
+									chip := ui.Transparent
+									switch {
+									case plus.Pressed():
+										ink, chip = t.Text, t.SurfacePressed
+									case plus.Hovered():
+										ink, chip = t.Text, t.Text.Alpha(0.10)
+									}
+									plus.Background(chip).TextColor(ink)
+									if !showPlus {
+										plus.Opacity(0).PassThrough()
+									}
+									if plus.Clicked() {
+										addTask = true
+										b.openTaskFormIn(p.ID, "")
+									}
+								})
+							})
+							if row.Clicked() && !addTask && !active {
+								b.openProject(p.ID)
+							}
+						}
+					})
+				})
+			})
+		// Settings stays at the foot of the rail as the same icon+label row.
+		ui.Column(c).FillWidth().
+			Padding(t.Space(1), t.Space(2), t.Space(2), t.Space(2)).Children(func() {
+			b.sidebarNavRow(c, t, "设置", settingsSliders, func() {
+				b.openSettings()
 			})
 		})
 	})
 }
 
-func (b *board) sidebarWidth(t *ui.Theme) float32 {
-	return t.Space(44) // 176 when Spacing=4 — fits names without crowding the board
+// sidebarNavRow is a full-width Grok-style action: leading icon + label,
+// with enough vertical padding that the icon is not squashed.
+func (b *board) sidebarNavRow(c *ui.Context, t *ui.Theme, label string, icon *ui.SVG, onClick func()) {
+	a11y := label
+	if label == "设置" {
+		a11y = "打开设置"
+	} else if label == "搜索" {
+		a11y = "搜索任务"
+	}
+	row := ui.Button(c.Key("nav-"+label), "").
+		FillWidth().Radius(t.Radius).
+		Padding(t.Space(2.5), t.Space(2)).
+		BorderWidth(0).
+		TextAlign(ui.Start).Justify(ui.Start).
+		Label(a11y).Tooltip(label)
+	face := ui.Transparent
+	switch {
+	case row.Pressed():
+		face = t.SurfacePressed
+	case row.Hovered():
+		face = t.SurfaceHover
+	}
+	row.Background(face).TextColor(t.Text)
+	row.Children(func() {
+		ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, icon).Size(16, 16).TextColor(t.TextMuted)
+			ui.Text(c, label).FontSize(t.FontSize).FontWeight(500).
+				TextColor(t.Text).Grow(1).MaxLines(1).Ellipsis("…")
+		})
+	})
+	if row.Clicked() {
+		onClick()
+	}
 }
 
+func (b *board) defaultSidebarWidth(t *ui.Theme) float32 {
+	return t.Space(52) // 208 when Spacing=4 — room for name + hover +
+}
 
+// sidebarVisible reports whether the project rail occupies the left edge.
+// Collapsed hides it outright — no narrow reopen rail — so the board takes
+// the window and the top bar's panel chip (or ⌘B) brings it back.
+func (b *board) sidebarVisible() bool {
+	return len(b.projects) > 0 && !b.prefs.SidebarCollapsed
+}
+
+func (b *board) ensureSidebarWidth(t *ui.Theme) {
+	if b.sidebarW > 0 {
+		return
+	}
+	if b.prefs.SidebarWidth >= 160 {
+		b.sidebarW = b.prefs.SidebarWidth
+		return
+	}
+	b.sidebarW = b.defaultSidebarWidth(t)
+}
+
+// sidebarWidth is the rail's resting width in both states: it is what the
+// rail's content is laid out at while the box animates, and what the board
+// pane subtracts once the slide ends. Visibility is railWidth's business.
+func (b *board) sidebarWidth(t *ui.Theme) float32 {
+	b.ensureSidebarWidth(t)
+	return b.sidebarW
+}
+
+func (b *board) toggleSidebar() {
+	b.prefs.SidebarCollapsed = !b.prefs.SidebarCollapsed
+	_ = saveUIPrefs(b.prefs)
+}
 
 func (b *board) offlineBanner(c *ui.Context, t *ui.Theme) {
 	ui.Row(c).Height(36).Padding(0, t.Space(4)).Gap(t.Space(2)).
@@ -309,25 +722,40 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 		return
 	}
 
-	// Columns split the board pane evenly, within the design's 240..400
-	// range; a narrower pane scrolls instead of squeezing them, and a
-	// wider one centers the board rather than leaving it hanging left.
-	w, _ := c.Size()
-	avail := w
-	if len(b.projects) > 0 {
-		// c.Size may be the window; sidebar already occupies its strip.
-		avail -= b.sidebarWidth(t)
-	}
-	width := b.columnWidth(c, t)
-	// With a sidebar, keep only a small left gutter — the sidebar is the left edge.
+	// Columns: horizontal (default) or vertical stack from prefs.BoardVertical.
+	// The pane's width for this frame, not the resting one: while the rail
+	// slides, laying the columns out for the resting width would push them
+	// past the pane's right edge.
+	_, h := c.Size()
+	avail := b.paneW
 	padL, padR := t.Space(5), t.Space(5)
-	if len(b.projects) > 0 {
+	if b.sidebarVisible() {
 		padL = t.Space(2)
 	}
+	colGap := float32(0) // flush columns; panel pad carries residual air
 	boardScroll := b.columnScroll("_board")
-	// Column gap is s1 only: borders are gone, so the old s2/s3 gutters
-	// read as empty border leftovers between panels.
-	colGap := t.Space(1)
+
+	if b.prefs.BoardVertical {
+		// Stack status columns as full-width rows; each row gets a share of
+		// the viewport height (min 220) and the board scrolls vertically.
+		n := max(len(b.columns), 1)
+		chrome := t.Space(12) // top bar approx
+		rowH := max((h-chrome)/float32(n), 220)
+		board := ui.Scroll(c).Grow(1).Padding(t.Space(1), padR, t.Space(2), padL).Gap(colGap).
+			TrackScroll(&boardScroll.state)
+		b.noteScroll(boardScroll)
+		if b.switching {
+			board.Opacity(0.55)
+		}
+		board.Children(func() {
+			for i := range b.columns {
+				b.columnView(c, t, &b.columns[i], avail-padL-padR, i, rowH)
+			}
+		})
+		return
+	}
+
+	width := b.columnWidth(c, t)
 	board := ui.ScrollHorizontal(c).Grow(1).Padding(t.Space(1), padR, t.Space(2), padL).Gap(colGap).AlignItems(ui.Stretch).
 		TrackScroll(&boardScroll.state)
 	b.noteScroll(boardScroll)
@@ -341,7 +769,7 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 			ui.Spacer(c).Width(lead)
 		}
 		for i := range b.columns {
-			b.columnView(c, t, &b.columns[i], width, i)
+			b.columnView(c, t, &b.columns[i], width, i, 0)
 		}
 	})
 }
@@ -366,13 +794,12 @@ func (b *board) noProjectState(c *ui.Context, t *ui.Theme) {
 // columnWidth is the width of one column: the window's room split among
 // the columns, clamped to the design's 240..400.
 func (b *board) columnWidth(c *ui.Context, t *ui.Theme) float32 {
-	w, _ := c.Size()
+	w := b.paneW
 	padL, padR := t.Space(5), t.Space(5)
-	if len(b.projects) > 0 {
-		w -= b.sidebarWidth(t)
+	if b.sidebarVisible() {
 		padL = t.Space(2)
 	}
-	room := w - padL - padR - float32(max(len(b.columns)-1, 0))*t.Space(1)
+	room := w - padL - padR - float32(max(len(b.columns)-1, 0))*float32(0)
 	if len(b.columns) == 0 {
 		return 320
 	}
@@ -383,22 +810,33 @@ func (b *board) columnWidth(c *ui.Context, t *ui.Theme) float32 {
 // columnView is one column: header and its cards. A column
 // enters by rising a step, its neighbors delayed in turn, so a board
 // arriving reads as one motion and a project switch replays it.
-func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width float32, index int) {
+func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width float32, index int, rowHeight float32) {
 	tasks := b.tasksIn(col.ID)
-	panel := ui.Column(c.Key(col.ID)).Width(width).FillHeight().
-		// Inner pad s2 (was s3): without column borders the old pad looked like
-		// extra gutter between columns.
-		Padding(t.Space(2)).Gap(t.Space(2)).Radius(t.Radius + 4).
+	panel := ui.Column(c.Key(col.ID)).Width(width)
+	if rowHeight > 0 {
+		panel = panel.Height(rowHeight)
+	} else {
+		panel = panel.FillHeight()
+	}
+	panel = panel.
+		// Inner pad: Y s2 / X s1 — tight inter-column air without crowding
+		// cards into the scrollbar gutter (gutter still reserved below).
+		Padding(t.Space(2), t.Space(1)).Gap(t.Space(2)).Radius(t.Radius + 4).
 		Background(colFace(t)).
 		Role(ui.RoleGroup).
 		Label(fmt.Sprintf("%s列", col.Name))
-	panel.Transition(ui.ElementTransition{
-		Duration: 280 * time.Millisecond,
-		Ease:     ui.EaseOut,
-		Enter:    &ui.Motion{Y: t.Space(3), Opacity: 0},
-		Animation: &ui.Animation{Duration: 280 * time.Millisecond, Ease: ui.EaseOut,
-			Delay: time.Duration(index) * 40 * time.Millisecond},
-	})
+	// A column re-flows with the board. When the sidebar just opened or
+	// collapsed, the width jump is not a transition but a new layout: the
+	// column must land at once, or its tween paints it outside the pane.
+	if !b.paneResize {
+		panel.Transition(ui.ElementTransition{
+			Duration: 280 * time.Millisecond,
+			Ease:     ui.EaseOut,
+			Enter:    &ui.Motion{Y: t.Space(3), Opacity: 0},
+			Animation: &ui.Animation{Duration: 280 * time.Millisecond, Ease: ui.EaseOut,
+				Delay: time.Duration(index) * 40 * time.Millisecond},
+		})
+	}
 
 	// The transient full-height preview owns placement feedback. Tracks
 	// keep their geometry and color while cards make room.
@@ -437,8 +875,11 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 
 // createTop creates a card and lifts it to the head of its column, which
 // is where a quick add puts it.
-func (b *board) createTop(columnID, title string) {
-	proj := b.cur
+func (b *board) createTop(projectID, columnID, title string) {
+	proj := projectID
+	if proj == "" {
+		proj = b.cur
+	}
 	if proj == "" || proj == curGlobal {
 		b.toast("无法创建", "请先在侧栏选一个项目，再添加任务。")
 		return
@@ -462,7 +903,7 @@ func (b *board) createTop(columnID, title string) {
 func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Element {
 	// No resting border: cardFace vs colFace carries the edge (theme tokens).
 	card := ui.Box(c.Key(task.ID)).FillWidth().
-		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius+2).BorderWidth(0).
+		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius + 2).BorderWidth(0).
 		Focusable().Cursor(ui.CursorPointer).Role(ui.RoleButton).
 		Label("打开任务：" + task.Title).
 		Drag(cardDrag(task.ID))
@@ -500,6 +941,9 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		if m.Item("打开详情").Chosen() {
 			b.openDetail(*task)
 		}
+		if m.Item("派发 DSH 执行").Chosen() {
+			b.dispatchTask(task.ID)
+		}
 		if m.Item("复制 ID").Chosen() {
 			mygo.Clipboard.WriteText(task.ID)
 			b.toast("已复制 ID", task.ID)
@@ -513,7 +957,13 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 	approve := false
 	inReview := b.columnName(task.ColumnID) == "评审"
 	card.Children(func() {
-		ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Start).Children(func() {
+		// Title row + optional ✓ in-flow (not Overlay). Overlay sat outside the
+		// card's hit target, so hovering the icon dropped card.Hovered(), tore
+		// the icon down, and flickered — clicks never stuck.
+		// Title body. In title-only mode the ✓ must NOT sit in-flow: its 28×28
+		// chip was stretching 评审 cards taller than other columns. Overlay it.
+		titleOnly := b.prefs.TitleOnlyCards
+		ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Grow(1).Gap(t.Space(2)).Children(func() {
 				ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
 					MaxLines(2).Ellipsis("…").FillWidth().Tooltip(task.Title)
@@ -524,7 +974,7 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 					}
 				}
 				// Title-only mode keeps the title alone so denser columns fit more cards.
-				if !b.prefs.TitleOnlyCards {
+				if !titleOnly {
 					if summary := firstLines(task.Description, 2); summary != "" {
 						ui.Text(c, summary).FontSize(fsm(t)).TextColor(t.TextMuted).
 							MaxLines(2).Ellipsis("…")
@@ -546,22 +996,15 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 					})
 				}
 			})
-			// 评审 only: hover reveals a lucide check (same stroke/size as
-			// the top-bar settings gear — muted, no green pill).
-			if inReview && card.Hovered() {
-				if ui.Button(c, "").Label("验收通过，移到完成").Tooltip("移到完成").
-					Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
-					TextColor(t.TextMuted).
-					Children(func() { ui.Icon(c, approveCheck).Size(16, 16) }).
-					Clicked() {
-					approve = true
-					if done := b.columnID("完成"); done != "" {
-						// Pin newly completed cards to the top of「完成」.
-						b.moveTask(task.ID, done, "", true)
-					}
-				}
+			// Full cards: ✓ stays in-flow beside the title stack.
+			if inReview && !titleOnly {
+				b.reviewCheckButton(c, t, card, task, &approve)
 			}
 		})
+		// Title-only: ✓ overlays the card corner so height matches other columns.
+		if inReview && titleOnly {
+			b.reviewCheckButtonOverlay(c, t, card, task, &approve)
+		}
 	})
 	b.bounds[task.ID] = card.Bounds()
 
@@ -569,6 +1012,84 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		b.openDetail(*task)
 	}
 	return card
+}
+
+// reviewCheckButton is the in-flow ✓ chip for full (non–title-only) cards.
+func (b *board) reviewCheckButton(c *ui.Context, t *ui.Theme, card ui.Element, task *model.Task, approve *bool) {
+	chipSize := float32(24)
+	// ButtonBase + Center: themed Button keeps horizontal padding that
+	// pulls the Lucide check toward the top-left of a square chip.
+	check := ui.ButtonBase(c.Key(task.ID+"-approve")).
+		Label("验收通过，移到完成").Tooltip("移到完成").
+		Size(chipSize, chipSize).Padding(0).Gap(0).BorderWidth(0).
+		Radius(t.Radius + 2).Center().
+		Children(func() {
+			// Lucide check mass sits left/high; 1px nudge for optical center.
+			ui.Icon(c, approveCheck).Size(16, 16).Margin(1, 0, 0, 1)
+		})
+	show := card.Hovered() || check.Hovered() || check.Pressed()
+	ink := t.TextMuted
+	chip := ui.Transparent
+	switch {
+	case check.Pressed():
+		ink = t.Text
+		chip = t.SurfacePressed
+	case check.Hovered():
+		ink = t.Text
+		chip = t.Text.Alpha(0.10)
+	case show:
+		ink = t.TextMuted
+		chip = ui.Transparent
+	}
+	check.Background(chip).TextColor(ink)
+	if !show {
+		check.Opacity(0).PassThrough()
+	}
+	if check.Clicked() {
+		*approve = true
+		if done := b.columnID("完成"); done != "" {
+			b.moveTask(task.ID, done, "", true)
+		}
+	}
+}
+
+// reviewCheckButtonOverlay pins ✓ to the card's right edge, centered on
+// the card's middle so it lines up with the title row of title-only 评审
+// cards (in-flow was the stretch that made them taller than other columns).
+func (b *board) reviewCheckButtonOverlay(c *ui.Context, t *ui.Theme, card ui.Element, task *model.Task, approve *bool) {
+	chipSize := float32(24)
+	check := ui.ButtonBase(c.Key(task.ID+"-approve")).
+		Label("验收通过，移到完成").Tooltip("移到完成").
+		Absolute().Attach(ui.AnchorRight, ui.AnchorCenter).Right(t.Space(1)).
+		Size(chipSize, chipSize).Padding(0).Gap(0).BorderWidth(0).
+		Radius(t.Radius + 2).Center().
+		Children(func() {
+			ui.Icon(c, approveCheck).Size(16, 16).Margin(1, 0, 0, 1)
+		})
+	show := card.Hovered() || check.Hovered() || check.Pressed()
+	ink := t.TextMuted
+	chip := ui.Transparent
+	switch {
+	case check.Pressed():
+		ink = t.Text
+		chip = t.SurfacePressed
+	case check.Hovered():
+		ink = t.Text
+		chip = t.Text.Alpha(0.10)
+	case show:
+		ink = t.TextMuted
+		chip = ui.Transparent
+	}
+	check.Background(chip).TextColor(ink)
+	if !show {
+		check.Opacity(0).PassThrough()
+	}
+	if check.Clicked() {
+		*approve = true
+		if done := b.columnID("完成"); done != "" {
+			b.moveTask(task.ID, done, "", true)
+		}
+	}
 }
 
 // --- detail ---
@@ -596,9 +1117,21 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						})
 					}
 
+					// Title / body stay as TextInput / TextArea always (borderless,
+					// transparent). Swapping Text ↔ input on hover shifted layout
+					// because the widgets disagree on intrinsic padding.
 					ui.TextInput(c, &d.title).Label("任务标题").Placeholder("任务标题").
-						FontSize(fmd(t)).FontWeight(500).AutoFocus()
-					ui.TextArea(c, &d.body).Label("任务正文").Placeholder("添加任务描述…").MinHeight(t.Space(30))
+						FillWidth().FontSize(fmd(t)).FontWeight(500).
+						BorderWidth(0).Background(ui.Transparent).
+						Padding(t.Space(0.5), t.Space(1))
+					d.editTitle = false
+
+					ui.TextArea(c, &d.body).Label("任务正文").Placeholder("添加任务描述…").
+						FillWidth().MinHeight(t.Space(30)).
+						BorderWidth(0).Background(ui.Transparent).
+						Padding(t.Space(0.5), t.Space(1))
+					d.editBody = false
+
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(t.Space(3)).Children(func() {
 						names := b.columnNames()
 						if d.column == "" {
@@ -617,9 +1150,14 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 							MaxLines(1).Ellipsis("…").Tooltip(provenance(&d.snap)).Grow(1).TextAlign(ui.End)
 					})
 
-					ui.Divider(c).BorderColor(t.Border)
-					ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "评论").FontSize(fsm(t)).FontWeight(600).TextColor(t.TextMuted)
+					// Comments: section label + Gap only (no hairline divider).
+					ui.Row(c).FillWidth().Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, "评论").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
+						if n := len(d.comments); n > 0 {
+							ui.Text(c, strconv.Itoa(n)).FontSize(fxs(t)).TextColor(t.TextMuted).
+								Label(strconv.Itoa(n) + " 条评论")
+						}
+						ui.Spacer(c)
 						if d.loading {
 							loading.LinearDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入评论")
 						}
@@ -628,42 +1166,46 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						ui.Text(c, "还没有评论").FontSize(fsm(t)).TextColor(t.TextMuted)
 					}
 					if len(d.comments) > 0 {
-						ui.Column(c).FillWidth().Children(func() {
-							ui.Column(c).FillWidth().Gap(t.Space(2)).Children(func() {
-								for i := range d.comments {
-									cm := &d.comments[i]
-									if i > 0 {
-										ui.Divider(c).BorderColor(t.Border)
-									}
-									ui.Column(c).Key("c-" + cm.ID).FillWidth().Gap(2).Children(func() {
-										ui.Row(c).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
-											ui.Text(c, cm.Author).FontSize(fsm(t)).FontWeight(600).
-												Grow(1).MaxLines(1).Ellipsis("…").Tooltip(cm.Author)
-											ui.Spacer(c)
-											ui.Text(c, cm.CreatedAt.Format("01-02 15:04")).FontSize(fxs(t)).TextColor(t.TextMuted)
-										})
-										ui.Text(c, cm.Text).FontSize(t.FontSize)
+						ui.Column(c).FillWidth().Gap(t.Space(2)).Children(func() {
+							for i := range d.comments {
+								cm := &d.comments[i]
+								ui.Box(c.Key("c-"+cm.ID)).FillWidth().
+									Padding(t.Space(2.5), t.Space(3)).Gap(t.Space(1.5)).
+									Radius(t.Radius + 2).BorderWidth(0).
+									Background(t.SurfaceHover.Alpha(0.55)).Children(func() {
+									ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+										ui.Avatar(c, cm.Author, nil).Size(20, 20)
+										ui.Text(c, cm.Author).FontSize(fsm(t)).FontWeight(600).
+											Grow(1).MaxLines(1).Ellipsis("…").Tooltip(cm.Author)
+										ui.Text(c, cm.CreatedAt.Format("01-02 15:04")).
+											FontSize(fxs(t)).TextColor(t.TextMuted)
 									})
-								}
-							})
+									ui.Text(c, cm.Text).FontSize(t.FontSize).TextColor(t.Text)
+								})
+							}
 						})
 					}
 				})
 			})
-			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-				input := ui.TextInput(c, &d.comment).Placeholder("写评论，回车发送").Label("写评论").
-					Grow(1).Disabled(b.commenting)
-				if b.commenting {
-					loading.BouncingDots(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在发送评论")
-				}
-				send := ui.Button(c, "发送").Label("发送评论").
-					Disabled(b.commenting || strings.TrimSpace(d.comment) == "")
-				if input.Submitted() || send.Clicked() {
-					b.sendComment()
-				}
-			})
+			ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5)).Gap(t.Space(2)).
+				Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4)).
+				Children(func() {
+					ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+						input := ui.TextInput(c, &d.comment).Placeholder("写评论，回车发送").Label("写评论").
+							Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent)
+						if b.commenting {
+							loading.BouncingDots(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在发送评论")
+						}
+						send := ui.Button(c, "发送").Label("发送评论").
+							Padding(t.Space(1.5), t.Space(2.5)).BorderWidth(0).
+							Disabled(b.commenting || strings.TrimSpace(d.comment) == "")
+						if input.Submitted() || send.Clicked() {
+							b.sendComment()
+						}
+					})
+				})
 
-			ui.Divider(c).BorderColor(t.Border)
+			// Archive / save footer: Gap only, no hairline divider.
 			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
 				if ui.Button(c, "归档").Label("归档任务").Cursor(ui.CursorPointer).
 					TextColor(t.Danger).Clicked() {
@@ -689,23 +1231,143 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 	d.open = open
 }
 
+// searchView is an immersive centered search overlay (same spirit as
+// taskComposeImmersive): large input + matching tasks listed underneath.
+// Esc / backdrop / 关闭 clears the query and closes.
+func (b *board) searchView(c *ui.Context, t *ui.Theme) {
+	open := b.searchOpen
+	ui.Modal(c, &open, func() {
+		ui.Column(c).Width(t.Space(140)).Gap(t.Space(3)).
+			AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "搜索任务").FontSize(fsm(t)).TextColor(t.TextMuted)
+			shell := ui.Column(c).FillWidth().
+				Padding(t.Space(4), t.Space(4)).
+				Gap(t.Space(2.5)).
+				Radius(t.Radius + 10).
+				Background(t.Surface).
+				BorderWidth(0)
+			shell.Children(func() {
+				ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+					ui.Icon(c, searchGlass).Size(20, 20).TextColor(t.TextMuted)
+					ui.TextInput(c, &b.searchQuery).Label("搜索任务").
+						Placeholder("搜索任务…").
+						Grow(1).
+						MinHeight(t.Space(12)).
+						Padding(t.Space(1), t.Space(1)).
+						BorderWidth(0).
+						Background(ui.Transparent).
+						FontSize(flg(t)).
+						AutoFocus()
+					if ui.Button(c, "关闭").Label("关闭搜索").
+						Padding(t.Space(1), t.Space(2)).BorderWidth(0).
+						TextColor(t.TextMuted).Clicked() {
+						open = false
+					}
+				})
+				hits := b.searchHits()
+				if strings.TrimSpace(b.searchQuery) == "" {
+					ui.Text(c, "输入标题或描述中的关键词").
+						FontSize(fsm(t)).TextColor(t.TextMuted)
+				} else if len(hits) == 0 {
+					ui.Text(c, "没有匹配的任务").
+						FontSize(fsm(t)).TextColor(t.TextMuted)
+				} else {
+					ui.Scroll(c).FillWidth().MaxHeight(t.Space(80)).Children(func() {
+						ui.Column(c).FillWidth().Gap(t.Space(1)).Children(func() {
+							for _, hit := range hits {
+								hit := hit
+								row := ui.Button(c.Key("search-hit-"+hit.ID), "").
+									FillWidth().Radius(t.Radius).
+									Padding(t.Space(2), t.Space(2.5)).
+									BorderWidth(0).
+									TextAlign(ui.Start).Justify(ui.Start).
+									Label("打开任务 " + hit.Title)
+								face := ui.Transparent
+								switch {
+								case row.Pressed():
+									face = t.SurfacePressed
+								case row.Hovered():
+									face = t.SurfaceHover
+								}
+								row.Background(face)
+								row.Children(func() {
+									ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
+										ui.Text(c, hit.Title).FontSize(t.FontSize).FontWeight(500).
+											TextColor(t.Text).FillWidth().MaxLines(1).Ellipsis("…")
+										meta := b.columnName(hit.ColumnID)
+										if snip := firstLines(hit.Description, 1); snip != "" {
+											if meta != "" {
+												meta = meta + " · " + snip
+											} else {
+												meta = snip
+											}
+										}
+										if meta != "" {
+											ui.Text(c, meta).FontSize(fxs(t)).TextColor(t.TextMuted).
+												FillWidth().MaxLines(1).Ellipsis("…")
+										}
+									})
+								})
+								if row.Clicked() {
+									b.openDetail(hit)
+									open = false
+								}
+							}
+						})
+					})
+				}
+			})
+		})
+	})
+	if !open {
+		b.searchQuery = ""
+		b.searchOpen = false
+		return
+	}
+	b.searchOpen = open
+}
+
 // --- forms ---
 
 func (b *board) openForm() { b.form = &form{open: true, isTask: false} }
 
 func (b *board) openTaskForm(columnID string) {
-	if b.cur == "" || b.cur == curGlobal {
+	b.openTaskFormIn(b.cur, columnID)
+}
+
+// openTaskFormIn opens the create-task sheet for a concrete project
+// (used by the sidebar row "+" while another board may be selected).
+func (b *board) openTaskFormIn(projectID, columnID string) {
+	if projectID == "" || projectID == curGlobal {
 		b.toast("无法创建", "请先在侧栏选一个项目，再添加任务。")
 		return
 	}
 	if columnID == "" {
-		columnID = b.defaultTaskColumnID()
+		columnID = b.projectColumnID(projectID, "待办")
 	}
 	if columnID == "" {
-		b.toast("无法创建", "当前看板没有可用的列。")
+		b.toast("无法创建", "该项目没有可用的列。")
 		return
 	}
-	b.form = &form{open: true, isTask: true, columnID: columnID}
+	b.form = &form{open: true, isTask: true, columnID: columnID, projectID: projectID}
+}
+
+// projectColumnID finds a named column on a project (falls back to first).
+func (b *board) projectColumnID(projectID, name string) string {
+	for _, p := range b.projects {
+		if p.ID != projectID {
+			continue
+		}
+		for _, c := range p.Columns {
+			if c.Name == name || c.ID == name {
+				return c.ID
+			}
+		}
+		if len(p.Columns) > 0 {
+			return p.Columns[0].ID
+		}
+	}
+	return ""
 }
 
 // defaultTaskColumnID prefers 待办, else the first column.
@@ -731,8 +1393,10 @@ func (b *board) settingsView(c *ui.Context, t *ui.Theme) {
 				Label("卡片仅显示标题").Changed() {
 				_ = saveUIPrefs(b.prefs)
 			}
-			ui.Text(c, "开启后，看板卡片只保留标题，隐藏描述摘要与底部元信息。").
-				FontSize(fsm(t)).TextColor(t.TextMuted)
+			if ui.Checkbox(c, &b.prefs.BoardVertical, "纵向排列状态列").
+				Label("纵向排列状态列").Changed() {
+				_ = saveUIPrefs(b.prefs)
+			}
 			ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
 				if ui.Button(c, "关闭").Label("关闭设置").Clicked() {
 					open = false
@@ -747,50 +1411,115 @@ func (b *board) settingsView(c *ui.Context, t *ui.Theme) {
 	s.open = open
 }
 
-
 func (b *board) formView(c *ui.Context, t *ui.Theme) {
 	f := b.form
 	open := f.open
-	ui.Modal(c, &open, func() {
-		ui.Column(c).Width(t.Space(80)).Gap(t.Space(3)).Children(func() {
-			if f.isTask {
-				ui.Text(c, "新建任务").FontSize(fmd(t)).FontWeight(600)
-				colName := b.columnName(f.columnID)
-				if colName != "" {
-					ui.Text(c, "将添加到「"+colName+"」列 · 回车可连续添加").FontSize(fsm(t)).TextColor(t.TextMuted)
-				} else {
-					ui.Text(c, "回车可连续添加").FontSize(fsm(t)).TextColor(t.TextMuted)
-				}
-				input := ui.TextInput(c, &f.name).Label("任务标题").Placeholder("任务标题，回车继续").AutoFocus()
-				ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
-					if ui.Button(c, "完成").Label("关闭新建任务").Clicked() {
+	// DialogBase so the outer card radius can be much larger than inner chips.
+	ui.DialogBase(c, &open, func(back, panel ui.Element) {
+		back.Background(ui.RGBA(0, 0, 0, 0.7))
+		if f.isTask {
+			w, _ := c.Size()
+			// Chrome-free wrapper: the pill row inside carries the surface.
+			panel.Padding(0).Gap(0).
+				Radius(0).
+				Background(ui.Transparent).
+				BorderWidth(0).
+				MaxWidth(w - t.Space(10))
+			b.taskComposeImmersive(c, t, f, &open)
+			return
+		}
+		panel.Padding(t.Space(5)).Gap(t.Space(3)).
+			Radius(t.Space(5)).
+			Background(t.Surface).
+			BorderWidth(0).
+			Width(t.Space(90)).
+			Shadow(0, 10, 30, 0, ui.RGBA(0, 0, 0, 0.3))
+		editing := f.editingProjectID != ""
+		title, hint, saveLabel := "新建项目", "回车创建并关闭 · Shift+回车连续创建", "创建"
+		emptyToast := "无法创建"
+		if editing {
+			title, hint, saveLabel, emptyToast = "编辑项目", "回车保存并关闭", "保存", "无法保存"
+		}
+		ui.Column(c).FillWidth().Gap(t.Space(3)).Children(func() {
+			ui.Text(c, title).FontSize(fmd(t)).FontWeight(600)
+			ui.Text(c, hint).
+				FontSize(fsm(t)).TextColor(t.TextMuted)
+			input := ui.TextInput(c, &f.name).Label("项目名").
+				Placeholder("项目名").AutoFocus().
+				OnTextKey(func(k ui.TextKey) bool {
+					if k.Key != ui.KeyEnter {
+						return false
+					}
+					name := strings.TrimSpace(k.Text())
+					if name == "" {
+						b.toast(emptyToast, "项目名不能为空。")
+						return true
+					}
+					f.name = name
+					if editing {
+						k.SetText("")
+						b.saveProjectEdit()
+						open = false
+						return true
+					}
+					stay := k.Mods&ui.Shift != 0
+					k.SetText("")
+					b.createProject(stay)
+					if !stay {
 						open = false
 					}
-					if ui.PrimaryButton(c, "创建").Clicked() || input.Submitted() {
-						title := strings.TrimSpace(f.name)
-						if title == "" {
-							b.toast("无法创建", "任务标题不能为空。")
-							return
+					return true
+				})
+			ui.Column(c).FillWidth().Gap(t.Space(1)).Children(func() {
+				ui.Text(c, "工作目录").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
+				ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+					pathLabel := "选择本机文件夹…"
+					if f.workspacePath != "" {
+						pathLabel = f.workspacePath
+					}
+					ui.Text(c, pathLabel).FontSize(fsm(t)).TextColor(t.TextMuted).
+						Grow(1).MaxLines(1).Ellipsis("…").Tooltip(f.workspacePath)
+					if ui.Button(c, "浏览…").Label("选择工作目录").
+						Padding(t.Space(1), t.Space(2)).BorderWidth(0).Clicked() {
+						dirs, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+							Title:             "选择项目工作目录",
+							ButtonLabel:       "选择",
+							Directory:         true,
+							CreateDirectories: true,
+							DefaultPath:       f.workspacePath,
+						})
+						if err != nil {
+							b.toast("无法选择目录", err.Error())
+						} else if len(dirs) > 0 {
+							f.workspacePath = dirs[0]
+							if strings.TrimSpace(f.name) == "" {
+								f.name = filepath.Base(dirs[0])
+							}
 						}
-						// Stay open: clear the field so the next title can be typed right away.
-						b.createTop(f.columnID, title)
-						f.name = ""
+					}
+					if f.workspacePath != "" {
+						if ui.Button(c, "清除").Label("清除工作目录").
+							Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
+							TextColor(t.TextMuted).Clicked() {
+							f.workspacePath = ""
+						}
 					}
 				})
-			} else {
-				ui.Text(c, "新建项目").FontSize(fmd(t)).FontWeight(600)
-				ui.Text(c, "侧栏「+」只用于新建项目；新建任务用顶栏加号。").
-					FontSize(fsm(t)).TextColor(t.TextMuted)
-				ui.TextInput(c, &f.name).Label("项目名").Placeholder("项目名").AutoFocus()
-				ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
-					if ui.Button(c, "取消").Clicked() {
-						open = false
+			})
+			ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
+				if ui.Button(c, "取消").Clicked() {
+					open = false
+				}
+				if ui.PrimaryButton(c, saveLabel).Clicked() {
+					if editing {
+						b.saveProjectEdit()
+					} else {
+						b.createProject(false)
 					}
-					if ui.PrimaryButton(c, "创建").Clicked() {
-						b.createProject()
-					}
-				})
-			}
+					open = false
+				}
+			})
+			_ = input
 		})
 	})
 	if !open {
@@ -798,6 +1527,96 @@ func (b *board) formView(c *ui.Context, t *ui.Theme) {
 		return
 	}
 	f.open = open
+}
+
+// taskComposeImmersive is a single-row pill prompt: input fills the bar,
+// circular ↑ button nested at the right end — Enter creates+closes,
+// Shift+Enter creates and stays for the next title.
+func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *bool) {
+	projName := b.projectNameByID(f.projectID)
+	colName := b.columnName(f.columnID)
+	if colName == "" || colName == f.columnID {
+		for _, p := range b.projects {
+			if p.ID != f.projectID {
+				continue
+			}
+			for _, col := range p.Columns {
+				if col.ID == f.columnID {
+					colName = col.Name
+					break
+				}
+			}
+		}
+	}
+	dest := "新任务"
+	switch {
+	case projName != "" && colName != "" && colName != f.columnID:
+		dest = projName + " · " + colName
+	case projName != "":
+		dest = projName
+	case colName != "" && colName != f.columnID:
+		dest = colName
+	}
+
+	ui.Column(c).Width(t.Space(140)).Gap(t.Space(1.5)).
+		AlignItems(ui.Center).Children(func() {
+		ui.Text(c, dest).FontSize(fsm(t)).TextColor(t.Text.Alpha(0.6))
+		// Single-row pill (reference style): input fills the bar, circular
+		// ↑ button nested at the right end. Backdrop click / Esc closes.
+		ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).
+			Padding(t.Space(1.5), t.Space(3)).
+			Radius(t.Space(5.5)).
+			Background(t.Surface).
+			BorderWidth(0).
+			Shadow(0, 12, 36, 0, ui.RGBA(0, 0, 0, 0.35)).
+			Children(func() {
+				input := ui.TextInput(c, &f.name).Label("任务标题").
+					Placeholder("写下一件要做的事…").
+					Grow(1).
+					BorderWidth(0).
+					Background(ui.Transparent).
+					FontSize(flg(t)).
+					AutoFocus().
+					OnTextKey(func(k ui.TextKey) bool {
+						if k.Key != ui.KeyEnter {
+							return false
+						}
+						title := strings.TrimSpace(k.Text())
+						if title == "" {
+							b.toast("无法创建", "任务标题不能为空。")
+							return true
+						}
+						stay := k.Mods&ui.Shift != 0
+						b.createTop(f.projectID, f.columnID, title)
+						k.SetText("")
+						f.name = ""
+						if !stay {
+							*open = false
+						}
+						return true
+					})
+				_ = input
+				send := ui.Button(c, "").Label("创建任务").
+					Tooltip("回车创建并关闭 · Shift+回车继续").
+					Width(t.Space(8)).Height(t.Space(8)).
+					Padding(0).BorderWidth(0).Radius(t.Space(4)).
+					Background(t.Text.Alpha(0.12)).
+					AlignItems(ui.Center).Justify(ui.Center).
+					Children(func() {
+						ui.Text(c, "↑").FontSize(fmd(t)).FontWeight(600).TextColor(t.Text)
+					})
+				if send.Clicked() {
+					title := strings.TrimSpace(f.name)
+					if title == "" {
+						b.toast("无法创建", "任务标题不能为空。")
+					} else {
+						b.createTop(f.projectID, f.columnID, title)
+						f.name = ""
+						*open = false
+					}
+				}
+			})
+	})
 }
 
 // --- conflict ---

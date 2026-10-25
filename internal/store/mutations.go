@@ -24,6 +24,46 @@ type TaskPatch struct {
 	Archived    *bool
 }
 
+// ProjectPatch edits a project's mutable fields. A nil pointer leaves the
+// field alone; a non-nil empty WorkspacePath string clears the path.
+type ProjectPatch struct {
+	Name          *string
+	WorkspacePath *string
+}
+
+// UpdateProject applies a ProjectPatch and emits project.changed. Name must
+// stay non-empty; the workspace path is trusted to have been validated at
+// the HTTP boundary (same split as CreateProjectWithPath).
+func (s *Store) UpdateProject(id string, patch ProjectPatch, by string) (model.Project, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ctx := context.Background()
+	p, err := s.projectLocked(ctx, id)
+	if err != nil {
+		return model.Project{}, err
+	}
+	name := p.Name
+	if patch.Name != nil {
+		name = strings.TrimSpace(*patch.Name)
+		if name == "" {
+			return model.Project{}, invalid("project name required")
+		}
+	}
+	if patch.WorkspacePath != nil {
+		p.WorkspacePath = *patch.WorkspacePath
+	}
+	p.Name = name
+	now := nowUTC()
+	if _, err := s.db.Execute(ctx,
+		`UPDATE projects SET name = ?, workspace_path = ?, updated_at = ? WHERE id = ?`,
+		p.Name, p.WorkspacePath, timestamp(now), id,
+	); err != nil {
+		return model.Project{}, err
+	}
+	emit(s, model.Event{Type: model.EventProjectChange, ProjectID: p.ID, ID: p.ID, By: by})
+	return p, nil
+}
+
 // CreateTask appends a card to the bottom of a column. An empty columnID
 // means the project's first column.
 func (s *Store) CreateTask(projectID, columnID, title, description, assignee, by string) (model.Task, error) {

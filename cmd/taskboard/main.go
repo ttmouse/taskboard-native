@@ -100,10 +100,10 @@ func runWindow() {
 	cl := client.New(&client.Discover{Addr: srv.Addr}, "gui")
 	b := newBoard(cl)
 	// TitleBarHiddenInset + empty Title: no macOS title text.
-	// Compact toolbar is 40 DIP (view.go Space(10)); TrafficLightPosition Y
-	// centers the lights in that band (do not size the row to bar.Height —
-	// that re-inflates to ~46–52 and looks too tall).
-	lights := &mygo.Point{X: 14, Y: 14} // close-btn top-left; centers ~12px lights in the 40 DIP toolbar
+	// Traffic lights sit in the sidebar's top rail (Grok Bolt–style).
+	// Y≈14 centers ~12px lights in the 40 DIP (Space(10)) rail; X≈14 is
+	// the close-button origin inside the sidebar — not the content bar.
+	lights := &mygo.Point{X: 14, Y: 14}
 
 	mygo.App.WhenReady(func() {
 		b.win = mygo.NewWindow(mygo.WindowOptions{

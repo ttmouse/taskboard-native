@@ -35,6 +35,9 @@ type api interface {
 	Comments(taskID string) ([]model.Comment, error)
 	AddComment(taskID, text string) (model.Comment, error)
 	CreateProject(name string) (model.Project, error)
+	CreateProjectWithPath(name, workspacePath string) (model.Project, error)
+	UpdateProject(id, name, workspacePath string) (model.Project, error)
+	Dispatch(taskID, runtime string) error
 	Subscribe(ctx context.Context, projectID string, onEvent func(model.Event), onState func(client.StreamState)) error
 }
 
@@ -60,6 +63,11 @@ type detail struct {
 	comments []model.Comment
 	loading  bool // comments still arriving
 
+	// editTitle / editBody keep the field in input mode while focused
+	// (even after the pointer leaves); cleared on blur when not hovered.
+	editTitle bool
+	editBody  bool
+
 	// snap is the task as it was opened; dirty() compares against it so a
 	// pushed update cannot silently overwrite unsaved typing.
 	snap   model.Task
@@ -78,10 +86,15 @@ func (d *detail) stale() bool { return d.dirty() && d.pushed != nil }
 
 // form is a small dialog: a new task or a new project.
 type form struct {
-	open     bool
-	isTask   bool // true → 新建任务；false → 新建项目
-	name     string
-	columnID string // task form only: target column
+	open          bool
+	isTask        bool // true → 新建任务；false → 新建项目
+	name          string
+	workspacePath string // project form: local working directory
+	columnID      string // task form only: target column
+	projectID     string // task form only: which project receives the card
+	// editingProjectID non-empty turns the project form into an edit sheet
+	// for that project (name pre-filled, save instead of create).
+	editingProjectID string
 }
 
 // settings is the small preferences sheet (one toggle for now).
@@ -127,9 +140,21 @@ type board struct {
 	conflict *conflict
 	settings *settings // nil when the settings sheet is closed
 
-	prefs uiPrefs // persisted window preferences (title-only cards, …)
+	prefs    uiPrefs // persisted window preferences (title-only cards, …)
+	sidebarW float32 // live sidebar width; 0 until first layout
 
-	searchQuery string // top-bar filter: title + description, all columns
+	// The sidebar slides open and shut (railWidth); the board pane takes the
+	// room it leaves. While the rail moves, the columns' and cards' own
+	// Position+Size transitions would lag behind the pane and got clipped at
+	// its left edge, so paneResize asks them to follow the pane exactly
+	// instead of tweening toward it. paneW is last frame's pane width.
+	paneW       float32
+	paneResize  bool
+	railStarted bool    // the rail's animated width exists after the first frame
+	railNow     float32 // the rail's width as the frame being built shows it
+
+	searchQuery string // filter: title + description, all columns
+	searchOpen  bool   // sidebar search button → immersive centered search overlay
 
 	// colScrolls tracks per-column (and board) scroll offsets so the
 	// scrollbar theme can stay transparent until the user scrolls.
@@ -144,6 +169,7 @@ type board struct {
 	streaming   bool                 // the SSE reader is running
 	recent      map[string]time.Time // task ID → until when it shows as changed
 	bounds      map[string]ui.Rect
+	sfxMuteUntil map[string]time.Time // per-task debounce for column-change cues
 	motionState // accepted motion shared with the Playground
 }
 
@@ -379,11 +405,15 @@ func (b *board) applyEvent(ev model.Event) {
 		}
 		task := *ev.Task
 		b.normalizeTaskColumns(&task)
-		if !b.upsert(task) {
+		applied, inserted := b.upsert(task)
+		if !applied {
 			return
 		}
 		b.touchDetail(task)
-		if ev.Type == model.EventTaskCreated {
+		// Create cue only when the card is new locally — updates that arrive
+		// tagged as created (or a create that races an optimistic insert)
+		// must not re-tick.
+		if ev.Type == model.EventTaskCreated && inserted {
 			playCreateCue()
 		}
 		if ev.By != "" && ev.By != b.agent {
@@ -560,6 +590,28 @@ func (b *board) taskMatchesSearch(t model.Task) bool {
 	return strings.Contains(strings.ToLower(t.Title+"\n"+t.Description), q)
 }
 
+// searchHits returns tasks matching searchQuery (title + description).
+// Empty query yields no hits — the overlay lists matches as the user types.
+func (b *board) searchHits() []model.Task {
+	q := strings.TrimSpace(b.searchQuery)
+	if q == "" {
+		return nil
+	}
+	var out []model.Task
+	for _, t := range b.tasks {
+		if b.taskMatchesSearch(t) {
+			out = append(out, t)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Title != out[j].Title {
+			return out[i].Title < out[j].Title
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
 func (b *board) sortTasks() {
 	rank := map[string]int{}
 	for i, c := range b.columns {
@@ -670,30 +722,32 @@ func (b *board) columnNames() []string {
 }
 
 // upsert merges a pushed task; a stale copy loses.
-func (b *board) upsert(t model.Task) bool {
+// applied is false when the event was ignored; inserted is true only when
+// a new card joined the local board (create cue uses this).
+func (b *board) upsert(t model.Task) (applied, inserted bool) {
 	if t.Archived {
-		return b.remove(t.ID)
+		return b.remove(t.ID), false
 	}
 	for i := range b.tasks {
 		if b.tasks[i].ID != t.ID {
 			continue
 		}
 		if t.Version < b.tasks[i].Version {
-			return false
+			return false, false
 		}
 		b.reconcilePlacement(t)
 		b.noteMove(b.tasks[i], t)
 		b.tasks[i] = t
 		b.sortTasks()
-		return true
+		return true, false
 	}
 	if b.cur != "" && b.cur != curGlobal && t.ProjectID != b.cur {
-		return false
+		return false, false
 	}
 	b.reconcilePlacement(t)
 	b.tasks = append(b.tasks, t)
 	b.sortTasks()
-	return true
+	return true, true
 }
 
 func (b *board) remove(id string) bool {
@@ -981,6 +1035,38 @@ func (b *board) restore(t model.Task) {
 	}()
 }
 
+// dispatchTask sends the card to the DSH runtime. The service runs
+// `dsh headless` inside the project's workspace directory and writes
+// progress back as comments and column moves; the GUI just watches the
+// stream, so there is nothing to update optimistically here.
+func (b *board) dispatchTask(id string) {
+	t := b.task(id)
+	if t == nil {
+		return
+	}
+	var ws string
+	for _, p := range b.projects {
+		if p.ID == t.ProjectID {
+			ws = strings.TrimSpace(p.WorkspacePath)
+			break
+		}
+	}
+	if ws == "" {
+		b.toast("无法派发", "项目未设置工作路径，先给项目设置工作目录")
+		return
+	}
+	go func() {
+		err := b.api.Dispatch(id, "")
+		b.post(func() {
+			if err != nil {
+				b.toast("派发失败", err.Error())
+				return
+			}
+			b.toast("已派发 DSH 执行", clip(t.Title, 24))
+		})
+	}()
+}
+
 func (b *board) sendComment() {
 	d := b.detail
 	if d == nil || b.commenting {
@@ -1009,7 +1095,18 @@ func (b *board) sendComment() {
 
 // playColumnChangeCue soft-clicks on a real column change; a landing in
 // 「完成」gets the done chime instead. Load/openProject never call this.
-func (b *board) playColumnChangeCue(toColumnID string) {
+// Per-task debounce suppresses the SSE echo after an optimistic replace
+// (and any rapid remaps) so one move never rings twice.
+func (b *board) playColumnChangeCue(taskID, toColumnID string) {
+	now := time.Now()
+	if b.sfxMuteUntil != nil {
+		if until, ok := b.sfxMuteUntil[taskID]; ok && now.Before(until) {
+			return
+		}
+	} else {
+		b.sfxMuteUntil = map[string]time.Time{}
+	}
+	b.sfxMuteUntil[taskID] = now.Add(500 * time.Millisecond)
 	if b.columnName(toColumnID) == "完成" {
 		playDoneCue()
 		return
@@ -1017,7 +1114,59 @@ func (b *board) playColumnChangeCue(toColumnID string) {
 	playMoveCue()
 }
 
-func (b *board) createProject() {
+// openProjectEdit opens the project form pre-filled for editing p: same
+// sheet as create, but 回车/保存 writes the change back instead.
+func (b *board) openProjectEdit(p model.Project) {
+	b.form = &form{
+		open:             true,
+		isTask:           false,
+		name:             p.Name,
+		workspacePath:    p.WorkspacePath,
+		editingProjectID: p.ID,
+	}
+}
+
+// saveProjectEdit writes an edited project's name and workspace path back.
+// The form closes on success; a failure keeps it open with the input
+// intact so the user can correct it.
+func (b *board) saveProjectEdit() {
+	f := b.form
+	if f == nil || f.editingProjectID == "" {
+		return
+	}
+	name := strings.TrimSpace(f.name)
+	if name == "" {
+		b.toast("无法保存", "项目名不能为空。")
+		return
+	}
+	path := strings.TrimSpace(f.workspacePath)
+	go func() {
+		p, err := b.api.UpdateProject(f.editingProjectID, name, path)
+		b.post(func() {
+			if err != nil {
+				b.toast("保存失败", err.Error())
+				return
+			}
+			ps, perr := b.api.Projects()
+			if perr == nil {
+				b.projects = ps
+			} else {
+				for i := range b.projects {
+					if b.projects[i].ID == p.ID {
+						b.projects[i] = p
+						break
+					}
+				}
+			}
+			if f := b.form; f != nil {
+				f.open = false
+			}
+			b.toast("已保存", "项目「"+clip(p.Name, 24)+"」已更新")
+		})
+	}()
+}
+
+func (b *board) createProject(stayOpen bool) {
 	f := b.form
 	if f == nil {
 		return
@@ -1027,9 +1176,20 @@ func (b *board) createProject() {
 		b.toast("无法创建", "项目名不能为空。")
 		return
 	}
-	f.open = false
+	path := strings.TrimSpace(f.workspacePath)
+	f.name = ""
+	if !stayOpen {
+		f.open = false
+		f.workspacePath = ""
+	}
 	go func() {
-		p, err := b.api.CreateProject(name)
+		var p model.Project
+		var err error
+		if path != "" {
+			p, err = b.api.CreateProjectWithPath(name, path)
+		} else {
+			p, err = b.api.CreateProject(name)
+		}
 		if err != nil {
 			b.toast("创建失败", err.Error())
 			return
@@ -1041,7 +1201,12 @@ func (b *board) createProject() {
 			} else {
 				b.projects = append(b.projects, p)
 			}
-			b.openProject(p.ID)
+			if stayOpen {
+				f.workspacePath = ""
+			}
+			if !stayOpen {
+				b.openProject(p.ID)
+			}
 		})
 	}()
 }

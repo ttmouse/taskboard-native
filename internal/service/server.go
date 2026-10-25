@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"taskboard-native/internal/executor"
 	"taskboard-native/internal/model"
 	"taskboard-native/internal/store"
 )
@@ -71,6 +73,7 @@ type Server struct {
 	hub      *hub
 	slow     time.Duration
 	ping     time.Duration // SSE keep-alive interval; 0 = 15s
+	dispatch *executor.Dispatcher
 	closed   chan struct{}
 	stopOnce sync.Once
 }
@@ -124,6 +127,7 @@ func StartOptions(opts Options) (*Server, error) {
 		store:    st,
 		hub:      h,
 		slow:     slow,
+		dispatch: executor.NewDispatcher(st),
 		closed:   make(chan struct{}),
 		listener: ln,
 	}
@@ -141,7 +145,8 @@ func StartOptions(opts Options) (*Server, error) {
 	return s, nil
 }
 
-// Close stops accepting requests, closes SSE subscribers and the database.
+// Close stops accepting requests, cancels running task executions, closes
+// SSE subscribers and the database.
 func (s *Server) Close() error {
 	var err error
 	s.stopOnce.Do(func() {
@@ -150,6 +155,9 @@ func (s *Server) Close() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		shutdownErr := s.http.Shutdown(ctx)
+		// Cancel executions before the store closes so their write-back
+		// goroutines drain against a live store.
+		s.dispatch.Close()
 		storeErr := s.store.Close()
 		err = errors.Join(shutdownErr, storeErr)
 	})
@@ -164,12 +172,14 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/projects", s.handleProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
+	mux.HandleFunc("PATCH /api/projects/{id}", s.handlePatchProject)
 	mux.HandleFunc("GET /api/projects/{id}/board", s.handleBoard)
 	mux.HandleFunc("GET /api/tasks", s.handleTasks)
 	mux.HandleFunc("POST /api/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleTask)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.handlePatchTask)
 	mux.HandleFunc("POST /api/tasks/{id}/archive", s.handleArchive)
+	mux.HandleFunc("POST /api/tasks/{id}/dispatch", s.handleDispatch)
 	mux.HandleFunc("GET /api/tasks/{id}/comments", s.handleComments)
 	mux.HandleFunc("POST /api/tasks/{id}/comments", s.handleAddComment)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
@@ -269,6 +279,26 @@ type newProject struct {
 	WorkspacePath string `json:"workspacePath"`
 }
 
+// checkWorkspacePath validates an optional workspace path: empty means
+// "none"; otherwise it must be an existing absolute directory. Returns the
+// cleaned path. Shared by project create and project edit.
+func checkWorkspacePath(w http.ResponseWriter, raw string) (string, bool) {
+	if raw == "" {
+		return "", true
+	}
+	if !filepath.IsAbs(raw) {
+		writeBadRequest(w, "workspacePath must be an absolute directory")
+		return "", false
+	}
+	cleaned := filepath.Clean(raw)
+	info, err := os.Stat(cleaned)
+	if err != nil || !info.IsDir() {
+		writeBadRequest(w, "workspacePath must be an existing directory")
+		return "", false
+	}
+	return cleaned, true
+}
+
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	var req newProject
 	if !decodeJSON(w, r, &req) {
@@ -278,18 +308,9 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, "name is required")
 		return
 	}
-	workspacePath := ""
-	if req.WorkspacePath != "" {
-		if !filepath.IsAbs(req.WorkspacePath) {
-			writeBadRequest(w, "workspacePath must be an absolute directory")
-			return
-		}
-		workspacePath = filepath.Clean(req.WorkspacePath)
-		info, err := os.Stat(workspacePath)
-		if err != nil || !info.IsDir() {
-			writeBadRequest(w, "workspacePath must be an existing directory")
-			return
-		}
+	workspacePath, ok := checkWorkspacePath(w, req.WorkspacePath)
+	if !ok {
+		return
 	}
 	project, err := s.store.CreateProjectWithPath(req.Name, workspacePath, agent(r))
 	if err != nil {
@@ -297,6 +318,39 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, project)
+}
+
+type projectPatch struct {
+	Name          *string `json:"name"`
+	WorkspacePath *string `json:"workspacePath"`
+}
+
+// handlePatchProject edits a project's name and/or workspace path. Absent
+// fields stay unchanged; an empty workspacePath clears the path. Path
+// validation matches project creation.
+func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
+	var req projectPatch
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	patch := store.ProjectPatch{Name: req.Name, WorkspacePath: req.WorkspacePath}
+	if req.WorkspacePath != nil && *req.WorkspacePath != "" {
+		cleaned, ok := checkWorkspacePath(w, *req.WorkspacePath)
+		if !ok {
+			return
+		}
+		patch.WorkspacePath = &cleaned
+	}
+	if req.Name != nil && strings.TrimSpace(*req.Name) == "" {
+		writeBadRequest(w, "name is required")
+		return
+	}
+	project, err := s.store.UpdateProject(r.PathValue("id"), patch, agent(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, project)
 }
 
 func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
@@ -558,6 +612,45 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, task)
+}
+
+type dispatchRequest struct {
+	Runtime string `json:"runtime"`
+}
+
+// handleDispatch starts an async execution of the task on an execution
+// runtime. The body is optional: with no runtime named, the only runtime
+// the service ships (dsh) is used. The run's progress lands as normal task
+// comments and column moves, so clients need no new event types.
+func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
+	var req dispatchRequest
+	if r.Body != nil {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil {
+			writeBadRequest(w, "read body: %v", err)
+			return
+		}
+		if strings.TrimSpace(string(body)) != "" {
+			if err := json.Unmarshal(body, &req); err != nil {
+				writeBadRequest(w, "invalid json: %v", err)
+				return
+			}
+		}
+	}
+	runtime := strings.TrimSpace(req.Runtime)
+	if runtime == "" {
+		runtime = executor.RuntimeDSH
+	}
+	taskID := r.PathValue("id")
+	if err := s.dispatch.Dispatch(taskID, runtime, agent(r)); err != nil {
+		if errors.Is(err, executor.ErrInProgress) {
+			writeJSON(w, http.StatusConflict, errorBody{Error: "dispatch_in_progress"})
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"taskId": taskID, "runtime": runtime})
 }
 
 func (s *Server) handleComments(w http.ResponseWriter, r *http.Request) {

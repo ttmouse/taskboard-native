@@ -34,6 +34,13 @@ func (b *board) cardView(c *ui.Context, t *ui.Theme, task *model.Task) {
 	}
 	tr := b.cardTransition(t, task)
 	tr.Match = cardMatch{ID: task.ID}
+	if b.paneResize {
+		// The sidebar opened or collapsed under this card: it is re-laid
+		// out, not moved. Tweening would drag it from its old place, past
+		// the pane's left edge, and its left side would be cut off. Keep
+		// the color tween (the card's own hover/flash) and snap the box.
+		tr.Position, tr.Size, tr.Enter = false, false, nil
+	}
 	until, flying := b.flights[task.ID]
 	flying = flying && c.Now().Before(until) && !c.Preferences().ReduceMotion
 	if !flying {
@@ -189,7 +196,7 @@ func (b *board) cardTransition(t *ui.Theme, task *model.Task) ui.ElementTransiti
 
 func (b *board) noteMove(from, to model.Task) {
 	if from.ColumnID != to.ColumnID {
-		b.playColumnChangeCue(to.ColumnID)
+		b.playColumnChangeCue(to.ID, to.ColumnID)
 	}
 	if from.ColumnID == to.ColumnID || b.frameCtx == nil || b.frameCtx.Preferences().ReduceMotion {
 		return
