@@ -990,7 +990,15 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		// chip was stretching 评审 cards taller than other columns. Overlay it.
 		titleOnly := b.prefs.TitleOnlyCards
 		ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
-			ui.Column(c).Grow(1).Gap(t.Space(2)).Children(func() {
+			// Title-only 评审 cards carry ✓ as a card overlay; reserve its
+			// zone in the resting layout too, so hover never re-truncates
+			// the line under the reader. s4 covers the chip (s1 inset + 24)
+			// less the card padding the title already stops at.
+			titleCol := ui.Column(c).Grow(1).Gap(t.Space(2))
+			if inReview && titleOnly {
+				titleCol = titleCol.MarginEnd(t.Space(4))
+			}
+			titleCol.Children(func() {
 				ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
 					MaxLines(2).Ellipsis("…").FillWidth().Tooltip(task.Title)
 				if b.cur == curGlobal {
@@ -1053,7 +1061,6 @@ func (b *board) reviewCheckButton(c *ui.Context, t *ui.Theme, card ui.Element, t
 			// Lucide check mass sits left/high; 1px nudge for optical center.
 			ui.Icon(c, approveCheck).Size(16, 16).Margin(1, 0, 0, 1)
 		})
-	b.approveHint(c, t, check, card)
 	show := card.Hovered() || check.Hovered() || check.Pressed()
 	ink := t.TextMuted
 	chip := ui.Transparent
@@ -1080,75 +1087,26 @@ func (b *board) reviewCheckButton(c *ui.Context, t *ui.Theme, card ui.Element, t
 	}
 }
 
-// approveHint hangs the ✓ chip's "移到完成" hint inside the card: at the
-// chip's left on its midline where the card has room, centered above it
-// where the card is too narrow for that, never past the card's edge.
+// reviewCheckButtonOverlay pins ✓ just inside the card's right edge,
+// centered on the card's middle so it lines up with the title row of
+// title-only 评审 cards (in-flow was the stretch that made them taller
+// than other columns).
 //
-// The themed Tooltip places the tip centered above the anchor, and in the
-// 评审 column that put it half outside the card: over the empty gap
-// between columns and over the last line of the card above, so it read as
-// a button that had wandered off the card it belongs to (LOCAL-32). The
-// hint has to say which card the ✓ acts on, so it stays on the card.
-func (b *board) approveHint(c *ui.Context, t *ui.Theme, check, card ui.Element) {
-	const text = "移到完成"
-	hovered := check.Pressed() || check.Hovered()
-	// Placed while hovered: its left edge is known only then, and one tip
-	// that comes and goes with the hover needs nothing more.
-	if !hovered {
-		return
-	}
-	fill, ink := tipFace(t)
-	ui.TooltipBase(c, check, func(tip ui.Element) {
-		tip.MaxWidth(t.Space(80)).Padding(t.Space(1.25), t.Space(2)).Radius(t.Space(1.25)).
-			Background(fill).TextColor(ink).FontSize(t.FontSize-1).
-			Shadow(0, 2, 8, 0, ui.RGBA(0, 0, 0, 0.2)).
-			Children(func() { ui.Text(c, text) })
-		tip.AttachTo(check, ui.AnchorLeft, ui.AnchorRight).Margin(0, t.Space(1), 0, 0)
-		insideCard(tip, card, t)
-	})
-}
-
-// tipFace is a hint's fill and text, the theme turned over as Tooltip
-// and Toast draw it. A theme that leaves Inverse unset (the stock light
-// one does) falls back to Text on Background, which mygo's fallback near
-// misses: it compares rather than checks for unset, so a transparent
-// Background won a white hint on a white card (LOCAL-32).
-func tipFace(t *ui.Theme) (fill, ink ui.Color) {
-	if t.Inverse.A != 0 {
-		return t.Inverse, t.InverseText
-	}
-	return t.Text, t.Background
-}
-
-// insideCard keeps tip over card: a tip hung off card's edge would cover
-// the next column's cards instead of its own (LOCAL-32).
-func insideCard(tip, card ui.Element, t *ui.Theme) {
-	inset := t.Space(1.5)
-	p := card.Bounds()
-	left, right := p.X+inset, p.X+p.W-inset
-	q := tip.Bounds()
-	switch {
-	case q.X+q.W > right:
-		tip.RightPercent(0).MarginEnd(0).MarginStart(inset)
-	case q.X < left:
-		tip.LeftPercent(0).Margin(0, 0, 0, inset)
-	}
-}
-
-// reviewCheckButtonOverlay pins ✓ to the card's right edge, centered on
-// the card's middle so it lines up with the title row of title-only 评审
-// cards (in-flow was the stretch that made them taller than other columns).
+// Attach's second anchor is the chip's own point: AnchorRight pins the
+// chip's right edge to the card's, and Right(s1) draws it in from there.
+// AnchorCenter — what LOCAL-32 first shipped — pins the chip's center to
+// the card's edge, leaving half the chip hanging outside over the column
+// gap, which is the defect this issue reports.
 func (b *board) reviewCheckButtonOverlay(c *ui.Context, t *ui.Theme, card ui.Element, task *model.Task, approve *bool) {
 	chipSize := float32(24)
 	check := ui.ButtonBase(c.Key(task.ID+"-approve")).
 		Label("验收通过，移到完成").
-		Absolute().Attach(ui.AnchorRight, ui.AnchorCenter).Right(t.Space(1)).
+		Absolute().Attach(ui.AnchorRight, ui.AnchorRight).Right(t.Space(1)).
 		Size(chipSize, chipSize).Padding(0).Gap(0).BorderWidth(0).
 		Radius(t.Radius + 2).Center().
 		Children(func() {
 			ui.Icon(c, approveCheck).Size(16, 16).Margin(1, 0, 0, 1)
 		})
-	b.approveHint(c, t, check, card)
 	show := card.Hovered() || check.Hovered() || check.Pressed()
 	ink := t.TextMuted
 	chip := ui.Transparent
