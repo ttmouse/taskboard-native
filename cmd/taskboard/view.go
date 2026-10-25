@@ -108,6 +108,14 @@ func (b *board) view(c *ui.Context) {
 	b.ensureSidebarWidth(t)
 	// Cmd+B toggles the project sidebar (same as the panel icon chip).
 	c.OnShortcut(ui.Cmd, ui.KeyB, func() { b.toggleSidebar() })
+	// Cmd+N opens the create-task sheet (same as the sidebar 新建任务 row).
+	// Window shortcuts wait while a modal is up, so it never fires under
+	// the detail dialog, search, or a form.
+	c.OnShortcut(ui.Cmd, ui.KeyN, func() { b.openTaskForm(b.defaultTaskColumnID()) })
+	// Cmd+Shift+L cycles 外观 (跟随系统 → 浅色 → 深色), the same setting the
+	// settings sheet's 外观 row carries; it works under a modal too, since
+	// changing the appearance of an open sheet is safe.
+	c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyL, b.cycleAppearance)
 	content := func() {
 		ui.Column(c).Fill().Children(func() {
 			b.topBar(c, t)
@@ -272,37 +280,55 @@ func (b *board) productionTopBar(c *ui.Context, t *ui.Theme) {
 // railEase is how the sidebar arrives: fast out, so the board gets its room
 // back almost at once, and short enough to read as a snap rather than a slide.
 const (
-	railOpenFor     = 150 * time.Millisecond
-	railCollapseFor = 130 * time.Millisecond
+	railOpenFor     = 170 * time.Millisecond
+	railCollapseFor = 150 * time.Millisecond
 )
 
-// railWidth is the sidebar's width for this frame, animated as a drawer: it
-// must be asked on an element (split) so MyGo can keep the value between
-// frames. Reduce Motion lands it at once.
+// railWidth is the sidebar's width for this frame, animated as a drawer: the
+// box narrows while its content keeps the resting width, so the rail reads as
+// sliding under the window edge rather than as squeezing.
+//
+// The animation is driven off the board's own state, not off side effects, so
+// it is safe to ask more than once in a frame (MyGo builds a view repeatedly):
+// b.railAt is when the current slide began and b.railFrom where it began.
 func (b *board) railWidth(split ui.Element, c *ui.Context, t *ui.Theme) float32 {
-	open := b.sidebarVisible()
 	b.ensureSidebarWidth(t)
+	if len(b.projects) == 0 {
+		// No rail at all, and nothing to animate from once one arrives.
+		b.railArmed, b.railNow = false, 0
+		return 0
+	}
+	open := b.sidebarVisible()
 	target := float32(0)
 	if open {
 		target = b.sidebarW
 	}
-	if b.sidebarW <= 0 {
+	// The rail's first appearance lands at once: the window opens with it in
+	// place, where a slide from zero would leave the sidebar absent for
+	// several frames. Arm only now, so the first real toggle animates.
+	if !b.railArmed {
+		b.railArmed, b.railNow = true, target
 		return target
 	}
-	if !b.railStarted {
-		// First frame: no animation, the window opens with the rail in place.
-		// Jump plants the value so the first toggle animates from here
-		// instead of starting at its target.
-		b.railStarted = true
-		return split.Jump(railKey, target)
+	now := c.Now()
+	if b.railNow == target {
+		return target
+	}
+	if b.railAt.IsZero() || b.railTo != target {
+		// A new slide starts here, from whatever is on screen.
+		b.railAt, b.railFrom, b.railTo = now, b.railNow, target
 	}
 	d := railOpenFor
 	if !open {
 		d = railCollapseFor
 	}
-	v := split.AnimateWith(railKey, target, d, ui.EaseOut)
-	// Land exactly on the target: the last sub-DIP frames would otherwise
-	// leave a 0.4 DIP sliver of rail behind.
+	elapsed := now.Sub(b.railAt)
+	if elapsed >= d {
+		b.railNow = target
+		return target
+	}
+	p := float32(elapsed) / float32(d)
+	v := b.railFrom + (target-b.railFrom)*ui.EaseOut(min(max(p, 0), 1))
 	if absDiff(v, target) < 0.75 {
 		v = target
 	}
@@ -1177,16 +1203,21 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					// Title / body stay as TextInput / TextArea always (borderless,
 					// transparent). Swapping Text ↔ input on hover shifted layout
 					// because the widgets disagree on intrinsic padding.
+					//
+					// Padding is zero, not "small": the input's own inset would push
+					// the title and the body a step to the right of the header, the
+					// select and the comment cards, which read as a ragged left
+					// margin down the sheet.
 					ui.TextInput(c, &d.title).Label("任务标题").Placeholder("任务标题").
 						FillWidth().FontSize(fmd(t)).FontWeight(500).
 						BorderWidth(0).Background(ui.Transparent).
-						Padding(t.Space(0.5), t.Space(1))
+						Padding(0, 0)
 					d.editTitle = false
 
 					ui.TextArea(c, &d.body).Label("任务正文").Placeholder("添加任务描述…").
 						FillWidth().MinHeight(t.Space(30)).
 						BorderWidth(0).Background(ui.Transparent).
-						Padding(t.Space(0.5), t.Space(1))
+						Padding(0, 0)
 					d.editBody = false
 
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(t.Space(3)).Children(func() {
@@ -1198,7 +1229,9 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 								d.column = names[0]
 							}
 						}
-						if ui.Select(c, &d.column, names).Label("移动到列").Changed() {
+						// The select's hairline is the row's left edge, so -Space(1)
+						// moves that edge onto the same line as the text above it.
+						if ui.Select(c, &d.column, names).Label("移动到列").MarginStart(-t.Space(1)).Changed() {
 							if colID := b.columnID(d.column); colID != "" {
 								b.moveTask(d.id, colID, "", false)
 							}
@@ -1226,8 +1259,12 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						ui.Column(c).FillWidth().Gap(t.Space(2)).Children(func() {
 							for i := range d.comments {
 								cm := &d.comments[i]
+								// The card's fill, not its inner padding, is the row
+								// that must line up: no inset on the sheet's left, so
+								// the comment's first glyph sits on the same edge as
+								// the title above it.
 								ui.Box(c.Key("c-"+cm.ID)).FillWidth().
-									Padding(t.Space(2.5), t.Space(3)).Gap(t.Space(1.5)).
+									Padding(t.Space(2.5), t.Space(3), t.Space(2.5), 0).Gap(t.Space(1.5)).
 									Radius(t.Radius + 2).BorderWidth(0).
 									Background(t.SurfaceHover.Alpha(0.55)).Children(func() {
 									ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
@@ -1244,12 +1281,16 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					}
 				})
 			})
-			ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5)).Gap(t.Space(2)).
+			// The composer's own box edges the sheet on the left (padding 0 in
+			// front) so the placeholder shares the row edge with every other
+			// line; its 写评论 input drops its inner inset for the same reason.
+			ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5), t.Space(2), 0).Gap(t.Space(2)).
 				Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4)).
 				Children(func() {
 					ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
 						input := ui.TextInput(c, &d.comment).Placeholder("写评论，回车发送").Label("写评论").
-							Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent)
+							Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent).
+							Padding(0, 0)
 						if b.commenting {
 							loading.BouncingDots(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在发送评论")
 						}
@@ -1440,12 +1481,68 @@ func (b *board) defaultTaskColumnID() string {
 
 func (b *board) openSettings() { b.settings = &settings{open: true} }
 
+// setAppearance makes a the chrome's 外观, now and on the next launch. The
+// frame follows on the next build (b.view asks mygo's appearance override
+// on every frame), so the board, its modals and this sheet all turn on the
+// same click.
+func (b *board) setAppearance(a appearance) {
+	if !a.valid() || a == b.prefs.Appearance {
+		return
+	}
+	b.prefs.Appearance = a
+	mygo.Theme.SetSource(a.source())
+	_ = saveUIPrefs(b.prefs)
+	if b.frameCtx != nil {
+		b.frameCtx.Invalidate()
+	}
+}
+
+// cycleAppearance steps 跟随系统 → 浅色 → 深色 → 跟随系统, as ⌘⇧L does.
+func (b *board) cycleAppearance() { b.setAppearance(b.prefs.Appearance.next()) }
+
+// appearanceIndex is the appearance in appearanceChoices, for the
+// segmented control, which works in indexes.
+func (b *board) appearanceIndex() int {
+	for i, choice := range appearanceChoices {
+		if choice.value == b.prefs.Appearance {
+			return i
+		}
+	}
+	return 0
+}
+
+// settingsView is the preferences sheet. Every row says what it sets; the
+// controls beside them carry the values, so no row repeats its own name
+// inside the control.
 func (b *board) settingsView(c *ui.Context, t *ui.Theme) {
 	s := b.settings
 	open := s.open
 	ui.Modal(c, &open, func() {
 		ui.Column(c).Width(t.Space(80)).Gap(t.Space(3)).Children(func() {
 			ui.Text(c, "设置").FontSize(fmd(t)).FontWeight(600)
+			// 外观: the segmented control turns the chrome at once, and the
+			// row's right-click menu offers the same three choices by name.
+			row := ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "外观").FontSize(t.FontSize)
+				ui.Spacer(c)
+				selected := b.appearanceIndex()
+				labels := make([]string, len(appearanceChoices))
+				for i, choice := range appearanceChoices {
+					labels[i] = choice.label
+				}
+				if ui.Segmented(c, &selected, labels...).
+					Label("外观，当前" + b.prefs.Appearance.label()).Changed() {
+					b.setAppearance(appearanceChoices[selected].value)
+				}
+			})
+			row.ContextMenu(func(m *ui.Menu) {
+				for _, choice := range appearanceChoices {
+					item := m.Item(choice.label).Checked(choice.value == b.prefs.Appearance)
+					if item.Chosen() {
+						b.setAppearance(choice.value)
+					}
+				}
+			})
 			if ui.Checkbox(c, &b.prefs.TitleOnlyCards, "卡片仅显示标题").
 				Label("卡片仅显示标题").Changed() {
 				_ = saveUIPrefs(b.prefs)
