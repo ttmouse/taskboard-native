@@ -435,6 +435,43 @@ func TestReviewStatusIconDoesNotCoverApprovalControl(t *testing.T) {
 	}
 }
 
+func TestCardFooterActionsShareHoverStyle(t *testing.T) {
+	isolatePrefs(t)
+	fake := seedBoard()
+	task := fake.tasks[0]
+	task.ColumnID = "c-review"
+	task.Execution = &model.Execution{
+		TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "returned",
+	}
+	fake.tasks[0] = task
+	b := newBoard(fake)
+	b.prefs.TitleOnlyCards = true
+	tt := newBoardTester(b)
+	waitFor(t, tt, "卡片页脚操作", func() bool {
+		return tt.HasText("打开 Herdr 中的 Codex 对话") && tt.HasText("验收通过，移到完成")
+	})
+	settle(t, tt)
+
+	open, _ := tt.Find("打开 Herdr 中的 Codex 对话")
+	approve, _ := tt.Find("验收通过，移到完成")
+	if open.W != approve.W || open.H != approve.H {
+		t.Fatalf("footer action sizes differ: open=%+v approve=%+v", open, approve)
+	}
+
+	hoverPixel := func(bounds ui.Rect) [4]uint32 {
+		tt.Move(bounds.X+bounds.W/2, bounds.Y+bounds.H/2)
+		tt.Advance(50 * time.Millisecond)
+		tt.Frame()
+		r, g, b, a := tt.Image().At(int(bounds.X+bounds.W/2), int(bounds.Y+2)).RGBA()
+		return [4]uint32{r, g, b, a}
+	}
+	openHover := hoverPixel(open)
+	approveHover := hoverPixel(approve)
+	if openHover != approveHover {
+		t.Fatalf("footer action hover fills differ: open=%v approve=%v", openHover, approveHover)
+	}
+}
+
 // TestOfflineBanner checks the banner appears when the stream drops and
 // that the board stays readable underneath.
 func TestOfflineBanner(t *testing.T) {
