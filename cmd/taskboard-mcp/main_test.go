@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"taskboard-native/internal/client"
 	"taskboard-native/internal/model"
 	"taskboard-native/internal/service"
 )
@@ -199,6 +200,19 @@ func TestMCPEndToEnd(t *testing.T) {
 		}
 	})
 
+	// A newly opened service starts projectless; this scenario expects the
+	// legacy「local」board with its three demo cards, so seed it via the API.
+	fc := client.New(&client.Discover{Addr: srv.Addr}, "test-agent")
+	proj, err := fc.CreateProject("local")
+	if err != nil {
+		t.Fatalf("fixture project: %v", err)
+	}
+	for i, title := range []string{"欢迎使用 taskboard", "接上 CLI 与 MCP", "检查实时推送"} {
+		if _, err := fc.CreateTask(proj.ID, proj.Columns[i].ID, title, "", ""); err != nil {
+			t.Fatalf("fixture task %d: %v", i, err)
+		}
+	}
+
 	s := startMCP(t, []string{"TASKBOARD_ADDR=" + srv.Addr, "TASKBOARD_AGENT=mcp-e2e"})
 
 	// initialize
@@ -250,14 +264,14 @@ func TestMCPEndToEnd(t *testing.T) {
 	if err := json.Unmarshal([]byte(text), &projects); err != nil {
 		t.Fatalf("decode projects %q: %v", text, err)
 	}
-	if len(projects) != 1 || projects[0].ID != "local" {
+	if len(projects) != 1 || projects[0].ID != proj.ID {
 		t.Fatalf("projects = %+v", projects)
 	}
 
 	// create_task by column name, identity from TASKBOARD_AGENT
 	text, isErr = toolText(t, s.call(4, "tools/call", map[string]any{
 		"name":      "create_task",
-		"arguments": map[string]any{"projectId": "local", "title": "MCP 创建", "columnId": "进行中", "description": "来自 MCP"},
+		"arguments": map[string]any{"projectId": proj.ID, "title": "MCP 创建", "columnId": "进行中", "description": "来自 MCP"},
 	}))
 	if isErr {
 		t.Fatalf("create_task failed: %s", text)
@@ -275,7 +289,7 @@ func TestMCPEndToEnd(t *testing.T) {
 
 	// list_tasks requires projectId and returns the new card
 	text, isErr = toolText(t, s.call(5, "tools/call", map[string]any{
-		"name": "list_tasks", "arguments": map[string]any{"projectId": "local"},
+		"name": "list_tasks", "arguments": map[string]any{"projectId": proj.ID},
 	}))
 	if isErr {
 		t.Fatalf("list_tasks failed: %s", text)

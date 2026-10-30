@@ -6,12 +6,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -160,8 +162,16 @@ func (s *server) dispatch(req request) (any, *rpcError) {
 				"isError": true,
 			}, nil
 		}
+		content := []map[string]any{{"type": "text", "text": text}}
+		// get_task returns the card as JSON; any images embedded in its body
+		// or comments are referenced by /api/images/{hash}. Attach them as
+		// native image blocks so a multimodal model can actually see them,
+		// with no extra instruction in the task prompt.
+		if params.Name == "get_task" {
+			content = append(content, s.taskImageBlocks(text)...)
+		}
 		return map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
+			"content": content,
 			"isError": false,
 		}, nil
 	case "resources/list":
@@ -228,13 +238,14 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "create_task",
-			"description": "在项目里新建卡片，默认追加到第一列或指定列的末尾。",
+			"description": "在项目里新建卡片，默认追加到第一列或指定列的末尾。带 dispatchRuntime 则同一调用建卡并派发给该执行渠道。",
 			"inputSchema": object(map[string]any{
-				"projectId":   str("项目 id，必填"),
-				"title":       str("卡片标题，必填"),
-				"columnId":    str("目标列 id 或列名，省略则用项目第一列"),
-				"description": str("卡片正文"),
-				"assignee":    str("负责人"),
+				"projectId":       str("项目 id，必填"),
+				"title":           str("卡片标题，必填"),
+				"columnId":        str("目标列 id 或列名，省略则用项目第一列"),
+				"description":     str("卡片正文"),
+				"assignee":        str("负责人"),
+				"dispatchRuntime": str("执行渠道 id（dsh|codex|pi|claude）；省略则只建卡不派发"),
 			}, "projectId", "title"),
 		},
 		{
@@ -261,10 +272,11 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "add_comment",
-			"description": "给卡片追加一条评论。",
+			"description": "给卡片追加一条评论。mention 指定由哪个执行渠道跟进这条评论（dsh|codex|pi|claude），留空表示不指定。",
 			"inputSchema": object(map[string]any{
-				"taskId": str("卡片 id，必填"),
-				"text":   str("评论正文，必填"),
+				"taskId":  str("卡片 id，必填"),
+				"text":    str("评论正文，必填"),
+				"mention": str("可选：@ 给一个执行渠道，派发器会把这条评论交给它跟进"),
 			}, "taskId", "text"),
 		},
 		{
@@ -380,6 +392,11 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 		} else if v != "" {
 			body["assignee"] = v
 		}
+		if v, err := optionalString(args, "dispatchRuntime"); err != nil {
+			return "", err
+		} else if v != "" {
+			body["dispatchRuntime"] = v
+		}
 		return s.send(http.MethodPost, "/api/tasks", body, http.StatusCreated)
 	case "update_task":
 		id, err := requiredString(args, "id")
@@ -441,7 +458,11 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return s.send(http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/comments", map[string]any{"text": text}, http.StatusCreated)
+		body := map[string]any{"text": text}
+		if mention, _ := optionalString(args, "mention"); mention != "" {
+			body["mention"] = mention
+		}
+		return s.send(http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/comments", body, http.StatusCreated)
 	case "list_comments":
 		taskID, err := requiredString(args, "taskId")
 		if err != nil {
@@ -493,6 +514,79 @@ func (s *server) do(method, path string, body []byte, want int) (string, error) 
 		return "", apiError(resp.StatusCode, raw)
 	}
 	return strings.TrimSpace(string(raw)), nil
+}
+
+var taskImageRef = regexp.MustCompile(`/api/images/([a-f0-9]{64})`)
+
+// taskImageBlocks parses a get_task JSON response and returns one MCP image
+// content block per distinct /api/images/{hash} reference found in the body
+// or comments. Failures are skipped: a missing image must not break reading
+// the card.
+func (s *server) taskImageBlocks(taskJSON string) []map[string]any {
+	var task struct {
+		Description string `json:"description"`
+		Comments    []struct {
+			Text string `json:"text"`
+		} `json:"comments"`
+	}
+	if json.Unmarshal([]byte(taskJSON), &task) != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var blocks []map[string]any
+	gather := func(text string) {
+		for _, m := range taskImageRef.FindAllStringSubmatch(text, -1) {
+			hash := m[1]
+			if seen[hash] {
+				continue
+			}
+			seen[hash] = true
+			data, mime := s.fetchImage(hash)
+			if len(data) == 0 {
+				continue
+			}
+			blocks = append(blocks, map[string]any{
+				"type":      "image",
+				"data":      base64.StdEncoding.EncodeToString(data),
+				"mimeType":  mime,
+			})
+		}
+	}
+	gather(task.Description)
+	for _, c := range task.Comments {
+		gather(c.Text)
+	}
+	return blocks
+}
+
+func (s *server) fetchImage(hash string) (data []byte, mime string) {
+	resp, err := s.http.Get(s.base + "/api/images/" + hash)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return nil, ""
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 25<<20))
+	if err != nil || len(raw) == 0 {
+		return nil, ""
+	}
+	return raw, sniffMIME(raw)
+}
+
+func sniffMIME(data []byte) string {
+	switch {
+	case len(data) >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G':
+		return "image/png"
+	case len(data) >= 2 && data[0] == 0xff && data[1] == 0xd8:
+		return "image/jpeg"
+	case len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a"):
+		return "image/gif"
+	case len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		return "image/webp"
+	}
+	return "image/png"
 }
 
 // apiError renders an API error body, keeping the current task on conflicts

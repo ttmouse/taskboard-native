@@ -10,9 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	tbclient "taskboard-native/internal/client"
 	"taskboard-native/internal/model"
 	"taskboard-native/internal/service"
 )
@@ -44,7 +47,36 @@ func testService(t *testing.T) *service.Server {
 			t.Fatalf("close: %v", err)
 		}
 	})
+	// A newly opened service starts projectless; the CLI scenarios below
+	// expect the legacy「local」board with its three demo cards, so seed it
+	// through the client API.
+	c := tbclient.New(&tbclient.Discover{Addr: srv.Addr}, "test-agent")
+	proj, err := c.CreateProject("local")
+	if err != nil {
+		t.Fatalf("fixture project: %v", err)
+	}
+	for i, title := range []string{"欢迎使用 taskboard", "接上 CLI 与 MCP", "检查实时推送"} {
+		if _, err := c.CreateTask(proj.ID, proj.Columns[i].ID, title, title+"的说明", ""); err != nil {
+			t.Fatalf("fixture task %d: %v", i, err)
+		}
+	}
 	return srv
+}
+
+func installFakeHerdr(t *testing.T, folder, state string) {
+	t.Helper()
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate fake Herdr fixture")
+	}
+	binDir := filepath.Join(filepath.Dir(source), "..", "..", "testdata", "fake-herdr")
+	logs := t.TempDir()
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TASKBOARD_TEST_HERDR_FOLDER", folder)
+	t.Setenv("TASKBOARD_TEST_HERDR_STATE", state)
+	t.Setenv("TASKBOARD_TEST_HERDR_ARGS", filepath.Join(logs, "herdr-args"))
+	t.Setenv("TASKBOARD_TEST_HC_SENDS", filepath.Join(logs, "hc-sends"))
+	t.Setenv("TASKBOARD_TEST_HERDR_COUNTER", filepath.Join(logs, "counter"))
 }
 
 func runTB(t *testing.T, bin string, env []string, args ...string) (string, string, int) {
@@ -73,6 +105,73 @@ func asExitError(err error, target **exec.ExitError) bool {
 		return true
 	}
 	return false
+}
+
+// `tb add --dispatch` must reach the one-call create+dispatch mode: the
+// service creates the card and the channel run finishes on it.
+func TestCLIAddDispatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nprintf 'CLI_ADD_DISPATCH_OK\\n'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	srv := testService(t)
+	c := clientFor(srv.Addr)
+	c.agent = "cli-dispatch-test"
+	raw, err := c.createProject("CLI 一步派发", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p projectInfo
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	installFakeHerdr(t, p.WorkspacePath, "done")
+	bin := buildBinary(t)
+	env := []string{"TASKBOARD_ADDR=" + srv.Addr, "TB_AGENT=cli-dispatch"}
+	stdout, stderr, code := runTB(t, bin, env, "add", "CLI 建卡即派发", "--project", p.ID, "--dispatch", "codex")
+	if code != 0 {
+		t.Fatalf("add --dispatch exit %d: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "已派发 codex") {
+		t.Fatalf("add --dispatch output = %q", stdout)
+	}
+	taskID := strings.Fields(strings.TrimSpace(stdout))[0]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		current, err := c.task(taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Execution != nil && current.Execution.Status == "returned" && strings.HasPrefix(current.Execution.SessionID, "herdr:") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dispatched run did not finish: %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Unknown channel: the CLI fails without leaving a card behind.
+	before := cliProjectTaskCount(t, bin, env, p.ID)
+	stdout, stderr, code = runTB(t, bin, env, "add", "坏渠道", "--project", p.ID, "--dispatch", "nope")
+	if code == 0 || !strings.Contains(stderr, "unknown runtime") {
+		t.Fatalf("bad channel exit=%d stderr=%q stdout=%q", code, stderr, stdout)
+	}
+	if after := cliProjectTaskCount(t, bin, env, p.ID); after != before {
+		t.Fatalf("rejected add left a card: %d -> %d", before, after)
+	}
+}
+
+func cliProjectTaskCount(t *testing.T, bin string, env []string, projectID string) int {
+	t.Helper()
+	stdout, stderr, code := runTB(t, bin, env, "list", "--project", projectID)
+	if code != 0 {
+		t.Fatalf("list exit %d: %s", code, stderr)
+	}
+	return len(nonEmptyLines(stdout))
 }
 
 func TestCLIEndToEnd(t *testing.T) {
@@ -125,13 +224,13 @@ func TestCLIEndToEnd(t *testing.T) {
 	}
 
 	// move: by column name
-	stdout, stderr, code = runTB(t, bin, env, "move", taskID, "评审")
+	stdout, stderr, code = runTB(t, bin, env, "move", taskID, "等你")
 	if code != 0 {
 		t.Fatalf("move exit %d: %s", code, stderr)
 	}
 	moved := fetchTask(t, srv, taskID)
 	if moved.ColumnID != board.Columns[2].ID || moved.Version != task.Version+1 {
-		t.Fatalf("moved task = %+v, want 评审 and v%d", moved, task.Version+1)
+		t.Fatalf("moved task = %+v, want 等你 and v%d", moved, task.Version+1)
 	}
 
 	// move --top: first card of 完成
@@ -185,8 +284,10 @@ func TestCLIStartsServiceWhenDown(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("projects exit %d: %s", code, stderr)
 	}
-	if !strings.Contains(stdout, "local") {
-		t.Fatalf("output = %q", stdout)
+	// A freshly opened database starts projectless — seeding was removed —
+	// so the list comes back empty rather than containing a demo board.
+	if strings.Contains(stdout, "local") {
+		t.Fatalf("fresh projects = %q, want no seeded board", stdout)
 	}
 
 	// The detached service must be reachable and killable afterwards.
@@ -364,7 +465,30 @@ func fetchTask(t *testing.T, srv *service.Server, id string) model.Task {
 
 func fetchBoard(t *testing.T, srv *service.Server) (int, []byte) {
 	t.Helper()
-	resp, err := http.Get(srv.URL + "/api/projects/local/board")
+	// Resolve the fixture project by name: created projects no longer get
+	// the literal "local" id.
+	listResp, err := http.Get(srv.URL + "/api/projects")
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	defer listResp.Body.Close()
+	var projects []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&projects); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	id := ""
+	for _, p := range projects {
+		if p.Name == "local" {
+			id = p.ID
+		}
+	}
+	if id == "" {
+		t.Fatal("fixture project not found")
+	}
+	resp, err := http.Get(srv.URL + "/api/projects/" + id + "/board")
 	if err != nil {
 		t.Fatalf("get board: %v", err)
 	}

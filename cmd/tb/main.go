@@ -71,10 +71,16 @@ func run(args []string) int {
 		return cmdAdd(rest)
 	case "move":
 		return cmdMove(rest)
+	case "column":
+		return cmdColumn(rest)
 	case "comment":
 		return cmdComment(rest)
+	case "followup":
+		return cmdFollowup(rest)
 	case "archive":
 		return cmdArchive(rest)
+	case "execution":
+		return cmdExecution(rest)
 	case "serve":
 		return cmdServe(rest)
 	default:
@@ -94,8 +100,12 @@ func usage() {
   tb list    [--project ID] [--column NAME|ID] [--assignee WHO] [--limit N --offset N] [--summary] [--json]
   tb show    <taskID> [--json]
   tb add     <title> [--project ID] [--column NAME|ID] [--body TEXT] [--assignee WHO]
+             [--dispatch dsh|codex|pi|claude]
   tb move    <taskID> <column NAME|ID> [--top] [--after CARD_ID]
-  tb comment <taskID> <body>
+  tb column  <columnID> <role> [--json]   # role: intake|doing|review|done，空字符串清空
+  tb comment <taskID> <body> [--mention dsh|codex|pi|claude]
+  tb followup <taskID> <commentID>
+  tb execution release <taskID>     # 执行记录收敛为 released（释放写锁）
   tb archive <taskID>
   tb serve   [--addr ADDR] [--db PATH] [--detach]
 
@@ -378,6 +388,7 @@ func cmdAdd(args []string) int {
 	column := fs.String("column", "", "column name or id")
 	body := fs.String("body", "", "task description")
 	assignee := fs.String("assignee", "", "assignee")
+	dispatch := fs.String("dispatch", "", "create and dispatch to channel (dsh|codex|pi|claude)")
 	addr := fs.String("addr", "", "service address")
 	agent := fs.String("agent", "", "agent identity")
 	// The title is positional; flags may appear before or after it.
@@ -422,11 +433,15 @@ func cmdAdd(args []string) int {
 		Title:       title,
 		Description: *body,
 		Assignee:    *assignee,
-	})
+	}, *dispatch)
 	if err != nil {
 		return fail(err)
 	}
-	fmt.Printf("%s\t%s\t%s\tv%d\n", task.ID, task.ColumnID, task.Title, task.Version)
+	line := fmt.Sprintf("%s\t%s\t%s\tv%d", task.ID, task.ColumnID, task.Title, task.Version)
+	if d := strings.TrimSpace(*dispatch); d != "" {
+		line += "\t已派发 " + d
+	}
+	fmt.Println(line)
 	return exitOK
 }
 
@@ -470,17 +485,82 @@ func cmdMove(args []string) int {
 	return exitOK
 }
 
+// cmdColumn labels a column with a workflow role (empty clears it). The
+// column is located across projects by ID or name, so the caller does not
+// have to know which project owns it.
+func cmdColumn(args []string) int {
+	fs := flag.NewFlagSet("column", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	addr := fs.String("addr", "", "service address")
+	agent := fs.String("agent", "", "agent identity")
+	asJSON := fs.Bool("json", false, "output JSON")
+	if err := fs.Parse(reorderArgs(args, "json")); err != nil {
+		fmt.Fprintf(os.Stderr, "tb column: %v\n", err)
+		return exitUsage
+	}
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "tb column: usage: tb column <columnID> <role>")
+		return exitUsage
+	}
+	want, role := fs.Arg(0), fs.Arg(1)
+	if !model.ValidColumnRole(role) {
+		fmt.Fprintf(os.Stderr, "tb column: unknown role %q (use intake|doing|review|done, or \"\" to clear)\n", role)
+		return exitUsage
+	}
+	c, err := ensureClient(*addr, *agent)
+	if err != nil {
+		return fail(err)
+	}
+	projects, err := c.projects()
+	if err != nil {
+		return fail(err)
+	}
+	projectID, columnID := "", ""
+	for _, p := range projects {
+		for _, col := range p.Columns {
+			if col.ID == want || col.Name == want {
+				projectID, columnID = p.ID, col.ID
+				break
+			}
+		}
+		if projectID != "" {
+			break
+		}
+	}
+	if columnID == "" {
+		return fail(fmt.Errorf("unknown column %q", want))
+	}
+	raw, err := c.setColumnRole(projectID, columnID, role)
+	if err != nil {
+		if err.Error() == "role_conflict" {
+			return fail(fmt.Errorf("该角色已被其他列占用"))
+		}
+		return fail(err)
+	}
+	if *asJSON {
+		fmt.Println(string(raw))
+		return exitOK
+	}
+	var column model.Column
+	if err := json.Unmarshal(raw, &column); err != nil {
+		return fail(err)
+	}
+	fmt.Printf("%s\t%s\t%s\n", column.ID, column.Name, column.Role)
+	return exitOK
+}
+
 func cmdComment(args []string) int {
 	fs := flag.NewFlagSet("comment", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	addr := fs.String("addr", "", "service address")
 	agent := fs.String("agent", "", "agent identity")
+	mention := fs.String("mention", "", "address the comment to one channel: dsh|codex|pi|claude")
 	if err := fs.Parse(reorderArgs(args)); err != nil {
 		fmt.Fprintf(os.Stderr, "tb comment: %v\n", err)
 		return exitUsage
 	}
 	if fs.NArg() < 2 {
-		fmt.Fprintln(os.Stderr, "tb comment: usage: tb comment <taskID> <body>")
+		fmt.Fprintln(os.Stderr, "tb comment: usage: tb comment <taskID> <body> [--mention dsh|codex|pi|claude]")
 		return exitUsage
 	}
 	taskID := fs.Arg(0)
@@ -489,7 +569,7 @@ func cmdComment(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	comment, err := c.addComment(taskID, body)
+	comment, err := c.addComment(taskID, body, *mention)
 	if err != nil {
 		return fail(err)
 	}
@@ -519,6 +599,34 @@ func cmdArchive(args []string) int {
 		return fail(err)
 	}
 	fmt.Printf("%s\tarchived\tv%d\n", task.ID, task.Version)
+	return exitOK
+}
+
+// cmdExecution manages a card's execution record. release converges it to
+// detached so a session that is gone for good stops blocking dispatch and
+// comment follow-up.
+func cmdExecution(args []string) int {
+	fs := flag.NewFlagSet("execution", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	addr := fs.String("addr", "", "service address")
+	agent := fs.String("agent", "", "agent identity")
+	if err := fs.Parse(reorderArgs(args)); err != nil {
+		fmt.Fprintf(os.Stderr, "tb execution: %v\n", err)
+		return exitUsage
+	}
+	if fs.NArg() != 2 || fs.Arg(0) != "release" {
+		fmt.Fprintln(os.Stderr, "tb execution: usage: tb execution release <taskID>")
+		return exitUsage
+	}
+	c, err := ensureClient(*addr, *agent)
+	if err != nil {
+		return fail(err)
+	}
+	task, err := c.releaseExecution(fs.Arg(1))
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Printf("%s\tdetached\tv%d\n", task.ID, task.Version)
 	return exitOK
 }
 
@@ -788,7 +896,10 @@ func (c *client) createProject(name, workspacePath string) (json.RawMessage, err
 	return out, c.send(http.MethodPost, "/api/projects", body, &out, http.StatusCreated)
 }
 
-func (c *client) createTask(task model.Task) (model.Task, error) {
+// createTask creates a card; a non-empty dispatchRuntime additionally hands
+// it to that channel in the same call (the service validates the runtime and
+// the project's workspacePath before creating).
+func (c *client) createTask(task model.Task, dispatchRuntime string) (model.Task, error) {
 	body := map[string]any{
 		"projectId": task.ProjectID,
 		"columnId":  task.ColumnID,
@@ -799,6 +910,9 @@ func (c *client) createTask(task model.Task) (model.Task, error) {
 	}
 	if task.Assignee != "" {
 		body["assignee"] = task.Assignee
+	}
+	if d := strings.TrimSpace(dispatchRuntime); d != "" {
+		body["dispatchRuntime"] = d
 	}
 	var out model.Task
 	return out, c.send(http.MethodPost, "/api/tasks", body, &out, http.StatusCreated)
@@ -841,9 +955,22 @@ func (c *client) patchTask(current model.Task, p patch) (model.Task, error) {
 	return out, c.send(http.MethodPatch, "/api/tasks/"+current.ID, body, &out, http.StatusOK)
 }
 
-func (c *client) addComment(taskID, text string) (model.Comment, error) {
+func (c *client) addComment(taskID, text, mention string) (model.Comment, error) {
+	body := map[string]any{"text": text}
+	if mention != "" {
+		body["mention"] = mention
+	}
 	var out model.Comment
-	return out, c.send(http.MethodPost, "/api/tasks/"+taskID+"/comments", map[string]any{"text": text}, &out, http.StatusCreated)
+	return out, c.send(http.MethodPost, "/api/tasks/"+taskID+"/comments", body, &out, http.StatusCreated)
+}
+
+// setColumnRole writes a column's workflow role and returns the updated
+// column as the service sent it (role "" clears it).
+func (c *client) setColumnRole(projectID, columnID, role string) (json.RawMessage, error) {
+	body := map[string]any{"role": role}
+	var out json.RawMessage
+	path := "/api/projects/" + url.PathEscape(projectID) + "/columns/" + url.PathEscape(columnID)
+	return out, c.send(http.MethodPatch, path, body, &out, http.StatusOK)
 }
 
 func (c *client) archiveTask(taskID string) (model.Task, error) {
@@ -853,6 +980,13 @@ func (c *client) archiveTask(taskID string) (model.Task, error) {
 	}
 	var out model.Task
 	return out, c.send(http.MethodPost, "/api/tasks/"+taskID+"/archive", map[string]any{"version": current.Version}, &out, http.StatusOK)
+}
+
+// releaseExecution converges the card's execution record to detached so a
+// session that is gone for good stops blocking dispatch and follow-up.
+func (c *client) releaseExecution(taskID string) (model.Task, error) {
+	var out model.Task
+	return out, c.send(http.MethodPost, "/api/tasks/"+taskID+"/execution/release", nil, &out, http.StatusOK)
 }
 
 func (c *client) get(path string, out any) error {
