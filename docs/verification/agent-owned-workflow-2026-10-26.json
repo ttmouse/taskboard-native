@@ -1,0 +1,81 @@
+[
+  {
+    "columnId": "a588d82616600c1db0b549f707bb80fd",
+    "execution": null,
+    "step": "real_bridge_auth_rejected_task_untouched",
+    "taskId": "d833943a89ae289f1bdc9ca4edb4c03c",
+    "time": "2026-10-26T05:08:53Z"
+  },
+  {
+    "columnId": "a588d82616600c1db0b549f707bb80fd",
+    "execution": {
+      "taskId": "d833943a89ae289f1bdc9ca4edb4c03c",
+      "sessionId": "taskboard-84be5863c6bfa375278d79403610193c",
+      "status": "failed",
+      "detail": "桌面端拒绝接收：AUTH 403: injected upstream authorization refusal"
+    },
+    "step": "injected_upstream_403_terminal_failure",
+    "taskId": "d833943a89ae289f1bdc9ca4edb4c03c",
+    "time": "2026-10-26T05:08:53Z"
+  },
+  {
+    "columnId": "a588d82616600c1db0b549f707bb80fd",
+    "execution": {
+      "taskId": "d833943a89ae289f1bdc9ca4edb4c03c",
+      "sessionId": "taskboard-f2807ee92b03a3a21031f7c1c47813da",
+      "status": "disconnected",
+      "detail": "DSH 桌面连接中断：\u003cnil\u003e"
+    },
+    "step": "accepted_then_transport_disconnected_duplicate_rejected",
+    "taskId": "d833943a89ae289f1bdc9ca4edb4c03c",
+    "time": "2026-10-26T05:08:54Z"
+  },
+  {
+    "columnId": "4687a64c94b8087c9de27e1b56a9cba4",
+    "execution": {
+      "taskId": "d833943a89ae289f1bdc9ca4edb4c03c",
+      "sessionId": "taskboard-f2807ee92b03a3a21031f7c1c47813da",
+      "status": "returned",
+      "detail": "会话已结束；任务结果以执行 Agent 的原卡回写为准"
+    },
+    "step": "service_restart_resumed_original_session_artifact_exactly_once_review",
+    "taskId": "d833943a89ae289f1bdc9ca4edb4c03c",
+    "time": "2026-10-26T05:11:18Z"
+  },
+  {
+    "columnId": "a588d82616600c1db0b549f707bb80fd",
+    "execution": {
+      "taskId": "259f81f2ab38e7ccf4fe307e573c88bb",
+      "sessionId": "taskboard-3ee5a75890ce18fca765b828f337f527",
+      "status": "unknown",
+      "detail": "DSH 桌面连接中断：\u003cnil\u003e "
+    },
+    "step": "real_acceptance_acknowledgement_lost",
+    "taskId": "259f81f2ab38e7ccf4fe307e573c88bb",
+    "time": "2026-10-26T05:11:19Z"
+  },
+  {
+    "columnId": "4687a64c94b8087c9de27e1b56a9cba4",
+    "execution": {
+      "taskId": "259f81f2ab38e7ccf4fe307e573c88bb",
+      "sessionId": "taskboard-3ee5a75890ce18fca765b828f337f527",
+      "status": "returned",
+      "detail": "会话已结束；任务结果以执行 Agent 的原卡回写为准"
+    },
+    "step": "retry_after_lost_ack_reused_session_and_executed_once",
+    "taskId": "259f81f2ab38e7ccf4fe307e573c88bb",
+    "time": "2026-10-26T05:12:57Z"
+  },
+  {
+    "columnId": "a588d82616600c1db0b549f707bb80fd",
+    "execution": {
+      "taskId": "88c80e753b7bbc02eeaca889dababbc6",
+      "sessionId": "taskboard-154cbb58bd1a0cc0a812e1abca91fdc2",
+      "status": "returned",
+      "detail": "会话已结束；任务结果以执行 Agent 的原卡回写为准"
+    },
+    "step": "agent_reported_blocker_returned_to_backlog_session_return_not_completion",
+    "taskId": "88c80e753b7bbc02eeaca889dababbc6",
+    "time": "2026-10-26T05:13:53Z"
+  }
+]

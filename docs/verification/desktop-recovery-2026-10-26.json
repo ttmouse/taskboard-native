@@ -1,0 +1,67 @@
+[
+  {
+    "columnId": "08a0e82181241e8e8b743b14a732f4f9",
+    "execution": null,
+    "step": "real_bridge_auth_rejected_and_returned_to_backlog",
+    "taskId": "25e6b3a502a4dc62690855b2e5745911",
+    "time": "2026-10-26T04:37:15Z"
+  },
+  {
+    "columnId": "08a0e82181241e8e8b743b14a732f4f9",
+    "execution": {
+      "taskId": "25e6b3a502a4dc62690855b2e5745911",
+      "sessionId": "taskboard-ba5434fcbb80467b7cbcad243d6efdb4",
+      "status": "failed",
+      "detail": "桌面端拒绝接收：AUTH 403: injected upstream authorization refusal"
+    },
+    "step": "injected_upstream_403_terminal_failure",
+    "taskId": "25e6b3a502a4dc62690855b2e5745911",
+    "time": "2026-10-26T04:37:16Z"
+  },
+  {
+    "columnId": "ad365c67584db98dbc53e09e66e5f127",
+    "execution": {
+      "taskId": "25e6b3a502a4dc62690855b2e5745911",
+      "sessionId": "taskboard-ec27df8e70a3e74056fd793ea0b5fb40",
+      "status": "disconnected",
+      "detail": "DSH 桌面连接中断：\u003cnil\u003e"
+    },
+    "step": "accepted_then_transport_disconnected_duplicate_rejected",
+    "taskId": "25e6b3a502a4dc62690855b2e5745911",
+    "time": "2026-10-26T04:37:16Z"
+  },
+  {
+    "columnId": "c4e8d19c992e10a90c9119239bba61c9",
+    "execution": {
+      "taskId": "25e6b3a502a4dc62690855b2e5745911",
+      "sessionId": "taskboard-ec27df8e70a3e74056fd793ea0b5fb40",
+      "status": "succeeded"
+    },
+    "step": "service_restart_resumed_original_session_artifact_exactly_once_review",
+    "taskId": "25e6b3a502a4dc62690855b2e5745911",
+    "time": "2026-10-26T04:37:50Z"
+  },
+  {
+    "columnId": "ad365c67584db98dbc53e09e66e5f127",
+    "execution": {
+      "taskId": "732503bdeabb0499d996fc0857061182",
+      "sessionId": "taskboard-4acc2a1f685381408392ddf79e4e5948",
+      "status": "unknown",
+      "detail": "DSH 桌面连接中断：\u003cnil\u003e "
+    },
+    "step": "real_acceptance_acknowledgement_lost",
+    "taskId": "732503bdeabb0499d996fc0857061182",
+    "time": "2026-10-26T04:37:50Z"
+  },
+  {
+    "columnId": "c4e8d19c992e10a90c9119239bba61c9",
+    "execution": {
+      "taskId": "732503bdeabb0499d996fc0857061182",
+      "sessionId": "taskboard-4acc2a1f685381408392ddf79e4e5948",
+      "status": "succeeded"
+    },
+    "step": "retry_after_lost_ack_reused_session_and_executed_once",
+    "taskId": "732503bdeabb0499d996fc0857061182",
+    "time": "2026-10-26T04:38:37Z"
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "47cce56ae0a80a4743ff4a86e2b4b92f",
+    "title": "在竖向的列表模式下面，我希望在顶部加一个输入框。直接输入可以新建任务。",
+    "columnId": "d1ab04dbcfa361bd0938cb26180222a6",
+    "execution": null
+  },
+  {
+    "id": "5ef76e72b19c087b0db0a7857e51d018",
+    "title": "竖向列表模式下面，右侧好像有额外多的间距。",
+    "columnId": "d1ab04dbcfa361bd0938cb26180222a6",
+    "execution": {
+      "taskId": "5ef76e72b19c087b0db0a7857e51d018",
+      "sessionId": "aa_ebf99dac28d7d70e_taskboard-b5bc2c2f62af492e51edcdf429bfbce4",
+      "status": "succeeded"
+    }
+  }
+]

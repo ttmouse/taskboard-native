@@ -1,0 +1,67 @@
+[
+  {
+    "columnId": "b1b20c33cac0e6d64bf486a499cdbccf",
+    "execution": null,
+    "step": "real_bridge_auth_rejected_and_returned_to_backlog",
+    "taskId": "6099e7fd15696eccd7f6f817a61261e9",
+    "time": "2026-10-26T04:48:35Z"
+  },
+  {
+    "columnId": "b1b20c33cac0e6d64bf486a499cdbccf",
+    "execution": {
+      "taskId": "6099e7fd15696eccd7f6f817a61261e9",
+      "sessionId": "taskboard-4c80dca268db295fc8ee243329623335",
+      "status": "failed",
+      "detail": "桌面端拒绝接收：AUTH 403: injected upstream authorization refusal"
+    },
+    "step": "injected_upstream_403_terminal_failure",
+    "taskId": "6099e7fd15696eccd7f6f817a61261e9",
+    "time": "2026-10-26T04:48:35Z"
+  },
+  {
+    "columnId": "28a8395b8601f4bd40183720bbdefa47",
+    "execution": {
+      "taskId": "6099e7fd15696eccd7f6f817a61261e9",
+      "sessionId": "taskboard-f3c8cabeeee9867eb9f0bb6f71fdeddf",
+      "status": "disconnected",
+      "detail": "DSH 桌面连接中断：\u003cnil\u003e"
+    },
+    "step": "accepted_then_transport_disconnected_duplicate_rejected",
+    "taskId": "6099e7fd15696eccd7f6f817a61261e9",
+    "time": "2026-10-26T04:48:35Z"
+  },
+  {
+    "columnId": "a945e3de4137e333f67325948180df17",
+    "execution": {
+      "taskId": "6099e7fd15696eccd7f6f817a61261e9",
+      "sessionId": "taskboard-f3c8cabeeee9867eb9f0bb6f71fdeddf",
+      "status": "succeeded"
+    },
+    "step": "service_restart_resumed_original_session_artifact_exactly_once_review",
+    "taskId": "6099e7fd15696eccd7f6f817a61261e9",
+    "time": "2026-10-26T04:49:36Z"
+  },
+  {
+    "columnId": "28a8395b8601f4bd40183720bbdefa47",
+    "execution": {
+      "taskId": "ed5f022269205cccdcf4e7960a99eeea",
+      "sessionId": "taskboard-454b7af7068ef3c6583a11310dad58fd",
+      "status": "unknown",
+      "detail": "DSH 桌面连接中断：\u003cnil\u003e "
+    },
+    "step": "real_acceptance_acknowledgement_lost",
+    "taskId": "ed5f022269205cccdcf4e7960a99eeea",
+    "time": "2026-10-26T04:49:37Z"
+  },
+  {
+    "columnId": "a945e3de4137e333f67325948180df17",
+    "execution": {
+      "taskId": "ed5f022269205cccdcf4e7960a99eeea",
+      "sessionId": "taskboard-454b7af7068ef3c6583a11310dad58fd",
+      "status": "succeeded"
+    },
+    "step": "retry_after_lost_ack_reused_session_and_executed_once",
+    "taskId": "ed5f022269205cccdcf4e7960a99eeea",
+    "time": "2026-10-26T04:51:24Z"
+  }
+]
