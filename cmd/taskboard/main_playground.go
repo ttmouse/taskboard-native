@@ -45,6 +45,7 @@ func main() {
 	b.phase = "等待播放 · 临时数据"
 	fmt.Printf("Playground API: %s\nScratch database: %s\n", srv.URL, srv.DBPath)
 	mygo.App.WhenReady(func() {
+		syncDisplayScale()
 		b.win = mygo.NewWindow(mygo.WindowOptions{
 			Title: "Motion Playground · 待验收", Width: 1280, Height: 800,
 			MinWidth: 1060, MinHeight: 600, Content: ui.View(b.view),

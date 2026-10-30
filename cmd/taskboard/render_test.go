@@ -241,7 +241,10 @@ func TestClickCardOpensAndSwitchesDetail(t *testing.T) {
 	if b.detail == nil || b.detail.id != "t-1" {
 		t.Fatalf("detail = %+v, want task t-1", b.detail)
 	}
-	for _, want := range []string{"任务详情", "标题", "正文", "评论", "发送", "保存", "归档"} {
+	if !tt.Focused("写评论") {
+		t.Fatal("opening task detail did not focus the comment composer")
+	}
+	for _, want := range []string{"任务详情", "标题", "正文", "评论", "写评论"} {
 		if !tt.HasText(want) {
 			t.Errorf("detail lacks %q; texts: %v", want, tt.Texts())
 		}
@@ -323,6 +326,112 @@ func TestSSEEventUpdatesInPlace(t *testing.T) {
 	waitFor(t, tt, "卡片归档", func() bool { return b.task(archived.ID) == nil })
 	if tt.HasText("由代理写入的卡片") {
 		t.Error("archived card still drawn")
+	}
+}
+
+func TestHerdrExecutionStatusUpdatesInPlace(t *testing.T) {
+	isolatePrefs(t)
+	fake := seedBoard()
+	task := fake.tasks[0]
+	task.Execution = &model.Execution{
+		TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "running",
+	}
+	fake.tasks[0] = task
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "Herdr 初始状态图标", func() bool {
+		_, ok := tt.Find("Herdr 执行状态：运行中")
+		return ok
+	})
+	if tt.HasText("Herdr 执行状态：运行中") == false {
+		t.Fatalf("running status icon accessibility label missing: %v", tt.Texts())
+	}
+
+	updated := task
+	updated.Execution = &model.Execution{
+		TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "waiting_approval",
+	}
+	fake.push(model.Event{
+		Type: model.EventTaskUpdated, ProjectID: task.ProjectID, ID: task.ID,
+		Version: task.Version, Task: &updated,
+	})
+	waitFor(t, tt, "Herdr 状态图标 SSE 更新", func() bool {
+		_, ok := tt.Find("Herdr 执行状态：等待处理")
+		return ok
+	})
+	if _, ok := tt.Find("Herdr 执行状态：运行中"); ok {
+		t.Fatalf("stale execution status remained visible: %v", tt.Texts())
+	}
+	if got := b.task(task.ID).ColumnID; got != task.ColumnID {
+		t.Fatalf("execution status moved the task: column=%q, want %q", got, task.ColumnID)
+	}
+}
+
+func TestHerdrStatusAndActionsShareCardFooter(t *testing.T) {
+	isolatePrefs(t)
+	fake := seedBoard()
+	task := fake.tasks[0]
+	task.Execution = &model.Execution{
+		TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "running",
+	}
+	fake.tasks[0] = task
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	icon, ok := tt.Find("Herdr 执行状态：运行中")
+	if !ok {
+		t.Fatal("Herdr execution icon is missing")
+	}
+	card, ok := tt.Find("打开任务：把看板接上 SSE")
+	if !ok {
+		t.Fatal("task card is missing")
+	}
+	meta, ok := tt.Find(provenance(&task))
+	if !ok {
+		t.Fatal("card provenance is missing")
+	}
+	open, ok := tt.Find("打开 Herdr 中的 Codex 对话")
+	if !ok {
+		t.Fatal("open-conversation action is missing")
+	}
+	if d := (icon.Y + icon.H/2) - (meta.Y + meta.H/2); d < -3 || d > 3 {
+		t.Fatalf("passive execution status is not aligned with provenance: icon=%+v meta=%+v", icon, meta)
+	}
+	if d := (icon.Y + icon.H/2) - (open.Y + open.H/2); d < -3 || d > 3 {
+		t.Fatalf("open action is not in the same footer row: icon=%+v open=%+v", icon, open)
+	}
+	cardBounds := card
+	if gap := cardBounds.X + cardBounds.W - open.X - open.W; gap < 0 || gap > 18 {
+		t.Fatalf("open action is not at the card's lower-right: open=%+v card=%+v gap=%v", open, cardBounds, gap)
+	}
+}
+
+func TestReviewStatusIconDoesNotCoverApprovalControl(t *testing.T) {
+	isolatePrefs(t)
+	fake := seedBoard()
+	task := fake.tasks[0]
+	task.ColumnID = "c-review"
+	task.Execution = &model.Execution{
+		TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "returned",
+	}
+	fake.tasks[0] = task
+	b := newBoard(fake)
+	b.prefs.TitleOnlyCards = true
+	tt := newBoardTester(b)
+	status, statusOK := tt.Find("Herdr 执行状态：执行已返回")
+	approve, approveOK := tt.Find("验收通过，移到完成")
+	if !statusOK || !approveOK {
+		t.Fatalf("review controls missing: status=%v approve=%v", statusOK, approveOK)
+	}
+	if status.X < approve.X+approve.W && status.X+status.W > approve.X &&
+		status.Y < approve.Y+approve.H && status.Y+status.H > approve.Y {
+		t.Fatalf("review status icon overlaps approval control: status=%+v approve=%+v", status, approve)
+	}
+	if d := (status.Y + status.H/2) - (approve.Y + approve.H/2); d < -3 || d > 3 {
+		t.Fatalf("review status and approval action are not in the same footer row: status=%+v approve=%+v", status, approve)
+	}
+	open, openOK := tt.Find("打开 Herdr 中的 Codex 对话")
+	if !openOK || open.X+open.W > approve.X {
+		t.Fatalf("open and approve actions are not grouped at lower-right: open=%+v approve=%+v", open, approve)
 	}
 }
 
@@ -433,8 +542,8 @@ func TestEditMoveArchiveAndComment(t *testing.T) {
 
 	// Editing the title and saving patches the service.
 	b.detail.title = "把看板接上 SSE（已改）"
-	if err := tt.Click("保存"); err != nil {
-		t.Fatalf("click save: %v", err)
+	if err := tt.Click("关闭详情"); err != nil {
+		t.Fatalf("close detail to save: %v", err)
 	}
 	waitFor(t, tt, "标题保存", func() bool {
 		task, err := fake.Task("t-1")
@@ -462,11 +571,15 @@ func TestEditMoveArchiveAndComment(t *testing.T) {
 	})
 
 	// A comment posts, and shows up in the detail.
-	b.detail.comment = "已从窗口发送"
-	if err := tt.Click("发送"); err != nil {
-		t.Fatalf("click send: %v", err)
+	if err := tt.Click("写评论"); err != nil {
+		t.Fatalf("focus comment: %v", err)
 	}
-	waitFor(t, tt, "评论发表", func() bool {
+	tt.Type("已从窗口发送")
+	tt.Key(0, ui.KeyEnter)
+	waitFor(t, tt, "评论发表并返回列表", func() bool {
+		if b.detail != nil {
+			return false
+		}
 		comments, err := fake.Comments("t-1")
 		if err != nil {
 			return false
@@ -479,9 +592,13 @@ func TestEditMoveArchiveAndComment(t *testing.T) {
 		return false
 	})
 
-	// Archive removes the card and offers an undo.
-	if err := tt.Click("归档"); err != nil {
-		t.Fatalf("click archive: %v", err)
+	// Archive is available from the card menu, keeping the detail footer free
+	// for the comment composer.
+	if err := tt.RightClick("打开任务：把看板接上 SSE（已改）"); err != nil {
+		t.Fatalf("open card menu: %v", err)
+	}
+	if err := tt.ChooseMenuItem("归档"); err != nil {
+		t.Fatalf("choose archive: %v", err)
 	}
 	waitFor(t, tt, "归档", func() bool {
 		task, _ := fake.Task("t-1")
@@ -512,6 +629,59 @@ func TestEditMoveArchiveAndComment(t *testing.T) {
 	}
 }
 
+func TestReplyToCommentInThread(t *testing.T) {
+	fake := seedBoard()
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+	b.openDetail(*b.task("t-1"))
+	waitFor(t, tt, "评论载入", func() bool { return b.detail != nil && !b.detail.loading })
+	if err := tt.Click("回复评论"); err != nil {
+		t.Fatalf("click reply: %v", err)
+	}
+	if b.detail.commentParentID != "m-1" {
+		t.Fatalf("reply target = %q, want m-1", b.detail.commentParentID)
+	}
+	b.detail.comment = "这是回复"
+	b.sendComment()
+	waitFor(t, tt, "回复保存", func() bool {
+		comments, err := fake.Comments("t-1")
+		if err != nil {
+			return false
+		}
+		for _, cm := range comments {
+			if cm.Text == "这是回复" {
+				return cm.ParentCommentID == "m-1"
+			}
+		}
+		return false
+	})
+	waitFor(t, tt, "详情关闭", func() bool { return b.detail == nil })
+	b.openDetail(*b.task("t-1"))
+	waitFor(t, tt, "回复线程显示", func() bool {
+		return b.detail != nil && !b.detail.loading && tt.HasText("这是回复") && tt.HasText("回复 @linus")
+	})
+}
+
+func TestOwnCommentEditLivesInOverflowMenu(t *testing.T) {
+	fake := seedBoard()
+	b := newBoard(fake)
+	b.agent = "linus"
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+	b.openDetail(*b.task("t-1"))
+	waitFor(t, tt, "评论载入", func() bool { return b.detail != nil && !b.detail.loading })
+	if err := tt.Click("更多评论操作"); err != nil {
+		t.Fatalf("open comment overflow: %v", err)
+	}
+	if err := tt.ChooseMenuItem("编辑"); err != nil {
+		t.Fatalf("choose edit: %v", err)
+	}
+	if b.detail.commentEditID != "m-1" {
+		t.Fatalf("editing comment = %q, want m-1", b.detail.commentEditID)
+	}
+}
+
 // TestProjectSwitchAndCreateTask checks the project sidebar switches boards and
 // that the column input creates a card.
 func TestProjectSwitchAndCreateTask(t *testing.T) {
@@ -539,7 +709,7 @@ func TestProjectSwitchAndCreateTask(t *testing.T) {
 	}
 
 	// Creating a card (sidebar/API path) still lands it in the column.
-	b.post(func() { b.createTop(b.cur, "c2-todo", "从侧栏路径新建的卡片") })
+	b.post(func() { b.createTask(b.cur, "c2-todo", "从侧栏路径新建的卡片") })
 	waitFor(t, tt, "新建卡片", func() bool { return tt.HasText("从侧栏路径新建的卡片") })
 }
 
@@ -577,8 +747,8 @@ func TestDirtyDetailSurvivesPush(t *testing.T) {
 	}
 
 	tt.Frame()
-	if err := tt.Click("保存"); err != nil {
-		t.Fatalf("click save: %v", err)
+	if err := tt.Click("关闭详情"); err != nil {
+		t.Fatalf("close detail to save: %v", err)
 	}
 	waitFor(t, tt, "冲突弹窗", func() bool { return b.conflict != nil && tt.HasText("任务已被修改") })
 	if b.detail == nil {
@@ -618,6 +788,9 @@ func TestHoverFaceDiffersFromColumn(t *testing.T) {
 	if cardFace(light) == colFace(light) {
 		t.Fatal("light resting face equals the column face")
 	}
+	if cardFace(light) != light.Surface {
+		t.Fatal("light resting card face should use the distinct surface color")
+	}
 }
 
 // Full-height drop projection is covered by TestDragProjectionReflowsAndCancels
@@ -630,7 +803,7 @@ func TestDetailFitsMinimumWindow(t *testing.T) {
 	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
 	b.openDetail(*b.task("t-1"))
 	waitFor(t, tt, "评论载入", func() bool { return b.detail != nil && !b.detail.loading })
-	for _, label := range []string{"关闭详情", "发送评论", "保存任务", "归档任务"} {
+	for _, label := range []string{"关闭详情", "写评论"} {
 		r, ok := tt.Find(label)
 		if !ok || r.Y < 0 || r.Y+r.H > 560 || r.X < 0 || r.X+r.W > 960 {
 			t.Errorf("%s is outside minimum window: %+v (found %v)", label, r, ok)
@@ -650,7 +823,10 @@ func TestCommentEnterSends(t *testing.T) {
 	}
 	tt.Type("回车发送的评论")
 	tt.Key(0, ui.KeyEnter)
-	waitFor(t, tt, "回车发送", func() bool {
+	waitFor(t, tt, "回车发送并关闭详情", func() bool {
+		if b.detail != nil {
+			return false
+		}
 		comments, _ := fake.Comments("t-1")
 		for _, cm := range comments {
 			if cm.Text == "回车发送的评论" {
@@ -687,7 +863,7 @@ func TestRenderDetailSizes(t *testing.T) {
 				Text: strings.Repeat("这是一条用于检查滚动边界的长评论。", 100),
 			})
 			tt.Frame()
-			for _, label := range []string{"关闭详情", "写评论", "发送评论", "保存任务", "归档任务"} {
+			for _, label := range []string{"关闭详情", "写评论"} {
 				r, ok := tt.Find(label)
 				if !ok || r.Y < 0 || r.Y+r.H > float32(size.h) {
 					t.Errorf("long content hides %s: %+v (found %v)", label, r, ok)
@@ -703,6 +879,14 @@ func TestRenderDetailSizes(t *testing.T) {
 type failedCommentAPI struct{ api }
 
 func (f failedCommentAPI) AddComment(string, string) (model.Comment, error) {
+	return model.Comment{}, errors.New("测试服务不可用")
+}
+
+func (f failedCommentAPI) AddCommentTo(string, string, string) (model.Comment, error) {
+	return model.Comment{}, errors.New("测试服务不可用")
+}
+
+func (f failedCommentAPI) AddCommentWithParent(string, string, string, string) (model.Comment, error) {
 	return model.Comment{}, errors.New("测试服务不可用")
 }
 
@@ -756,7 +940,7 @@ func TestRenderBoardWindowSizes(t *testing.T) {
 }
 
 // TestTitleOnlyCards checks the denser card layout hides summary + footer
-// while titles, click-to-open, and the settings sheet stay available.
+// while titles and the top-right display controls stay available.
 func TestTitleOnlyCards(t *testing.T) {
 	dir := t.TempDir()
 	mygo.App.SetPath(mygo.PathUserData, dir)
@@ -794,14 +978,7 @@ func TestTitleOnlyCards(t *testing.T) {
 		t.Errorf("title-only frame still shows comment badge")
 	}
 
-	if err := tt.Click("打开设置"); err != nil {
-		t.Fatalf("click 打开设置: %v", err)
-	}
-	tt.Frame()
-	if !tt.HasText("卡片仅显示标题") {
-		t.Fatalf("settings sheet missing toggle; texts: %v", tt.Texts())
-	}
-	if err := tt.Click("卡片仅显示标题"); err != nil {
+	if err := tt.Click("卡片仅显示标题，卡片：仅标题 · 点击显示完整内容"); err != nil {
 		t.Fatalf("click toggle: %v", err)
 	}
 	tt.Frame()

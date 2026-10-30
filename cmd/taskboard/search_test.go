@@ -7,7 +7,7 @@ import (
 	"taskboard-native/internal/model"
 )
 
-func TestTasksInHonorsSearchQuery(t *testing.T) {
+func TestSearchQueryDoesNotFilterBoardTasks(t *testing.T) {
 	b := &board{
 		tasks: []model.Task{
 			{ID: "1", ColumnID: "c-todo", Title: "边缘避让", Description: "motion", Position: 1, CreatedAt: time.Now()},
@@ -20,16 +20,24 @@ func TestTasksInHonorsSearchQuery(t *testing.T) {
 	}
 	b.searchQuery = "边缘"
 	got := b.tasksIn("c-todo")
-	if len(got) != 1 || got[0].ID != "1" {
-		t.Fatalf("title match: %+v", got)
+	if len(got) != 2 {
+		t.Fatalf("search overlay changed the background board: %+v", got)
+	}
+	if hits := b.searchHits(); len(hits) != 1 || hits[0].ID != "1" {
+		t.Fatalf("title search hits: %+v", hits)
 	}
 	b.searchQuery = "filter"
-	got = b.tasksIn("c-doing")
-	if len(got) != 1 || got[0].ID != "3" {
-		t.Fatalf("body match: %+v", got)
+	if hits := b.searchHits(); len(hits) != 1 || hits[0].ID != "3" {
+		t.Fatalf("description search hits: %+v", hits)
+	}
+	if got := b.tasksIn("c-todo"); len(got) != 2 {
+		t.Fatalf("description search changed the background board: %+v", got)
 	}
 	b.searchQuery = "没有这个"
-	if n := len(b.tasksIn("c-todo")); n != 0 {
-		t.Fatalf("miss: %d", n)
+	if hits := b.searchHits(); len(hits) != 0 {
+		t.Fatalf("miss: %+v", hits)
+	}
+	if n := len(b.tasksIn("c-todo")); n != 2 {
+		t.Fatalf("no-result search changed the background board: %d tasks", n)
 	}
 }

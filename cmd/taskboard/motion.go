@@ -125,7 +125,6 @@ func edgeInsertIndex(y float32, heights []float32, gap float32) int {
 	return at
 }
 
-
 func (b *board) rememberDrop(id string, panel ui.Element) {
 	if b.frameCtx.Preferences().ReduceMotion {
 		return
@@ -286,6 +285,12 @@ func (b *board) columnCards(c *ui.Context, t *ui.Theme, col *model.Column, tasks
 		if h <= 0 {
 			h = 74
 		}
+		// The panel insets its children by s1 on each side. A negative
+		// margin is not the way to cancel that: it also widens the box the
+		// drop test measures, and the preview then disagrees with where the
+		// card actually lands (236 over 240). The ghost keeps the ordinary
+		// layout width; only its paint reaches out, so where the card will
+		// land reads flush with the cards above and below it.
 		ui.Box(c.Key("drop-preview")).FillWidth().Height(h).Radius(t.Radius+2).
 			Background(t.Accent.Alpha(0.06)).Border(1, t.Accent.Alpha(0.28)).
 			Label("任务落位预览").PassThrough()
@@ -308,17 +313,37 @@ func (b *board) columnCards(c *ui.Context, t *ui.Theme, col *model.Column, tasks
 	if at == len(projected) {
 		ghost()
 	}
-	// Empty columns stay blank — no reminder copy (列头「添加任务」已够).
+	// Empty columns stay blank. Vertical quick-add lives above the board,
+	// not on a column, so an empty row stays header-only.
 }
 
 func (b *board) dropOn(id string, col *model.Column, panel ui.Element) {
 	slot, ok := b.previewSlots[col.ID]
 	if !ok || slot.id != id {
+		// No rendered list to preview a slot with: a folded group (or an
+		// empty stacked one) takes the card at its bottom, then unfolds so
+		// the landing is visible.
+		if b.prefs.BoardVertical {
+			b.rememberDrop(id, panel)
+			b.dropIntoGroup(id, col)
+		}
 		return
 	}
 	b.rememberDrop(id, panel)
 	b.moveTask(id, col.ID, slot.after, slot.atTop)
 	delete(b.previewSlots, col.ID)
+}
+
+// dropIntoGroup files a card dropped onto a group with no rendered list
+// (folded, or empty in the stacked board). moveTask owns the placement —
+// a bare drop into 完成 tops the column, anything else appends — and a
+// folded group unfolds, so the landing is visible.
+func (b *board) dropIntoGroup(id string, col *model.Column) {
+	b.moveTask(id, col.ID, "", false)
+	if b.prefs.CollapsedCols[col.ID] {
+		delete(b.prefs.CollapsedCols, col.ID)
+		_ = saveUIPrefs(b.prefs)
+	}
 }
 
 func maxTime(a, b time.Time) time.Time {

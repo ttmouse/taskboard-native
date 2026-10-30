@@ -20,7 +20,13 @@ func TestMotionParallelHTTPAndSSERetarget(t *testing.T) {
 	}
 	defer srv.Close()
 	cl := client.New(&client.Discover{Addr: srv.Addr}, "motion-regression")
-	bd, err := cl.Board("local")
+	// A newly opened service starts projectless; seed the legacy「local」
+	// board this regression drives.
+	proj, err := cl.CreateProject("local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bd, err := cl.Board(proj.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +36,7 @@ func TestMotionParallelHTTPAndSSERetarget(t *testing.T) {
 	}
 	cards := make([]model.Task, 3)
 	for i, name := range []string{"并行卡 A", "并行卡 B", "并行卡 C"} {
-		cards[i], err = cl.CreateTask("local", cols["待办"], name, "", "")
+		cards[i], err = cl.CreateTask(proj.ID, cols["待办"], name, "", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -85,11 +91,11 @@ func TestMotionParallelHTTPAndSSERetarget(t *testing.T) {
 	tt.Advance(360 * time.Millisecond)
 	tt.Frame()
 	before, _ := tt.Find("打开任务：" + cards[0].Title)
-	cards[0], err = cl.Move(cards[0].ID, cards[0].Version, cols["评审"], "", true)
+	cards[0], err = cl.Move(cards[0].ID, cards[0].Version, cols["等你"], "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, tt, "真实 SSE 中途改道", func() bool { return b.task(cards[0].ID).ColumnID == cols["评审"] })
+	waitFor(t, tt, "真实 SSE 中途改道", func() bool { return b.task(cards[0].ID).ColumnID == cols["等你"] })
 	after, _ := tt.Find("打开任务：" + cards[0].Title)
 	if math.Abs(float64(before.X-after.X)) > 0.02 || math.Abs(float64(before.Y-after.Y)) > 0.02 {
 		t.Fatalf("SSE retarget jumped: %+v -> %+v", before, after)
@@ -105,11 +111,11 @@ func TestMotionParallelHTTPAndSSERetarget(t *testing.T) {
 			t.Fatalf("card failed to land at normal size: %s %+v", card.Title, rect)
 		}
 	}
-	server, err := cl.Board("local")
+	server, err := cl.Board(proj.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"进行中", "评审"} {
+	for _, name := range []string{"进行中", "等你"} {
 		var serverIDs []string
 		positions := map[string]float64{}
 		for _, task := range server.Tasks {

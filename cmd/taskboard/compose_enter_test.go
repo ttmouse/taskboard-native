@@ -28,9 +28,7 @@ func TestComposeEnterCloses(t *testing.T) {
 	if b.form != nil && b.form.open {
 		t.Fatalf("sheet still open after Enter; texts: %v", tt.Texts())
 	}
-	if !hasTask(fake, "回车创建并关闭") {
-		t.Fatal("task not created on Enter")
-	}
+	waitFor(t, tt, "回车创建任务落到后端", func() bool { return hasTask(fake, "回车创建并关闭") })
 }
 
 // TestComposeShiftEnterStays: Shift+Enter creates and keeps the sheet for
@@ -54,12 +52,12 @@ func TestComposeShiftEnterStays(t *testing.T) {
 	if b.form.name != "" {
 		t.Fatalf("draft not cleared: %q", b.form.name)
 	}
-	if !hasTask(fake, "第一条") {
-		t.Fatal("task not created on Shift+Enter")
-	}
+	waitFor(t, tt, "连续创建任务落到后端", func() bool { return hasTask(fake, "第一条") })
 }
 
 func hasTask(f *fakeBoard, title string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, task := range f.tasks {
 		if task.Title == title {
 			return true

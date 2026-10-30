@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"taskboard-native/internal/client"
+	"taskboard-native/internal/executor"
 	"taskboard-native/internal/model"
 
 	"github.com/egoist/mygo"
@@ -35,12 +37,29 @@ type api interface {
 	Restore(id string, version int) (model.Task, error)
 	Comments(taskID string) ([]model.Comment, error)
 	AddComment(taskID, text string) (model.Comment, error)
+	AddCommentTo(taskID, text, mention string) (model.Comment, error)
+	AddCommentWithParent(taskID, text, mention, parentCommentID string) (model.Comment, error)
+	UpdateComment(taskID, commentID, text string) (model.Comment, error)
+	DeleteComment(taskID, commentID string) error
+	ContinueComment(taskID, commentID string) error
 	CreateProject(name string) (model.Project, error)
 	CreateProjectWithPath(name, workspacePath string) (model.Project, error)
+	CreateProjectWithColor(name, workspacePath, color string) (model.Project, error)
 	UpdateProject(id, name, workspacePath string) (model.Project, error)
+	UpdateProjectWithColor(id, name, workspacePath, color string) (model.Project, error)
+	DeleteProject(id string) error
 	Dispatch(taskID, runtime string) error
+	StartProjectRun(projectID, runtime string) (model.ProjectRun, error)
+	ProjectRun(projectID string) (model.ProjectRun, error)
+	StopProjectRun(projectID string) (model.ProjectRun, error)
 	Subscribe(ctx context.Context, projectID string, onEvent func(model.Event), onState func(client.StreamState)) error
 }
+
+// agentSetter is what a client exposes when its identity can change while
+// it runs, which is what editing 显示名 does. Tests inject fakes without
+// it, so the board only signs under a new name when there is a client to
+// tell.
+type agentSetter interface{ SetAgent(string) }
 
 // cardDrag is the value a dragged card carries between columns.
 type cardDrag string
@@ -54,23 +73,38 @@ type cardMatch struct{ ID string }
 
 // detail is the open task detail, with the edits not yet saved.
 type detail struct {
-	open         bool
-	id           string
-	title        string
-	body         string
-	assignee     string
-	column       string // selected column name in the move select
-	comment      string
-	comments     []model.Comment
-	loading      bool // comments still arriving
-	bodyImage    imageEdit
-	commentImage imageEdit
-	markdown     *markdown.Options
+	open                bool
+	id                  string
+	title               string
+	body                string
+	assignee            string
+	column              string // selected column name in the move select
+	comment             string
+	commentEditID       string
+	commentEditText     string
+	commentParentID     string
+	commentParentAuthor string
+	commentMention      string // execution channel addressed with @ in the draft
+	mentionOpen         bool   // the @ picker is showing, waiting for a channel
+	mentionIndex        int    // keyboard-highlighted channel while the picker is open
+	commentFocus        int    // frames left to focus the composer on open or hand focus back after picking
+	commentCaretStart   bool   // the caret sat at the start when the field was built
+	comments            []model.Comment
+	loading             bool // comments still arriving
+	bodyImage           imageEdit
+	commentImage        imageEdit
+	markdown            *markdown.Options
+	markdownImages      sync.Map // URL → *markdownImageLoad
 
 	// editTitle / editBody keep the field in input mode while focused
 	// (even after the pointer leaves); cleared on blur when not hovered.
 	editTitle bool
 	editBody  bool
+
+	// bodyTop scrolls the body to its first line once, when the dialog
+	// opens: a fresh TextArea puts the caret at the end of the text and
+	// reveals it, which for a long description leaves the head hidden.
+	bodyTop bool
 
 	// snap is the task as it was opened; dirty() compares against it so a
 	// pushed update cannot silently overwrite unsaved typing.
@@ -94,21 +128,25 @@ type form struct {
 	isTask           bool // true → 新建任务；false → 新建项目
 	name             string
 	workspacePath    string // project form: local working directory
+	color            string // project form: accent color; "" → automatic slot
 	pickingWorkspace bool   // one native directory picker at a time
 	columnID         string // task form only: target column
 	projectID        string // task form only: which project receives the card
+	runtimeLabel     string // selected execution channel for Cmd+Enter
+	creating         bool   // form write is awaiting the service
+	// composeImages holds standalone image URLs pasted while composing the
+	// task; they are embedded in the task body when it is created.
+	composeImages []string
+	composeImage  imageEdit
+	// thumbs caches decoded bitmaps for the small preview strip so each
+	// image is fetched once, not every frame.
+	thumbs       map[string]ui.ImageSource
+	thumbLoading map[string]bool
+	// markdown renders pasted-image markdown previews in the composer.
+	markdown *markdown.Options
 	// editingProjectID non-empty turns the project form into an edit sheet
 	// for that project (name pre-filled, save instead of create).
 	editingProjectID string
-}
-
-// composeSubmit is the title an Enter press in the create-task pill took
-// out of the field, held for the same frame's submit to close the sheet
-// and create the card.
-type composeSubmit struct {
-	projectID string
-	columnID  string
-	title     string
 }
 
 // settings is the small preferences sheet (one toggle for now).
@@ -139,6 +177,26 @@ type board struct {
 	columns  []model.Column
 	tasks    []model.Task
 
+	// timeFilter narrows the board to tasks updated within a window:
+	// "" (all) / "today" / "yesterday" / "7d" / "30d". Column counts and
+	// card lists honor it, so「今天完成了哪些」reads straight off the
+	// 完成 column.
+	timeFilter string
+
+	// projectRunRuntime remembers the channel handling continuous handoff for
+	// each open project. The service remains the source of truth.
+	projectRunRuntime map[string]string
+
+	// projectSort orders the sidebar's project list: "" (server order,
+	// position + created) / "updated" (ActiveAt desc) / "created"
+	// (CreatedAt desc).
+	projectSort string
+
+	// confirmDelete holds the project pending deletion; the sidebar asks,
+	// the dialog answers, the API keeps no undo.
+	confirmDelete        *model.Project
+	confirmDeleteComment *model.Comment
+
 	status     client.StreamState
 	loading    bool // first board in flight
 	switching  bool // another project's board in flight
@@ -154,12 +212,17 @@ type board struct {
 	conflict *conflict
 	settings *settings // nil when the settings sheet is closed
 
-	// pendingCompose carries a create-task Enter from the key callback to
-	// the submit check in the same build pass; takeComposeSubmit clears it.
-	pendingCompose *composeSubmit
+	// hotkeyErr is why the global ⌘⇧N shortcut could not be bound ("" when
+	// none). It survives the launch-time frame gap that swallows toasts, so
+	// the settings sheet can show the failure until the user sees it.
+	hotkeyErr string
 
-	prefs    uiPrefs // persisted window preferences (title-only cards, …)
-	sidebarW float32 // live sidebar width; 0 until first layout
+	// openDialog is mygo's native open panel unless a test stands in a fake.
+	openDialog func(mygo.OpenDialogOptions) ([]string, error)
+
+	prefs           uiPrefs // persisted window preferences (title-only cards, …)
+	sidebarW        float32 // live sidebar width; 0 until first layout
+	sidebarResizing bool    // dragging the divider tracks the rail directly, without its open/close tween
 
 	// The sidebar slides open and shut (railWidth); the board pane takes the
 	// room it leaves. While the rail moves, the columns' and cards' own
@@ -175,8 +238,12 @@ type board struct {
 	railFrom   float32   // the width it began at
 	railTo     float32   // the width it heads for
 
-	searchQuery string // filter: title + description, all columns
-	searchOpen  bool   // sidebar search button → immersive centered search overlay
+	searchQuery          string // filter: title + description, all columns
+	searchOpen           bool   // sidebar search button → immersive centered search overlay
+	searchSelection      int    // highlighted search hit; -1 means no keyboard selection
+	searchSelectionQuery string // query the current keyboard selection belongs to
+	quickTitle           string // vertical-list top field; Enter creates in 待办
+	quickCreating        bool   // the quick-add request is awaiting the service
 
 	// colScrolls tracks per-column (and board) scroll offsets so the
 	// scrollbar theme can stay transparent until the user scrolls.
@@ -195,26 +262,24 @@ type board struct {
 	motionState                       // accepted motion shared with the Playground
 }
 
-// takeComposeSubmit consumes the title An Enter press in the pill left
-// behind, so one press creates one card.
-func (b *board) takeComposeSubmit() *composeSubmit {
-	p := b.pendingCompose
-	b.pendingCompose = nil
-	return p
-}
-
 func newBoard(a api) *board {
+	prefs := loadUIPrefs()
 	b := &board{
 		api:    a,
 		msgs:   make(chan func(), 64),
 		drafts: map[string]string{},
 		status: client.Connecting,
-		agent:  "gui",
+		agent:  prefs.windowAgent(),
 		recent: map[string]time.Time{},
 		bounds: map[string]ui.Rect{},
-		prefs:  loadUIPrefs(),
+		prefs:  prefs,
 		// Launch into「全部项目」, not a concrete board like local.
 		cur: curGlobal,
+	}
+	// A board built around a live client signs its writes with the saved
+	// display name from its first request on, whatever the caller passed.
+	if s, ok := a.(agentSetter); ok {
+		s.SetAgent(b.agent)
 	}
 	b.load()
 	b.startStream()
@@ -393,6 +458,7 @@ func (b *board) openProject(id string) {
 			b.detail = nil
 			b.clearMotion()
 			b.sortTasks()
+			b.loadProjectRun(id)
 		})
 	}()
 }
@@ -423,6 +489,10 @@ func (b *board) stop() {
 
 // applyEvent merges one pushed change.
 func (b *board) applyEvent(ev model.Event) {
+	if ev.Type == model.EventBoardSnapshot {
+		b.applySnapshot(ev.Snapshot)
+		return
+	}
 	// Global view listens to every project; single-project view stays scoped.
 	if ev.ProjectID != "" && b.cur != "" && b.cur != curGlobal && ev.ProjectID != b.cur {
 		return
@@ -454,17 +524,147 @@ func (b *board) applyEvent(ev model.Event) {
 			b.flash()
 		}
 	case model.EventCommentAdded:
+		if ev.Comment != nil {
+			if completedBy := model.CompletingAgent(*ev.Comment); completedBy != "" {
+				if task := b.task(ev.ID); task != nil {
+					task.CompletedBy = completedBy
+				}
+				if b.detail != nil && b.detail.id == ev.ID {
+					b.detail.snap.CompletedBy = completedBy
+				}
+			}
+		}
 		if ev.Comment != nil && b.appendComment(ev.ID, *ev.Comment) {
 			b.flash()
 		}
+	case model.EventCommentUpdated, model.EventCommentDeleted:
+		if ev.Comment == nil {
+			return
+		}
+		for i := range b.tasks {
+			if b.tasks[i].ID != ev.ID {
+				continue
+			}
+			b.tasks[i].Comments = applyCommentMutation(b.tasks[i].Comments, ev.Type, *ev.Comment)
+			break
+		}
+		if b.detail != nil && b.detail.id == ev.ID {
+			d := b.detail
+			d.comments = applyCommentMutation(d.comments, ev.Type, *ev.Comment)
+			if ev.Type == model.EventCommentDeleted && d.commentParentID == ev.Comment.ID {
+				d.commentParentID, d.commentParentAuthor = "", ""
+			}
+			if d.commentEditID == ev.Comment.ID {
+				d.commentEditID = ""
+				d.commentEditText = ""
+			}
+		}
+		b.flash()
 	case model.EventProjectChange:
 		go func() {
 			ps, err := b.api.Projects()
 			if err != nil {
 				return
 			}
-			b.post(func() { b.projects = ps })
+			b.post(func() {
+				b.projects = ps
+				// 列的角色可能刚被改动：当前项目的列直接换成服务端最新快照，
+				// 让「按角色认列」的行为不用重开窗口就生效。
+				if b.cur != "" && b.cur != curGlobal {
+					for _, p := range ps {
+						if p.ID == b.cur && len(p.Columns) > 0 {
+							b.columns = p.Columns
+						}
+					}
+				}
+				// 项目可能刚被删除：当前项目不在最新列表里就退回全局视角。
+				if b.cur != "" && b.cur != curGlobal {
+					found := false
+					for _, p := range ps {
+						if p.ID == b.cur {
+							found = true
+							break
+						}
+					}
+					if !found {
+						go b.openGlobal()
+					}
+				}
+			})
 		}()
+	}
+}
+
+func applyCommentMutation(comments []model.Comment, eventType string, comment model.Comment) []model.Comment {
+	for i := range comments {
+		if comments[i].ID != comment.ID {
+			continue
+		}
+		if eventType == model.EventCommentDeleted {
+			return append(comments[:i], comments[i+1:]...)
+		}
+		comments[i] = comment
+		return comments
+	}
+	if eventType == model.EventCommentUpdated {
+		return append(comments, comment)
+	}
+	return comments
+}
+
+// applySnapshot replaces the local board with the consistent snapshot sent
+// at the start of each SSE connection. It repairs changes missed while the
+// stream was disconnected; subsequent queued events are newer than the
+// snapshot sequence and continue to apply incrementally.
+func (b *board) applySnapshot(snapshot *model.BoardSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	b.projects = append([]model.Project(nil), snapshot.Projects...)
+	var columns []model.Column
+	var tasks []model.Task
+	if b.cur == curGlobal {
+		byName := map[string]string{}
+		for _, board := range snapshot.Boards {
+			if columns == nil && len(board.Columns) > 0 {
+				columns = append([]model.Column(nil), board.Columns...)
+				for _, column := range columns {
+					byName[column.Name] = column.ID
+				}
+			}
+			idMap := map[string]string{}
+			for _, column := range board.Columns {
+				if dest, ok := byName[column.Name]; ok {
+					idMap[column.ID] = dest
+				}
+			}
+			for _, task := range board.Tasks {
+				if dest, ok := idMap[task.ColumnID]; ok {
+					task.ColumnID = dest
+				}
+				tasks = append(tasks, task)
+			}
+		}
+	} else {
+		for _, board := range snapshot.Boards {
+			if board.Project.ID == b.cur {
+				columns = append([]model.Column(nil), board.Columns...)
+				tasks = append([]model.Task(nil), board.Tasks...)
+				break
+			}
+		}
+	}
+	if b.cur != "" && b.cur != curGlobal && columns == nil {
+		return
+	}
+	b.columns = columns
+	b.tasks = tasks
+	b.clearMotion()
+	b.sortTasks()
+	if b.detail != nil {
+		if task := b.task(b.detail.id); task != nil && task.Version > b.detail.snap.Version {
+			b.touchDetail(*task)
+		}
 	}
 }
 
@@ -521,6 +721,37 @@ func (b *board) projectNameByID(id string) string {
 		}
 	}
 	return ""
+}
+
+// sortedProjects returns the sidebar's project list in the order the active
+// projectSort asks for, without mutating b.projects: "" keeps the server's
+// position/created order, "updated" puts the most recently active project
+// first, "created" the newest project first.
+func (b *board) sortedProjects() []model.Project {
+	out := make([]model.Project, len(b.projects))
+	copy(out, b.projects)
+	switch b.projectSort {
+	case "updated":
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].ActiveAt.After(out[j].ActiveAt)
+		})
+	case "created":
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		})
+	}
+	return out
+}
+
+// projectByID returns the project the id names, for the color the card's
+// global-view accent wears.
+func (b *board) projectByID(id string) (model.Project, bool) {
+	for _, p := range b.projects {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return model.Project{}, false
 }
 
 func (b *board) task(id string) *model.Task {
@@ -583,19 +814,17 @@ func (b *board) scrollbarActive() bool {
 	return false
 }
 
-// tasksIn returns the column's tasks in board order, honoring searchQuery.
+// tasksIn returns the column's tasks in board order, honoring the active time
+// filter. Search is scoped to the search overlay and must not change the board
+// behind it.
 func (b *board) tasksIn(columnID string) []model.Task {
 	var out []model.Task
-	q := strings.ToLower(strings.TrimSpace(b.searchQuery))
 	for _, t := range b.tasks {
 		if t.ColumnID != columnID {
 			continue
 		}
-		if q != "" {
-			hay := strings.ToLower(t.Title + "\n" + t.Description)
-			if !strings.Contains(hay, q) {
-				continue
-			}
+		if !b.timeFilterHits(t) {
+			continue
 		}
 		out = append(out, t)
 	}
@@ -606,6 +835,32 @@ func (b *board) tasksIn(columnID string) []model.Task {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
 	return out
+}
+
+// timeFilterHits reports whether a task passes the active time filter.
+// Windows are local calendar days: 今天 / 昨天 are single days, 近7天 and
+// 近30天 count back from today inclusive. The updated time is the last
+// mutation (moving a card to 完成 bumps it), so「今天完成了哪些」filters on
+// UpdatedAt.
+func (b *board) timeFilterHits(t model.Task) bool {
+	if b.timeFilter == "" {
+		return true
+	}
+	now := time.Now()
+	loc := now.Location()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	switch b.timeFilter {
+	case "today":
+		return !t.UpdatedAt.Before(start) && t.UpdatedAt.Before(start.AddDate(0, 0, 1))
+	case "yesterday":
+		y := start.AddDate(0, 0, -1)
+		return !t.UpdatedAt.Before(y) && t.UpdatedAt.Before(start)
+	case "7d":
+		return !t.UpdatedAt.Before(start.AddDate(0, 0, -6))
+	case "30d":
+		return !t.UpdatedAt.Before(start.AddDate(0, 0, -29))
+	}
+	return true
 }
 
 // taskMatchesSearch reports whether a task matches the current query
@@ -661,6 +916,22 @@ func (b *board) columnID(name string) string {
 		}
 	}
 	return ""
+}
+
+// columnIDByRole resolves a workflow role on the current board view. The
+// resolver falls back to the legacy Chinese name, so projects created before
+// roles existed (or renamed before the upgrade) keep working.
+func (b *board) columnIDByRole(role string) string {
+	if c, ok := model.ColumnByRole(b.columns, role); ok {
+		return c.ID
+	}
+	return ""
+}
+
+// columnHasRole reports whether columnID currently plays role.
+func (b *board) columnHasRole(columnID, role string) bool {
+	c, ok := model.ColumnByRole(b.columns, role)
+	return ok && c.ID == columnID
 }
 
 func (b *board) columnName(id string) string {
@@ -894,14 +1165,16 @@ func (b *board) ctx() *ui.Context { return b.frameCtx }
 
 func (b *board) openDetail(t model.Task) {
 	d := &detail{
-		open:     true,
-		id:       t.ID,
-		title:    t.Title,
-		body:     t.Description,
-		assignee: t.Assignee,
-		column:   b.columnName(t.ColumnID),
-		loading:  true,
-		snap:     t,
+		open:         true,
+		id:           t.ID,
+		title:        t.Title,
+		body:         t.Description,
+		assignee:     t.Assignee,
+		column:       b.columnName(t.ColumnID),
+		loading:      true,
+		commentFocus: 1,
+		snap:         t,
+		bodyTop:      true,
 	}
 	b.detail = d
 	go func() {
@@ -937,7 +1210,8 @@ func (b *board) saveDetail() {
 	body := d.body
 	cur := *t
 	if !d.dirty() && title == cur.Title && body == cur.Description {
-		b.detail.open = false
+		d.open = false
+		b.detail = nil
 		return
 	}
 	// Another agent pushed a newer version after this dialog opened: the
@@ -950,16 +1224,7 @@ func (b *board) saveDetail() {
 			title:   "任务已被修改",
 			message: fmt.Sprintf("「%s」已被 %s 更新到 v%d。", clip(cur.Title, 20), agentName(cur.UpdatedBy), cur.Version),
 			retry: func(version int) {
-				go func() {
-					if _, err := b.api.Update(cur.ID, version, &title, &body, nil); err == nil {
-						b.post(func() {
-							if b.detail != nil && b.detail.id == cur.ID {
-								b.detail.open = false
-								b.detail = nil
-							}
-						})
-					}
-				}()
+				b.saveDetailVersion(d, title, body, version)
 			},
 		}
 		return
@@ -970,19 +1235,28 @@ func (b *board) saveDetail() {
 	optimistic.Title, optimistic.Description = title, body
 	optimistic.Version++
 	b.replace(optimistic)
+	b.saveDetailVersion(d, title, body, cur.Version)
+}
+
+// Both the initial save and a confirmed conflict retry have the same
+// completion semantics: close only the detail that submitted the write.
+func (b *board) saveDetailVersion(d *detail, title, body string, version int) {
+	b.saving = true
+	b.savingID = d.id
 	go func() {
-		_, err := b.api.Update(cur.ID, cur.Version, &title, &body, nil)
+		_, err := b.api.Update(d.id, version, &title, &body, nil)
 		b.post(func() {
 			b.saving = false
 			b.savingID = ""
 			if err == nil {
-				if b.detail != nil {
-					b.detail.open = false
+				if b.detail == d {
+					d.open = false
+					b.detail = nil
 				}
 				return
 			}
-			b.recover(cur.ID, err, func(version int) {
-				_, _ = b.api.Update(cur.ID, version, &title, &body, nil)
+			b.recover(d.id, err, func(version int) {
+				b.saveDetailVersion(d, title, body, version)
 			})
 		})
 	}()
@@ -994,8 +1268,8 @@ func (b *board) moveTask(id, toColumn, afterID string, atTop bool) {
 	if t == nil {
 		return
 	}
-	// Completing (bare drop into「完成」) always lands at the column top.
-	if !atTop && afterID == "" && b.columnName(toColumn) == "完成" {
+	// Completing (bare drop into the done column) always lands at the top.
+	if !atTop && afterID == "" && b.columnHasRole(toColumn, model.ColumnRoleDone) {
 		atTop = true
 	}
 	if t.ColumnID == toColumn && !atTop && afterID == "" {
@@ -1063,13 +1337,27 @@ func (b *board) restore(t model.Task) {
 	}()
 }
 
-// dispatchTask sends the card to the DSH runtime. The service runs
-// `dsh headless` inside the project's workspace directory and writes
+// dispatchTask sends the card to the selected runtime. The service runs
+// the CLI inside the project's workspace directory and writes
 // progress back as comments and column moves; the GUI just watches the
 // stream, so there is nothing to update optimistically here.
-func (b *board) dispatchTask(id string) {
+func (b *board) dispatchTask(id, runtime string) {
 	t := b.task(id)
 	if t == nil {
+		return
+	}
+	label := ""
+	if runtime == "" {
+		runtime = executor.RuntimeDSH
+	}
+	for _, channel := range executor.Runtimes() {
+		if channel.ID == runtime {
+			label = channel.Label
+			break
+		}
+	}
+	if label == "" {
+		b.toast("无法派发", "未知执行渠道："+runtime)
 		return
 	}
 	var ws string
@@ -1084,18 +1372,102 @@ func (b *board) dispatchTask(id string) {
 		return
 	}
 	go func() {
-		err := b.api.Dispatch(id, "")
+		err := b.api.Dispatch(id, runtime)
 		b.post(func() {
 			if err != nil {
 				b.toast("派发失败", err.Error())
 				return
 			}
-			b.toast("已派发 DSH 执行", clip(t.Title, 24))
+			b.toast("已派发 "+label+" 执行", clip(t.Title, 24))
 		})
 	}()
 }
 
 func (b *board) sendComment() {
+	b.submitComment(false)
+}
+
+func (b *board) beginCommentEdit(cm model.Comment) {
+	if b.detail == nil || cm.Author != b.agent || b.commenting {
+		return
+	}
+	b.detail.commentEditID = cm.ID
+	b.detail.commentEditText = cm.Text
+}
+
+func (b *board) beginCommentReply(cm model.Comment) {
+	if b.detail == nil || b.commenting {
+		return
+	}
+	b.detail.commentParentID = cm.ID
+	b.detail.commentParentAuthor = cm.Author
+	b.detail.commentFocus = 1
+}
+
+func (b *board) saveCommentEdit() {
+	d := b.detail
+	if d == nil || d.commentEditID == "" || b.commenting {
+		return
+	}
+	text := strings.TrimSpace(d.commentEditText)
+	if text == "" {
+		b.toast("无法保存评论", "评论内容不能为空")
+		return
+	}
+	id, taskID := d.commentEditID, d.id
+	b.commenting = true
+	go func() {
+		cm, err := b.api.UpdateComment(taskID, id, text)
+		b.post(func() {
+			b.commenting = false
+			if err != nil {
+				b.toast("编辑评论失败", err.Error())
+				return
+			}
+			if b.detail == d {
+				d.comments = applyCommentMutation(d.comments, model.EventCommentUpdated, cm)
+				d.commentEditID, d.commentEditText = "", ""
+			}
+			for i := range b.tasks {
+				if b.tasks[i].ID == taskID {
+					b.tasks[i].Comments = applyCommentMutation(b.tasks[i].Comments, model.EventCommentUpdated, cm)
+				}
+			}
+		})
+	}()
+}
+
+func (b *board) deleteComment(cm model.Comment) {
+	d := b.detail
+	if d == nil || cm.Author != b.agent || b.commenting {
+		return
+	}
+	taskID := d.id
+	b.commenting = true
+	go func() {
+		err := b.api.DeleteComment(taskID, cm.ID)
+		b.post(func() {
+			b.commenting = false
+			if err != nil {
+				b.toast("删除评论失败", err.Error())
+				return
+			}
+			if b.detail == d {
+				d.comments = applyCommentMutation(d.comments, model.EventCommentDeleted, cm)
+				if d.commentEditID == cm.ID {
+					d.commentEditID, d.commentEditText = "", ""
+				}
+			}
+			for i := range b.tasks {
+				if b.tasks[i].ID == taskID {
+					b.tasks[i].Comments = applyCommentMutation(b.tasks[i].Comments, model.EventCommentDeleted, cm)
+				}
+			}
+		})
+	}()
+}
+
+func (b *board) submitComment(followup bool) {
 	d := b.detail
 	if d == nil || b.commenting || d.commentImage.busy() {
 		return
@@ -1104,24 +1476,75 @@ func (b *board) sendComment() {
 	if text == "" {
 		return
 	}
+	// An @mention is an explicit address, so sending it also wakes that agent;
+	// a plain comment on a task with a returned original session wakes that
+	// session too, so the user does not have to address the agent again.
+	mention := d.commentMention
+	parentID, parentAuthor := d.commentParentID, d.commentParentAuthor
+	autoFollowup := followup || mention != "" || taskHasReturnedSession(d.snap)
 	d.comment = ""
+	d.commentMention = ""
+	d.commentParentID, d.commentParentAuthor = "", ""
+	d.mentionOpen = false
 	b.commenting = true
 	go func() {
-		_, err := b.api.AddComment(d.id, text)
+		cm, err := b.api.AddCommentWithParent(d.id, text, mention, parentID)
 		b.post(func() {
 			b.commenting = false
 			if err != nil {
 				if b.detail == d && d.comment == "" {
 					d.comment = text
+					d.commentMention = mention
+					d.commentParentID, d.commentParentAuthor = parentID, parentAuthor
 				}
 				b.toast("评论失败", err.Error())
+				return
+			}
+			if b.detail == d {
+				// Preserve the normal close behavior for any title or body edits
+				// made before the comment was submitted.
+				b.saveDetail()
+			}
+		})
+		if err == nil && autoFollowup {
+			if followupErr := b.api.ContinueComment(d.id, cm.ID); followupErr != nil {
+				b.post(func() { b.toast("评论已保存，AI 跟进失败", followupErr.Error()) })
+			}
+		}
+	}()
+}
+
+func taskHasReturnedSession(task model.Task) bool {
+	run := task.Execution
+	if run == nil || strings.TrimSpace(run.SessionID) == "" {
+		return false
+	}
+	switch run.Status {
+	case "returned", "succeeded", "failed", "detached":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *board) continueComment(taskID, commentID string) {
+	if b.commenting {
+		return
+	}
+	b.commenting = true
+	go func() {
+		err := b.api.ContinueComment(taskID, commentID)
+		b.post(func() {
+			b.commenting = false
+			if err != nil {
+				b.toast("AI 跟进失败", err.Error())
 			}
 		})
 	}()
 }
 
-// playColumnChangeCue soft-clicks on a real column change; a landing in
-// 「完成」gets the done chime instead. Load/openProject never call this.
+// playColumnChangeCue soft-clicks on a real column change; a landing in the
+// done column gets the done chime instead. Load/openProject never call this.
 // Per-task debounce suppresses the SSE echo after an optimistic replace
 // (and any rapid remaps) so one move never rings twice.
 func (b *board) playColumnChangeCue(taskID, toColumnID string) {
@@ -1134,7 +1557,7 @@ func (b *board) playColumnChangeCue(taskID, toColumnID string) {
 		b.sfxMuteUntil = map[string]time.Time{}
 	}
 	b.sfxMuteUntil[taskID] = now.Add(500 * time.Millisecond)
-	if b.columnName(toColumnID) == "完成" {
+	if b.columnHasRole(toColumnID, model.ColumnRoleDone) {
 		playDoneCue()
 		return
 	}
@@ -1143,12 +1566,24 @@ func (b *board) playColumnChangeCue(taskID, toColumnID string) {
 
 // openProjectEdit opens the project form pre-filled for editing p: same
 // sheet as create, but 回车/保存 writes the change back instead.
+// deleteProject calls the API in the background; the project.changed event
+// that comes back refreshes the sidebar and drops a deleted current project
+// back to the global view.
+func (b *board) deleteProject(p model.Project) {
+	go func() {
+		if err := b.api.DeleteProject(p.ID); err != nil {
+			b.post(func() { b.toast("删除失败", err.Error()) })
+		}
+	}()
+}
+
 func (b *board) openProjectEdit(p model.Project) {
 	b.form = &form{
 		open:             true,
 		isTask:           false,
 		name:             p.Name,
 		workspacePath:    p.WorkspacePath,
+		color:            p.Color,
 		editingProjectID: p.ID,
 	}
 }
@@ -1158,7 +1593,7 @@ func (b *board) openProjectEdit(p model.Project) {
 // intact so the user can correct it.
 func (b *board) saveProjectEdit() {
 	f := b.form
-	if f == nil || f.editingProjectID == "" {
+	if f == nil || f.editingProjectID == "" || f.creating {
 		return
 	}
 	name := strings.TrimSpace(f.name)
@@ -1167,14 +1602,19 @@ func (b *board) saveProjectEdit() {
 		return
 	}
 	path := strings.TrimSpace(f.workspacePath)
+	color := strings.TrimSpace(f.color)
+	f.creating = true
 	go func() {
-		p, err := b.api.UpdateProject(f.editingProjectID, name, path)
-		b.post(func() {
-			if err != nil {
+		p, err := b.api.UpdateProjectWithColor(f.editingProjectID, name, path, color)
+		if err != nil {
+			b.post(func() {
+				f.creating = false
 				b.toast("保存失败", err.Error())
-				return
-			}
-			ps, perr := b.api.Projects()
+			})
+			return
+		}
+		ps, perr := b.api.Projects()
+		b.post(func() {
 			if perr == nil {
 				b.projects = ps
 			} else {
@@ -1185,7 +1625,8 @@ func (b *board) saveProjectEdit() {
 					}
 				}
 			}
-			if f := b.form; f != nil {
+			if b.form == f {
+				f.creating = false
 				f.open = false
 			}
 			b.toast("已保存", "项目「"+clip(p.Name, 24)+"」已更新")
@@ -1195,7 +1636,7 @@ func (b *board) saveProjectEdit() {
 
 func (b *board) createProject(stayOpen bool) {
 	f := b.form
-	if f == nil {
+	if f == nil || f.creating {
 		return
 	}
 	name := strings.TrimSpace(f.name)
@@ -1204,21 +1645,15 @@ func (b *board) createProject(stayOpen bool) {
 		return
 	}
 	path := strings.TrimSpace(f.workspacePath)
-	f.name = ""
-	if !stayOpen {
-		f.open = false
-		f.workspacePath = ""
-	}
+	color := strings.TrimSpace(f.color)
+	f.creating = true
 	go func() {
-		var p model.Project
-		var err error
-		if path != "" {
-			p, err = b.api.CreateProjectWithPath(name, path)
-		} else {
-			p, err = b.api.CreateProject(name)
-		}
+		p, err := b.api.CreateProjectWithColor(name, path, color)
 		if err != nil {
-			b.toast("创建失败", err.Error())
+			b.post(func() {
+				f.creating = false
+				b.toast("创建失败", err.Error())
+			})
 			return
 		}
 		ps, perr := b.api.Projects()
@@ -1228,12 +1663,17 @@ func (b *board) createProject(stayOpen bool) {
 			} else {
 				b.projects = append(b.projects, p)
 			}
+			if b.form != f {
+				return
+			}
+			f.creating = false
 			if stayOpen {
+				f.name = ""
 				f.workspacePath = ""
+				return
 			}
-			if !stayOpen {
-				b.openProject(p.ID)
-			}
+			f.open = false
+			b.openProject(p.ID)
 		})
 	}()
 }

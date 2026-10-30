@@ -21,9 +21,12 @@ type fakeBoard struct {
 	seq         int64
 	delay       time.Duration // injected latency, standing in for a slow service
 	fail        error         // returned by every read when set
+	createFail  error         // returned by CreateTask when set
+	projectFail error         // returned by project create/update when set
 	subs        []func(model.Event)
 	now         time.Time
 	dispatches  [][2]string // recorded Dispatch(taskID, runtime) calls
+	projectRuns [][2]string // recorded StartProjectRun(projectID, runtime) calls
 }
 
 // seedBoard is the demo board the screenshots use: four columns, five
@@ -71,6 +74,10 @@ func seedBoard() *fakeBoard {
 		Description: "409 之后用服务端版本重发，不覆盖别人的修改。",
 		Position:    1000, Version: 1, CreatedAt: now, UpdatedAt: now,
 	})
+	// The seeded cards already hold t-1 through t-5, so the counter has to
+	// start past them. Otherwise a created task takes an ID that is already
+	// in use and silently overwrites a seeded card.
+	f.seq = 5
 	return f
 }
 
@@ -137,6 +144,9 @@ func (f *fakeBoard) CreateTask(projectID, columnID, title, description, assignee
 	f.wait()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.createFail != nil {
+		return model.Task{}, f.createFail
+	}
 	var p model.Project
 	for _, cand := range f.projects {
 		if cand.ID == projectID {
@@ -288,6 +298,14 @@ func (f *fakeBoard) Comments(taskID string) ([]model.Comment, error) {
 }
 
 func (f *fakeBoard) AddComment(taskID, text string) (model.Comment, error) {
+	return f.AddCommentTo(taskID, text, "")
+}
+
+func (f *fakeBoard) AddCommentTo(taskID, text, mention string) (model.Comment, error) {
+	return f.AddCommentWithParent(taskID, text, mention, "")
+}
+
+func (f *fakeBoard) AddCommentWithParent(taskID, text, mention, parentCommentID string) (model.Comment, error) {
 	f.wait()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -296,7 +314,7 @@ func (f *fakeBoard) AddComment(taskID, text string) (model.Comment, error) {
 		if t.ID != taskID {
 			continue
 		}
-		cm := model.Comment{ID: nextID("m", f.seq), Author: "gui", Text: text, CreatedAt: f.now}
+		cm := model.Comment{ID: nextID("m", f.seq), Author: "gui", Text: text, Mention: mention, ParentCommentID: parentCommentID, CreatedAt: f.now}
 		t.Comments = append(t.Comments, cm)
 		f.emitLocked(model.Event{Type: model.EventCommentAdded, ProjectID: t.ProjectID, ID: t.ID, Version: t.Version, By: "gui", Comment: &cm})
 		return cm, nil
@@ -304,10 +322,60 @@ func (f *fakeBoard) AddComment(taskID, text string) (model.Comment, error) {
 	return model.Comment{}, fmt.Errorf("任务不存在")
 }
 
+func (f *fakeBoard) UpdateComment(taskID, commentID, text string) (model.Comment, error) {
+	f.wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.tasks {
+		if f.tasks[i].ID != taskID {
+			continue
+		}
+		for j := range f.tasks[i].Comments {
+			cm := &f.tasks[i].Comments[j]
+			if cm.ID == commentID {
+				if cm.Author != "gui" {
+					return model.Comment{}, fmt.Errorf("comment author mismatch")
+				}
+				cm.Text = text
+				updated := *cm
+				f.emitLocked(model.Event{Type: model.EventCommentUpdated, ProjectID: f.tasks[i].ProjectID, ID: taskID, By: "gui", Comment: &updated})
+				return updated, nil
+			}
+		}
+	}
+	return model.Comment{}, fmt.Errorf("评论不存在")
+}
+
+func (f *fakeBoard) DeleteComment(taskID, commentID string) error {
+	f.wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.tasks {
+		if f.tasks[i].ID != taskID {
+			continue
+		}
+		for j := range f.tasks[i].Comments {
+			cm := f.tasks[i].Comments[j]
+			if cm.ID == commentID {
+				if cm.Author != "gui" {
+					return fmt.Errorf("comment author mismatch")
+				}
+				f.tasks[i].Comments = append(f.tasks[i].Comments[:j], f.tasks[i].Comments[j+1:]...)
+				f.emitLocked(model.Event{Type: model.EventCommentDeleted, ProjectID: f.tasks[i].ProjectID, ID: taskID, By: "gui", Comment: &cm})
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("评论不存在")
+}
+
 func (f *fakeBoard) CreateProject(name string) (model.Project, error) {
 	f.wait()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.projectFail != nil {
+		return model.Project{}, f.projectFail
+	}
 	p := model.Project{ID: nextID("p", f.seq), Name: name, CreatedAt: f.now,
 		Columns: []model.Column{{ID: nextID("c", f.seq), Name: "待办"}}}
 	f.projects = append(f.projects, p)
@@ -317,19 +385,54 @@ func (f *fakeBoard) CreateProject(name string) (model.Project, error) {
 // Subscribe registers for pushed events until ctx ends, reporting Online
 // at once.
 func (f *fakeBoard) CreateProjectWithPath(name, workspacePath string) (model.Project, error) {
+	return f.CreateProjectWithColor(name, workspacePath, "")
+}
+
+func (f *fakeBoard) CreateProjectWithColor(name, workspacePath, color string) (model.Project, error) {
 	p, err := f.CreateProject(name)
 	if err != nil {
 		return p, err
 	}
 	p.WorkspacePath = workspacePath
+	p.Color = color
 	for i := range f.projects {
 		if f.projects[i].ID == p.ID {
 			f.projects[i].WorkspacePath = workspacePath
+			f.projects[i].Color = color
 			p = f.projects[i]
 			break
 		}
 	}
 	return p, nil
+}
+
+func (f *fakeBoard) StartProjectRun(projectID, runtime string) (model.ProjectRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.projectRuns = append(f.projectRuns, [2]string{projectID, runtime})
+	return model.ProjectRun{ProjectID: projectID, Runtime: runtime, Status: "running"}, nil
+}
+
+func (f *fakeBoard) ProjectRun(projectID string) (model.ProjectRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, run := range f.projectRuns {
+		if run[0] == projectID {
+			return model.ProjectRun{ProjectID: projectID, Runtime: run[1], Status: "running"}, nil
+		}
+	}
+	return model.ProjectRun{}, store.ErrNotFound
+}
+
+func (f *fakeBoard) StopProjectRun(projectID string) (model.ProjectRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.projectRuns {
+		if f.projectRuns[i][0] == projectID {
+			f.projectRuns[i][1] = "stopped"
+		}
+	}
+	return model.ProjectRun{ProjectID: projectID, Status: "stopped"}, nil
 }
 
 // Dispatch records the request; tests assert on it via dispatches.
@@ -342,16 +445,43 @@ func (f *fakeBoard) Dispatch(taskID, runtime string) error {
 
 // UpdateProject edits the named project in place.
 func (f *fakeBoard) UpdateProject(id, name, workspacePath string) (model.Project, error) {
+	return f.UpdateProjectWithColor(id, name, workspacePath, "")
+}
+
+func (f *fakeBoard) UpdateProjectWithColor(id, name, workspacePath, color string) (model.Project, error) {
+	f.wait()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.projectFail != nil {
+		return model.Project{}, f.projectFail
+	}
 	for i := range f.projects {
 		if f.projects[i].ID == id {
 			f.projects[i].Name = name
 			f.projects[i].WorkspacePath = workspacePath
+			f.projects[i].Color = color
 			return f.projects[i], nil
 		}
 	}
 	return model.Project{}, store.ErrNotFound
+}
+
+// DeleteProject drops the named project from the fake's list; tasks are
+// fake-local and not tracked per project here.
+func (f *fakeBoard) DeleteProject(id string) error {
+	f.wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.projectFail != nil {
+		return f.projectFail
+	}
+	for i := range f.projects {
+		if f.projects[i].ID == id {
+			f.projects = append(f.projects[:i], f.projects[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (f *fakeBoard) Subscribe(ctx context.Context, projectID string, onEvent func(model.Event), onState func(client.StreamState)) error {

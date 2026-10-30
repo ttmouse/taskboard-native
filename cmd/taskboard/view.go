@@ -5,15 +5,16 @@ package main
 
 import (
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"taskboard-native/internal/client"
+	"taskboard-native/internal/executor"
 	"taskboard-native/internal/model"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/plugins/glass"
 	"github.com/egoist/mygo/plugins/loading"
 	"github.com/egoist/mygo/ui"
 )
@@ -38,16 +39,8 @@ func sidebarSelected(t *ui.Theme, pressed bool) ui.Color {
 }
 
 func cardFace(t *ui.Theme) ui.Color {
-	if t.Dark {
-		return t.Surface
-	}
-	return t.Background
+	return t.Surface
 }
-
-// cardEdge is a resting card's outline. A card that shares the window's
-// face on light has to hold its shape by its edge, which the old column
-// panel used to do for it.
-func cardEdge(t *ui.Theme) ui.Color { return t.Border }
 
 // cardHover is a resting card's fill under the pointer. It must never
 // equal the column's own face: with no column tone, a hover that stepped to
@@ -62,8 +55,7 @@ func cardHover(t *ui.Theme) ui.Color {
 }
 
 // The column panel carries neither fill nor outline: the window face runs
-// behind it, and the cards hold their own edges (cardEdge). The accent
-// appears when a drag hovers.
+// behind it. The accent appears when a drag hovers.
 
 // typeScale is the design's f-* steps relative to the theme's size.
 func fxs(t *ui.Theme) float32 { return t.FontSize - 2 }
@@ -112,16 +104,37 @@ func (b *board) view(c *ui.Context) {
 	b.ensureSidebarWidth(t)
 	// Cmd+B toggles the project sidebar (same as the panel icon chip).
 	c.OnShortcut(ui.Cmd, ui.KeyB, func() { b.toggleSidebar() })
+	// Cmd+F opens task search (same as the sidebar/top-bar search action).
+	// Avoid stacking it over task details; window shortcuts wait while a
+	// dialog is up.
+	c.OnShortcut(ui.Cmd, ui.KeyF, func() {
+		if b.detail == nil {
+			b.searchOpen = true
+		}
+	})
 	// Cmd+N opens the create-task sheet (same as the sidebar 新建任务 row).
 	// Window shortcuts wait while a modal is up, so it never fires under
 	// the detail dialog, search, or a form.
-	c.OnShortcut(ui.Cmd, ui.KeyN, func() { b.openTaskForm(b.defaultTaskColumnID()) })
+	c.OnShortcut(ui.Cmd, ui.KeyN, func() {
+		if b.detail == nil {
+			b.openTaskForm(b.defaultTaskColumnID())
+		}
+	})
+	// Cmd+, opens the settings sheet, matching the standard macOS shortcut.
+	c.OnShortcut(ui.Cmd, ui.KeyComma, func() { b.openSettings() })
 	// Cmd+Shift+L cycles 外观 (跟随系统 → 浅色 → 深色), the same choice the
 	// settings sheet's 外观 row carries, for turning it from the keyboard.
 	// Like the other window shortcuts it waits while a dialog is up; the
 	// sheet's own segmented control is the way to switch from inside one.
 	c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyL, b.cycleAppearance)
 	content := func() {
+		if b.detail != nil {
+			// Task details replace the board inside its pane. The project rail
+			// remains available on the left, while the detail uses the full
+			// height and width of the right side of the window.
+			b.detailView(c, t)
+			return
+		}
 		ui.Column(c).Fill().Children(func() {
 			b.topBar(c, t)
 			if b.status == client.Offline {
@@ -159,6 +172,9 @@ func (b *board) view(c *ui.Context) {
 				Cursor(ui.CursorResizeEW).
 				Role(ui.RoleSplitter).Label("调整侧栏宽度")
 			dx, _, held := handle.Dragged()
+			if held {
+				b.sidebarResizing = true
+			}
 			if held && dx != 0 {
 				w := b.sidebarW + dx
 				if w < 160 {
@@ -170,8 +186,10 @@ func (b *board) view(c *ui.Context) {
 				if w != b.sidebarW {
 					b.sidebarW = w
 					b.prefs.SidebarWidth = w
-					_ = saveUIPrefs(b.prefs)
 				}
+			} else if !held && b.sidebarResizing {
+				b.sidebarResizing = false
+				_ = saveUIPrefs(b.prefs)
 			}
 			showLine := held || handle.Hovered()
 			handle.Draw(func(p *ui.Painter, r ui.Rect) {
@@ -189,12 +207,9 @@ func (b *board) view(c *ui.Context) {
 	})
 	// After TrackScroll updates offsets, set thumb visibility for this paint.
 	// MyGo would otherwise keep thumbs visible for the whole hover; we only
-	// show them briefly while scrolling (gutter still reserved).
+	// show them briefly while scrolling, over the content.
 	b.applyScrollbarTheme(c, theme)
 
-	if b.detail != nil {
-		b.detailView(c, t)
-	}
 	if b.searchOpen {
 		b.searchView(c, t)
 	}
@@ -206,6 +221,12 @@ func (b *board) view(c *ui.Context) {
 	}
 	if b.conflict != nil {
 		b.conflictView(c, t)
+	}
+	if b.confirmDelete != nil {
+		b.confirmDeleteView(c, t)
+	}
+	if b.confirmDeleteComment != nil {
+		b.confirmDeleteCommentView(c, t)
 	}
 }
 
@@ -262,6 +283,10 @@ func (b *board) productionTopBar(c *ui.Context, t *ui.Theme) {
 			loading.Ring(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在切换项目")
 		}
 		ui.Spacer(c)
+		ui.Text(c, appVersion).FontSize(fxs(t)).TextColor(t.Text.Alpha(0.55))
+		if b.cur != "" && b.cur != curGlobal {
+			b.projectRunControl(c, t)
+		}
 		// The rail carries 新建任务 / 搜索 / 设置; with it hidden they move
 		// here so collapsing never strands an action.
 		if railHidden {
@@ -279,7 +304,200 @@ func (b *board) productionTopBar(c *ui.Context, t *ui.Theme) {
 			}
 			b.topBarAction(c, t, "打开设置", settingsSliders, func() { b.openSettings() })
 		}
+		b.timeFilterControl(c, t)
+		b.boardDisplayControls(c, t)
 	})
+}
+
+// projectRunControl is the open project's continuous handoff switch.
+// Off opens the channel menu; on turns the switch off.
+func (b *board) projectRunControl(c *ui.Context, t *ui.Theme) {
+	label, tip, action := "自动承接", "开启后持续承接这个项目，一次一张", "开启自动承接"
+	if runtime := b.projectRunRuntime[b.cur]; runtime != "" {
+		channel := runtimeLabel(runtime)
+		label, tip, action = channel+" 承接中", channel+" 正在承接这个项目，点击关闭", "关闭自动承接"
+	}
+	btn := ui.ButtonBase(c.Key("project-run")).Label(action).Tooltip(tip).
+		Padding(t.Space(1), t.Space(2)).Gap(t.Space(1)).
+		Radius(t.Radius).BorderWidth(0).
+		Children(func() {
+			ui.Icon(c, autoRun).Size(16, 16)
+			ui.Text(c, label).FontSize(t.FontSize).FontWeight(500)
+		})
+	ink, face := t.TextMuted, ui.Transparent
+	if b.projectRunRuntime[b.cur] != "" {
+		ink = t.Text
+	}
+	switch {
+	case btn.Pressed():
+		ink, face = t.Text, t.SurfacePressed
+	case btn.Hovered():
+		ink, face = t.Text, t.Text.Alpha(0.14)
+	}
+	btn.Background(face).TextColor(ink)
+	if b.projectRunRuntime[b.cur] != "" {
+		if btn.Clicked() {
+			b.stopProjectRun()
+		}
+		return
+	}
+	btn.Menu(func(m *ui.Menu) {
+		for _, runtime := range executor.Runtimes() {
+			if m.Item(runtime.Label).Chosen() {
+				b.startProjectRun(runtime.ID)
+			}
+		}
+	})
+}
+
+func (b *board) startProjectRun(runtime string) {
+	projectID := b.cur
+	label := runtime
+	for _, channel := range executor.Runtimes() {
+		if channel.ID == runtime {
+			label = channel.Label
+		}
+	}
+	for _, project := range b.projects {
+		if project.ID == projectID && strings.TrimSpace(project.WorkspacePath) == "" {
+			b.toast("无法承接", "项目未设置工作路径，先给项目设置工作目录")
+			return
+		}
+	}
+	go func() {
+		run, err := b.api.StartProjectRun(projectID, runtime)
+		b.post(func() {
+			if err != nil {
+				b.toast("自动承接未开启", err.Error())
+				return
+			}
+			if b.projectRunRuntime == nil {
+				b.projectRunRuntime = map[string]string{}
+			}
+			if run.Running() {
+				b.projectRunRuntime[projectID] = run.Runtime
+			} else {
+				delete(b.projectRunRuntime, projectID)
+			}
+			b.toast("自动承接已开启", label+" 会持续处理，一次一张")
+		})
+	}()
+}
+
+func (b *board) stopProjectRun() {
+	projectID := b.cur
+	go func() {
+		_, err := b.api.StopProjectRun(projectID)
+		b.post(func() {
+			if err != nil {
+				b.toast("自动承接未能关闭", err.Error())
+				return
+			}
+			if b.projectRunRuntime != nil {
+				delete(b.projectRunRuntime, projectID)
+			}
+			b.toast("自动承接已关闭", "当前这张卡会继续")
+		})
+	}()
+}
+
+func (b *board) loadProjectRun(projectID string) {
+	if projectID == "" || projectID == curGlobal {
+		return
+	}
+	go func() {
+		run, err := b.api.ProjectRun(projectID)
+		b.post(func() {
+			if b.projectRunRuntime == nil {
+				b.projectRunRuntime = map[string]string{}
+			}
+			if err == nil && run.Running() {
+				b.projectRunRuntime[projectID] = run.Runtime
+			} else {
+				delete(b.projectRunRuntime, projectID)
+			}
+		})
+	}()
+}
+
+// timeFilterControl is the top-right time dimension picker: 全部时间 by
+// default, plus 今天 / 昨天 / 近7天 / 近30天. The board then shows only
+// tasks updated inside the window, so「今天完成了哪些」is one click away.
+func (b *board) timeFilterControl(c *ui.Context, t *ui.Theme) {
+	label, tip := "全部时间", "时间筛选：全部任务"
+	switch b.timeFilter {
+	case "today":
+		label, tip = "今天", "时间筛选：今天更新的任务"
+	case "yesterday":
+		label, tip = "昨天", "时间筛选：昨天更新的任务"
+	case "7d":
+		label, tip = "近7天", "时间筛选：最近 7 天更新的任务"
+	case "30d":
+		label, tip = "近30天", "时间筛选：最近 30 天更新的任务"
+	}
+	btn := ui.MenuButton(c, label, func(m *ui.Menu) {
+		if m.Item("全部时间").Checked(b.timeFilter == "").Chosen() {
+			b.timeFilter = ""
+		}
+		if m.Item("今天").Checked(b.timeFilter == "today").Chosen() {
+			b.timeFilter = "today"
+		}
+		if m.Item("昨天").Checked(b.timeFilter == "yesterday").Chosen() {
+			b.timeFilter = "yesterday"
+		}
+		if m.Item("近7天").Checked(b.timeFilter == "7d").Chosen() {
+			b.timeFilter = "7d"
+		}
+		if m.Item("近30天").Checked(b.timeFilter == "30d").Chosen() {
+			b.timeFilter = "30d"
+		}
+	}).Label("时间筛选").Tooltip(tip).BorderWidth(0)
+	face, ink := ui.Transparent, t.TextMuted
+	switch {
+	case btn.Pressed():
+		face, ink = t.SurfacePressed, t.Text
+	case btn.Hovered():
+		face, ink = t.Text.Alpha(0.14), t.Text
+	}
+	btn.Background(face).TextColor(ink)
+}
+
+// boardDisplayControls stays at the right edge with or without a sidebar.
+// Each icon depicts the current value; the tooltip names the next action.
+func (b *board) boardDisplayControls(c *ui.Context, t *ui.Theme) {
+	cardIcon, cardTip := cardFull, "卡片：完整内容 · 点击仅显示标题"
+	if b.prefs.TitleOnlyCards {
+		cardIcon, cardTip = cardTitle, "卡片：仅标题 · 点击显示完整内容"
+	}
+	b.boardDisplayToggle(c, t, "卡片仅显示标题", cardTip, cardIcon, &b.prefs.TitleOnlyCards)
+	layoutIcon, layoutTip := columnsHorizontal, "布局：横向 · 点击纵向排列状态列"
+	if b.prefs.BoardVertical {
+		layoutIcon, layoutTip = columnsVertical, "布局：纵向 · 点击横向排列状态列"
+	}
+	b.boardDisplayToggle(c, t, "纵向排列状态列", layoutTip, layoutIcon, &b.prefs.BoardVertical)
+}
+
+func (b *board) boardDisplayToggle(c *ui.Context, t *ui.Theme, label, tip string, icon *ui.SVG, value *bool) {
+	btn := ui.ButtonBase(c.Key("board-display-"+label)).
+		Label(label+"，"+tip).Tooltip(tip).
+		Size(t.Space(7), t.Space(7)).Padding(0).Gap(0).BorderWidth(0).
+		Radius(t.Radius + 2).Center().
+		Children(func() { ui.Icon(c, icon).Size(16, 16) })
+	ink, face := t.TextMuted, ui.Transparent
+	if *value {
+		ink, face = t.Text, t.Text.Alpha(0.09)
+	}
+	switch {
+	case btn.Pressed():
+		ink, face = t.Text, t.SurfacePressed
+	case btn.Hovered():
+		ink, face = t.Text, t.Text.Alpha(0.14)
+	}
+	btn.Background(face).TextColor(ink)
+	if btn.Clicked() {
+		*value = !*value
+		_ = saveUIPrefs(b.prefs)
+	}
 }
 
 // railEase is how the sidebar arrives: fast out, so the board gets its room
@@ -307,6 +525,13 @@ func (b *board) railWidth(split ui.Element, c *ui.Context, t *ui.Theme) float32 
 	target := float32(0)
 	if open {
 		target = b.sidebarW
+	}
+	// Resizing changes the rail and pane together on every pointer frame.
+	// Retargeting the open animation here would make the divider lag behind
+	// the pointer and leave the board pane briefly out of sync.
+	if b.sidebarResizing {
+		b.railNow, b.railAt, b.railTo = target, time.Time{}, target
+		return target
 	}
 	// The rail's first appearance lands at once: the window opens with it in
 	// place, where a slide from zero would leave the sidebar absent for
@@ -486,6 +711,30 @@ func (b *board) sidebarCollapseChip(c *ui.Context, t *ui.Theme, collapsing bool)
 	}
 }
 
+// projectSortControl is the small sort dropdown left of 添加项目 in the
+// sidebar header: 默认（服务端顺序）/ 按更新时间（最近活跃在前）/
+// 按创建时间（最新在前）。
+func (b *board) projectSortControl(c *ui.Context, t *ui.Theme) {
+	label, tip := "排序", "项目排序：默认"
+	switch b.projectSort {
+	case "updated":
+		label, tip = "按更新", "项目排序：按更新时间（最近活跃在前）"
+	case "created":
+		label, tip = "按创建", "项目排序：按创建时间（最新在前）"
+	}
+	ui.MenuButton(c, label, func(m *ui.Menu) {
+		if m.Item("默认排序").Checked(b.projectSort == "").Chosen() {
+			b.projectSort = ""
+		}
+		if m.Item("按更新时间").Checked(b.projectSort == "updated").Chosen() {
+			b.projectSort = "updated"
+		}
+		if m.Item("按创建时间").Checked(b.projectSort == "created").Chosen() {
+			b.projectSort = "created"
+		}
+	}).Label("项目排序").Tooltip(tip).BorderWidth(0)
+}
+
 // projectSidebar is a quiet project switcher on L0 (window face), not a
 // second column panel — columns stay the only L1 surfaces.
 func (b *board) projectSidebar(c *ui.Context, t *ui.Theme) {
@@ -523,6 +772,7 @@ func (b *board) projectSidebar(c *ui.Context, t *ui.Theme) {
 				hdr.Children(func() {
 					ui.Text(c, "项目").FontSize(fsm(t)).FontWeight(600).TextColor(t.TextMuted).
 						TextAlign(ui.Start).Grow(1)
+					b.projectSortControl(c, t)
 					plus := ui.Button(c.Key("projects-hdr-add"), "+").Label("新建项目").Tooltip("新建项目").
 						Padding(t.Space(1), t.Space(1.5)).Radius(t.Radius).BorderWidth(0)
 					showPlus := hdr.Hovered() || plus.Hovered() || plus.Pressed()
@@ -572,7 +822,7 @@ func (b *board) projectSidebar(c *ui.Context, t *ui.Theme) {
 						if gRow.Clicked() && !globalOn {
 							b.openGlobal()
 						}
-						for _, p := range b.projects {
+						for _, p := range b.sortedProjects() {
 							p := p
 							active := b.cur != curGlobal && p.ID == b.cur
 							addTask := false
@@ -597,12 +847,26 @@ func (b *board) projectSidebar(c *ui.Context, t *ui.Theme) {
 							}
 							row.Background(face)
 							row.ContextMenu(func(m *ui.Menu) {
+								if m.Item("打开项目所在的目录").Chosen() {
+									if strings.TrimSpace(p.WorkspacePath) == "" {
+										b.toast("无法打开项目目录", "该项目尚未设置工作目录。")
+									} else if err := openProjectDirectory(p.WorkspacePath); err != nil {
+										b.toast("无法打开项目目录", err.Error())
+									}
+								}
 								if m.Item("编辑项目").Chosen() {
 									b.openProjectEdit(p)
 								}
 							})
 							row.Children(func() {
 								ui.Row(c).FillWidth().Height(projectRowH).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+									// A 8×8 dot wears the project's accent (or its
+									// stable palette slot), matching the card bars
+									// in 全部项目.
+									ui.Box(c).Key("project-"+p.ID+"-dot").
+										Size(t.Space(2), t.Space(2)).Radius(t.Space(2) / 2).
+										Background(b.projectColor(p)).
+										Label("项目颜色")
 									ui.Icon(c, folderClosed).Size(14, 14).TextColor(t.TextMuted)
 									ui.Text(c, p.Name).FontSize(t.FontSize).FontWeight(500).
 										TextColor(t.Text).Grow(1).MaxLines(1).Ellipsis("…")
@@ -763,6 +1027,9 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 	if b.sidebarVisible() {
 		padL = t.Space(2)
 	}
+	if !b.prefs.BoardVertical {
+		padL, padR = t.Space(2), t.Space(2)
+	}
 	colGap := float32(0) // flush columns; panel pad carries residual air
 	boardScroll := b.columnScroll("_board")
 
@@ -771,22 +1038,28 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 		// tall as its cards need: the board scrolls vertically to reach the
 		// rest. Giving a row a share of the viewport and clipping its list
 		// cut cards off part-way instead of showing them whole.
-		board := ui.Scroll(c).Grow(1).Padding(t.Space(1), padR, t.Space(2), padL).Gap(t.Space(2)).
-			TrackScroll(&boardScroll.state)
-		b.noteScroll(boardScroll)
+		// The quick-add sits above the scroll so it stays put while the
+		// rows move, and so an empty status row stays header-only.
+		pane := ui.Column(c).Grow(1)
 		if b.switching {
-			board.Opacity(0.55)
+			pane.Opacity(0.55)
 		}
-		board.Children(func() {
-			for i := range b.columns {
-				b.columnView(c, t, &b.columns[i], avail-padL-padR, i, b.verticalRowHeight(t, i))
-			}
+		pane.Children(func() {
+			b.quickAdd(c, t, padL, padR)
+			board := ui.Scroll(c).Grow(1).Padding(0, padR, t.Space(2), padL).Gap(t.Space(2)).
+				TrackScroll(&boardScroll.state)
+			b.noteScroll(boardScroll)
+			board.Children(func() {
+				for i := range b.columns {
+					b.columnView(c, t, &b.columns[i], avail-padL-padR, i)
+				}
+			})
 		})
 		return
 	}
 
 	width := b.columnWidth(c, t)
-	board := ui.ScrollHorizontal(c).Grow(1).Padding(t.Space(1), padR, t.Space(2), padL).Gap(colGap).AlignItems(ui.Stretch).
+	board := ui.ScrollHorizontal(c).Grow(1).Padding(t.Space(1), padR, 0, padL).Gap(colGap).AlignItems(ui.Stretch).
 		TrackScroll(&boardScroll.state)
 	b.noteScroll(boardScroll)
 	if b.switching {
@@ -799,7 +1072,7 @@ func (b *board) boardArea(c *ui.Context, t *ui.Theme) {
 			ui.Spacer(c).Width(lead)
 		}
 		for i := range b.columns {
-			b.columnView(c, t, &b.columns[i], width, i, 0)
+			b.columnView(c, t, &b.columns[i], width, i)
 		}
 	})
 }
@@ -825,11 +1098,7 @@ func (b *board) noProjectState(c *ui.Context, t *ui.Theme) {
 // the columns, clamped to the design's 240..400.
 func (b *board) columnWidth(c *ui.Context, t *ui.Theme) float32 {
 	w := b.paneW
-	padL, padR := t.Space(5), t.Space(5)
-	if b.sidebarVisible() {
-		padL = t.Space(2)
-	}
-	room := w - padL - padR - float32(max(len(b.columns)-1, 0))*float32(0)
+	room := w - 2*t.Space(2)
 	if len(b.columns) == 0 {
 		return 320
 	}
@@ -837,35 +1106,20 @@ func (b *board) columnWidth(c *ui.Context, t *ui.Theme) float32 {
 	return min(max(width, 240), 400)
 }
 
-// verticalRowHeight is the floor a stacked status row gets on the board:
-// one share of the viewport (min 220), so a short column still reads as a
-// band of its own. The row grows past it whenever its cards need more.
-func (b *board) verticalRowHeight(t *ui.Theme, index int) float32 {
-	h := b.frameH
-	n := max(len(b.columns), 1)
-	chrome := t.Space(12) // top bar approx
-	return max((h-chrome)/float32(n), 220)
-}
-
 // columnView is one column: header and its cards. A column
 // enters by rising a step, its neighbors delayed in turn, so a board
 // arriving reads as one motion and a project switch replays it.
-func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width float32, index int, rowHeight float32) {
+func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width float32, index int) {
 	tasks := b.tasksIn(col.ID)
 	panel := ui.Column(c.Key(col.ID)).Width(width)
-	if rowHeight > 0 {
-		// A stacked row is as tall as its cards: the height stays a hint
-		// for the row, never a frame the cards are cut off by.
-		panel = panel.MinHeight(rowHeight)
-	} else {
+	if !b.prefs.BoardVertical {
 		panel = panel.FillHeight()
 	}
 	panel = panel.
 		// The panel has no face of its own (colFace), so the inner pad is
-		// air, not a frame: Y s2 keeps the first card off the header, X s1
-		// keeps cards off the scrollbar gutter. Vertical air between the
-		// panel edge and the header comes from the board's own padding.
-		Padding(t.Space(2), t.Space(1)).Gap(t.Space(2)).Radius(t.Radius + 4).
+		// air, not a frame: Y s2 keeps the first card off the header.
+		// Air above the header comes from the board's own padding.
+		Padding(t.Space(2), t.Space(1), 0, t.Space(1)).Gap(t.Space(2)).Radius(t.Radius + 4).
 		Background(colFace(t)).
 		Role(ui.RoleGroup).
 		Label(fmt.Sprintf("%s列", col.Name))
@@ -890,24 +1144,47 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 	}
 
 	panel.Children(func() {
-		ui.Row(c).Height(t.Space(7)).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, col.Name).FontSize(fmd(t)).FontWeight(600).
-				Role(ui.RoleHeading).Level(2)
-			ui.Text(c, strconv.Itoa(len(tasks))).FontSize(fsm(t)).TextColor(t.TextMuted).
-				Label(fmt.Sprintf("%d 个任务", len(tasks)))
-			ui.Spacer(c)
-		})
-
-		// Scrollbar overlays content by default; reserve a right gutter so
-		// thumbs never cover cards. Same columnView → 待办/进行中/评审/完成.
-		bar := t.ScrollbarWidth
-		if bar <= 0 {
-			bar = 6
+		// The stacked board folds a group from its header; the horizontal
+		// board keeps the plain heading: its full-height columns do not fold.
+		if b.prefs.BoardVertical {
+			b.columnHeader(c, t, col, len(tasks))
+		} else {
+			ui.Row(c).Height(t.Space(7)).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, col.Name).FontSize(fmd(t)).FontWeight(600).
+					Role(ui.RoleHeading).Level(2)
+				ui.Text(c, strconv.Itoa(len(tasks))).FontSize(fsm(t)).TextColor(t.TextMuted).
+					Label(fmt.Sprintf("%d 个任务", len(tasks)))
+				ui.Spacer(c)
+			})
 		}
-		gutter := bar + t.Space(2)
+
+		// Empty stacked statuses keep their heading and drop target without
+		// reserving space for an empty list or its bottom padding. A folded
+		// group does the same with its cards still inside.
+		if b.prefs.BoardVertical && (len(tasks) == 0 || b.prefs.CollapsedCols[col.ID]) {
+			return
+		}
+
 		track := b.columnScroll(col.ID)
-		ui.Scroll(c).Grow(1).TrackScroll(&track.state).Children(func() {
-			list := ui.Column(c).FillWidth().Gap(t.Space(2)).Padding(0, gutter, t.Space(6), 0).
+		// Keep cards full-width and move only the column thumb into the
+		// existing gap between panels, outside the card surface.
+		scroll := ui.Scroll(c).Grow(1).TrackScroll(&track.state)
+		gutter := float32(0)
+		if !b.prefs.BoardVertical {
+			bar := t.ScrollbarWidth
+			if bar <= 0 {
+				bar = 6
+			}
+			gutter = bar + t.Space(1)
+			// Extend the hit area into the gap as well as the painted thumb.
+			// Matching list padding keeps the card width unchanged.
+			scroll.Margin(0, -gutter, 0, 0)
+		}
+		scroll.Children(func() {
+			// The list's bottom padding is air below the last card, not a
+			// frame: keep it as small as the top so a short column does not
+			// read as extra blank space under the cards.
+			list := ui.Column(c).FillWidth().Gap(t.Space(2)).Padding(0, gutter, 0, 0).
 				FocusGroup(ui.Vertical).Label(col.Name + "列任务")
 			list.Children(func() {
 				b.columnCards(c, t, col, tasks, panel, list, string(dragID), over)
@@ -917,27 +1194,192 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 	})
 }
 
-// createTop creates a card and lifts it to the head of its column, which
-// is where a quick add puts it.
-func (b *board) createTop(projectID, columnID, title string) {
+// columnHeader is one stacked group's header: chevron, name and count on a
+// full-width button. Clicking folds the group down to this header — a folded
+// 完成 keeps its count, so the row still says what it holds — or unfolds it.
+// The state lives in uiPrefs, so folds survive a restart.
+func (b *board) columnHeader(c *ui.Context, t *ui.Theme, col *model.Column, count int) {
+	folded := b.prefs.CollapsedCols[col.ID]
+	verb, icon := "折叠", chevronDown
+	if folded {
+		verb, icon = "展开", chevronRight
+	}
+	head := ui.Button(c.Key("col-head-"+col.ID), "").
+		FillWidth().Height(t.Space(7)).
+		Radius(t.Radius).BorderWidth(0).
+		TextAlign(ui.Start).Justify(ui.Start).
+		Label(verb + col.Name)
+	face := ui.Transparent
+	switch {
+	case head.Pressed():
+		face = t.SurfacePressed
+	case head.Hovered():
+		face = t.SurfaceHover
+	}
+	head.Background(face).TextColor(t.Text)
+	head.Children(func() {
+		ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, icon).Size(14, 14).TextColor(t.TextMuted)
+			ui.Text(c, col.Name).FontSize(fmd(t)).FontWeight(600).
+				Role(ui.RoleHeading).Level(2)
+			ui.Text(c, strconv.Itoa(count)).FontSize(fsm(t)).TextColor(t.TextMuted).
+				Label(fmt.Sprintf("%d 个任务", count))
+			ui.Spacer(c)
+		})
+	})
+	if head.Clicked() {
+		if folded {
+			delete(b.prefs.CollapsedCols, col.ID)
+		} else {
+			if b.prefs.CollapsedCols == nil {
+				b.prefs.CollapsedCols = map[string]bool{}
+			}
+			b.prefs.CollapsedCols[col.ID] = true
+		}
+		_ = saveUIPrefs(b.prefs)
+	}
+}
+
+// quickAdd is the one field at the top of the vertical list. Enter creates
+// in the current project's 待办 and clears the field only after the service
+// confirms it; a blank Enter does nothing, Escape clears, and 全部项目 keeps
+// the draft. Horizontal boards never call this.
+func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
+	// A column panel pads its own content by s1 on each side, so the field
+	// is inset by the same amount: it lines up with the cards below it,
+	// not with the panel's edge, and never reads wider than them.
+	ui.Row(c).FillWidth().
+		Padding(t.Space(2), padR+t.Space(1), t.Space(2), padL+t.Space(1)).
+		Children(func() {
+			ui.TextInput(c.Key("quick-add"), &b.quickTitle).
+				FillWidth().
+				Placeholder("添加任务，回车创建").
+				Label("在「待办」中添加任务").
+				FontSize(t.FontSize).
+				BorderWidth(0).
+				ReadOnly(b.quickCreating).
+				OnTextKey(func(k ui.TextKey) bool {
+					if b.quickCreating {
+						return true
+					}
+					if k.Key == ui.KeyEscape && k.Mods == 0 {
+						k.SetText("")
+						return true
+					}
+					if k.Key != ui.KeyEnter || k.Mods != 0 {
+						return false
+					}
+					title := strings.TrimSpace(k.Text())
+					if title == "" {
+						return true
+					}
+					b.quickCreating = true
+					if !b.createTaskAndDispatch(b.cur, b.defaultTaskColumnID(), title, "", "", func(created bool) {
+						b.quickCreating = false
+						if created && b.quickTitle == title {
+							b.quickTitle = ""
+						}
+					}) {
+						b.quickCreating = false
+					}
+					return true
+				})
+		})
+}
+
+// createTask creates a card at the bottom of its column.
+func (b *board) createTask(projectID, columnID, title string) {
+	b.createTaskAndDispatch(projectID, columnID, title, "", "", nil)
+}
+
+func (b *board) createTaskAndDispatch(projectID, columnID, title, description, runtime string, afterCreate func(bool)) bool {
 	proj := projectID
 	if proj == "" {
 		proj = b.cur
 	}
 	if proj == "" || proj == curGlobal {
 		b.toast("无法创建", "请先在侧栏选一个项目，再添加任务。")
-		return
+		return false
+	}
+	if runtime != "" {
+		workspace := ""
+		for _, project := range b.projects {
+			if project.ID == proj {
+				workspace = strings.TrimSpace(project.WorkspacePath)
+				break
+			}
+		}
+		if workspace == "" {
+			b.toast("无法派发", "项目未设置工作路径，先给项目设置工作目录")
+			return false
+		}
+	}
+	complete := func(created bool) {
+		if afterCreate != nil {
+			b.post(func() { afterCreate(created) })
+		}
 	}
 	go func() {
-		t, err := b.api.CreateTask(proj, columnID, title, "", "")
+		t, err := b.api.CreateTask(proj, columnID, title, description, "")
 		if err != nil {
 			b.toast("创建失败", err.Error())
+			complete(false)
 			return
 		}
-		if _, err := b.api.Move(t.ID, t.Version, columnID, "", true); err != nil {
-			b.toast("新任务未能置顶", err.Error())
+		complete(true)
+		if runtime != "" {
+			if err := b.api.Dispatch(t.ID, runtime); err != nil {
+				b.toast("任务已创建，派发失败", err.Error())
+			}
 		}
 	}()
+	return true
+}
+
+func herdrExecutionLabel(status string, t *ui.Theme) (string, ui.Color) {
+	switch status {
+	case "submitting":
+		return "正在接入", t.TextMuted
+	case "running":
+		return "运行中", t.Accent
+	case "waiting_approval":
+		return "等待处理", t.Warning
+	case "returned", "succeeded":
+		return "执行已返回", t.TextMuted
+	case "failed":
+		return "执行失败", t.Danger
+	case "disconnected", "unknown":
+		return "连接异常", t.Warning
+	case "detached":
+		return "已分离", t.TextMuted
+	case "released":
+		return "已释放", t.TextMuted
+	default:
+		return "", t.TextMuted
+	}
+}
+
+func herdrExecutionIcon(status string) *ui.SVG {
+	switch status {
+	case "submitting":
+		return herdrSubmitting
+	case "running":
+		return herdrRunning
+	case "waiting_approval":
+		return herdrWaiting
+	case "returned", "succeeded":
+		return herdrReturned
+	case "failed":
+		return herdrFailed
+	case "disconnected", "unknown":
+		return herdrDisconnected
+	case "detached":
+		return herdrDetached
+	case "released":
+		return herdrReleased
+	default:
+		return nil
+	}
 }
 
 // cardView draws one card: title, summary, and its footer. The footer
@@ -945,11 +1387,21 @@ func (b *board) createTop(projectID, columnID, title string) {
 // that wrote it last, and when — because who moved a task is this
 // board's story.
 func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Element {
-	// The column has no tone of its own, so the card's 1 DIP edge is what
-	// draws it on the window (cardEdge).
+	// 全部项目 names the card's project and wears its color: the project
+	// dot beside the name and the 3px left-edge bar both use projectColor.
+	projectName := ""
+	var projectColor ui.Color
+	projectColorSet := false
+	if b.cur == curGlobal {
+		projectName = b.projectNameByID(task.ProjectID)
+		if p, ok := b.projectByID(task.ProjectID); ok {
+			projectColor = b.projectColor(p)
+			projectColorSet = true
+		}
+	}
 	card := ui.Box(c.Key(task.ID)).FillWidth().
 		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius + 2).
-		Border(1, cardEdge(t)).
+		BorderWidth(0).
 		Focusable().Cursor(ui.CursorPointer).Role(ui.RoleButton).
 		Label("打开任务：" + task.Title).
 		Drag(cardDrag(task.ID))
@@ -971,6 +1423,15 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		}
 	}
 	card.Background(card.AnimateColor("face", face, ui.Animation{Duration: 200 * time.Millisecond, Ease: ui.EaseOut}))
+	// 全部项目 paints a 3px accent bar down the card's left edge in the
+	// project's color, so cards from different projects read apart at a
+	// glance without the color washing the card face.
+	if projectColorSet {
+		card.Draw(func(p *ui.Painter, r ui.Rect) {
+			bar := ui.Rect{X: r.X + 2, Y: r.Y + 2, W: 3, H: r.H - 4}
+			p.Fill(bar, projectColor, 1.5)
+		})
+	}
 	if card.Dragging() {
 		card.Opacity(b.dragSourceOpacity())
 	}
@@ -987,8 +1448,25 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		if m.Item("打开详情").Chosen() {
 			b.openDetail(*task)
 		}
-		if m.Item("派发 DSH 执行").Chosen() {
-			b.dispatchTask(task.ID)
+		m.Submenu("派发任务", func(sub *ui.Menu) {
+			for _, runtime := range executor.Runtimes() {
+				if sub.Item(runtime.Label).Chosen() {
+					b.dispatchTask(task.ID, runtime.ID)
+				}
+			}
+		})
+		if task.Execution != nil && task.Execution.Channel() == executor.RuntimeCodex && strings.TrimSpace(task.Execution.SessionID) != "" {
+			active := task.Execution.Active() && !task.Execution.Stalled()
+			openLabel := "在 Ghostty 打开 Codex 对话"
+			if strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") {
+				openLabel = "在 Herdr 中定位 Codex 对话"
+				// Focusing a Herdr terminal does not resume or create a session,
+				// so it is safe while the original agent is active.
+				active = false
+			}
+			if m.Item(openLabel).Disabled(active).Chosen() {
+				b.openTaskExecution(task)
+			}
 		}
 		if m.Item("复制 ID").Chosen() {
 			mygo.Clipboard.WriteText(task.ID)
@@ -1001,13 +1479,49 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 	})
 
 	approve := false
-	inReview := b.columnName(task.ColumnID) == "评审"
+	openExecution := false
+	inReview := b.columnHasRole(task.ColumnID, model.ColumnRoleReview)
+	drawCardFooterControls := func() {
+		if task.Execution != nil && strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") {
+			status := task.Execution.Status
+			showReturned := (status != "returned" && status != "succeeded") || inReview
+			label, color := herdrExecutionLabel(status, t)
+			icon := herdrExecutionIcon(status)
+			if showReturned && label != "" && icon != nil {
+				ui.Icon(c, icon).Size(14, 14).TextColor(color).
+					Label("Herdr 执行状态：" + label).
+					Tooltip("Herdr 执行状态：" + label)
+			}
+		}
+		ui.Spacer(c)
+		if task.Execution != nil && task.Execution.Channel() == executor.RuntimeCodex &&
+			strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") &&
+			strings.TrimSpace(task.Execution.SessionID) != "herdr:" {
+			button := ui.ButtonBase(c.Key(task.ID+"-herdr-open")).
+				Size(t.Space(6), t.Space(6)).Padding(0).Gap(0).Radius(t.Radius + 2).
+				BorderWidth(0).Center().
+				Label("打开 Herdr 中的 Codex 对话").Tooltip("打开 Herdr 中的 Codex 对话")
+			ink, face := t.TextMuted, ui.Transparent
+			switch {
+			case button.Pressed():
+				ink, face = t.Text, t.SurfacePressed
+			case button.Hovered():
+				ink, face = t.Text, t.Text.Alpha(0.10)
+			}
+			button.Background(face).TextColor(ink)
+			button.Children(func() { ui.Icon(c, herdrConversation).Size(16, 16) })
+			if button.Clicked() {
+				openExecution = true
+				b.openTaskExecution(task)
+			}
+		}
+		if inReview {
+			b.reviewCheckButton(c, t, card, task, &approve)
+		}
+	}
 	card.Children(func() {
-		// Title row + optional ✓ in-flow (not Overlay). Overlay sat outside the
-		// card's hit target, so hovering the icon dropped card.Hovered(), tore
-		// the icon down, and flickered — clicks never stuck.
-		// Title body. In title-only mode the ✓ must NOT sit in-flow: its 28×28
-		// chip was stretching 评审 cards taller than other columns. Overlay it.
+		// Title body. Interactive controls live in the card footer so they stay
+		// together and away from the title and project name.
 		titleOnly := b.prefs.TitleOnlyCards
 		// A stacked board shows cards whole: a line of title or body wraps
 		// as far as it goes instead of being cut at two lines, so a row is
@@ -1017,26 +1531,62 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		if whole {
 			titleLines, bodyLines = 0, 0
 		}
+		// 全部项目 names the card's project. Full cards and the horizontal
+		// board put that name under the title. A stacked title-only row
+		// keeps the name on the title's own line, right after the title's
+		// words, so the name does not add a second line and the row stays
+		// as tall as the title.
+		projectInline := titleOnly && whole && projectName != ""
 		ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
 			// Title-only 评审 cards carry ✓ as a card overlay; reserve its
 			// zone in the resting layout too, so hover never re-truncates
 			// the line under the reader. s4 covers the chip (s1 inset + 24)
 			// less the card padding the title already stops at.
 			titleCol := ui.Column(c).Grow(1).Gap(t.Space(2))
-			if inReview && titleOnly {
-				titleCol = titleCol.MarginEnd(t.Space(4))
-			}
 			titleCol.Children(func() {
-				title := ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
-					FillWidth().Tooltip(task.Title)
-				if titleLines > 0 {
-					title = title.MaxLines(titleLines).Ellipsis("…")
-				}
-				if b.cur == curGlobal {
-					if name := b.projectNameByID(task.ProjectID); name != "" {
-						ui.Text(c, name).FontSize(fxs(t)).TextColor(t.TextMuted).
-							MaxLines(1).Ellipsis("…").Label("所属项目 " + name)
+				drawTitle := func() {
+					title := ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
+						Tooltip(task.Title)
+					if !projectInline {
+						title = title.FillWidth()
 					}
+					if titleLines > 0 {
+						title = title.MaxLines(titleLines).Ellipsis("…")
+					}
+				}
+				drawProject := func() {
+					if projectName == "" {
+						return
+					}
+					ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+						// A 6×6 dot wears the project's color so the name's
+						// owner reads at a glance even in a dense global view.
+						if projectColorSet {
+							ui.Box(c).Key(task.ID+"-dot").
+								Size(t.Space(1.5), t.Space(1.5)).Radius(t.Space(1.5) / 2).
+								Background(projectColor).
+								Label("所属项目 " + projectName)
+						}
+						ui.Text(c, projectName).FontSize(fxs(t)).TextColor(t.TextMuted).
+							MaxLines(1).Ellipsis("…").Label("所属项目 " + projectName)
+					})
+				}
+				if projectInline {
+					// One paragraph: the name follows the title's words and
+					// wraps with them, instead of standing on a line of
+					// its own or being pushed to the row's right end.
+					ui.RichText(c).FillWidth().FontSize(t.FontSize).FontWeight(500).
+						Children(func() {
+							ui.Text(c, task.Title).Tooltip(task.Title)
+							// The name reads as its own thing to assistive
+							// technology, as it did on its own line.
+							ui.Text(c, "  "+projectName).FontSize(fxs(t)).FontWeight(400).
+								TextColor(t.TextMuted).Role(ui.RoleGroup).
+								Label("所属项目 " + projectName)
+						})
+				} else {
+					drawTitle()
+					drawProject()
 				}
 				// Title-only mode keeps the title alone so denser columns fit more cards.
 				if !titleOnly {
@@ -1065,30 +1615,38 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 						if b.savingID == task.ID && (b.detail == nil || b.detail.id != task.ID) {
 							loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
 						}
+						drawCardFooterControls()
 					})
 				}
 			})
-			// Full cards: ✓ stays in-flow beside the title stack.
-			if inReview && !titleOnly {
-				b.reviewCheckButton(c, t, card, task, &approve)
-			}
 		})
-		// Title-only: ✓ overlays the card corner so height matches other columns.
-		if inReview && titleOnly {
-			b.reviewCheckButtonOverlay(c, t, card, task, &approve)
+		if titleOnly {
+			hasFooter := inReview || (task.Execution != nil && strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:"))
+			if hasFooter {
+				ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(drawCardFooterControls)
+			}
 		}
 	})
 	b.bounds[task.ID] = card.Bounds()
 
-	if card.Clicked() && !approve {
+	if card.Clicked() && !approve && !openExecution {
 		b.openDetail(*task)
 	}
 	return card
 }
 
+func (b *board) openTaskExecution(task *model.Task) {
+	project, ok := b.projectByID(task.ProjectID)
+	if !ok {
+		b.toast("无法打开 Codex 对话", "找不到任务所属项目")
+	} else if err := openCodexSession(project.WorkspacePath, task.Execution.SessionID); err != nil {
+		b.toast("无法打开 Codex 对话", err.Error())
+	}
+}
+
 // reviewCheckButton is the in-flow ✓ chip for full (non–title-only) cards.
 func (b *board) reviewCheckButton(c *ui.Context, t *ui.Theme, card ui.Element, task *model.Task, approve *bool) {
-	chipSize := float32(24)
+	chipSize := t.Space(6)
 	// ButtonBase + Center: themed Button keeps horizontal padding that
 	// pulls the Lucide check toward the top-left of a square chip.
 	check := ui.ButtonBase(c.Key(task.ID+"-approve")).
@@ -1119,53 +1677,7 @@ func (b *board) reviewCheckButton(c *ui.Context, t *ui.Theme, card ui.Element, t
 	}
 	if check.Clicked() {
 		*approve = true
-		if done := b.columnID("完成"); done != "" {
-			b.moveTask(task.ID, done, "", true)
-		}
-	}
-}
-
-// reviewCheckButtonOverlay pins ✓ just inside the card's right edge,
-// centered on the card's middle so it lines up with the title row of
-// title-only 评审 cards (in-flow was the stretch that made them taller
-// than other columns).
-//
-// Attach's second anchor is the chip's own point: AnchorRight pins the
-// chip's right edge to the card's, and Right(s1) draws it in from there.
-// AnchorCenter — what LOCAL-32 first shipped — pins the chip's center to
-// the card's edge, leaving half the chip hanging outside over the column
-// gap, which is the defect this issue reports.
-func (b *board) reviewCheckButtonOverlay(c *ui.Context, t *ui.Theme, card ui.Element, task *model.Task, approve *bool) {
-	chipSize := float32(24)
-	check := ui.ButtonBase(c.Key(task.ID+"-approve")).
-		Label("验收通过，移到完成").
-		Absolute().Attach(ui.AnchorRight, ui.AnchorRight).Right(t.Space(1)).
-		Size(chipSize, chipSize).Padding(0).Gap(0).BorderWidth(0).
-		Radius(t.Radius + 2).Center().
-		Children(func() {
-			ui.Icon(c, approveCheck).Size(16, 16).Margin(1, 0, 0, 1)
-		})
-	show := card.Hovered() || check.Hovered() || check.Pressed()
-	ink := t.TextMuted
-	chip := ui.Transparent
-	switch {
-	case check.Pressed():
-		ink = t.Text
-		chip = t.SurfacePressed
-	case check.Hovered():
-		ink = t.Text
-		chip = t.Text.Alpha(0.10)
-	case show:
-		ink = t.TextMuted
-		chip = ui.Transparent
-	}
-	check.Background(chip).TextColor(ink)
-	if !show {
-		check.Opacity(0).PassThrough()
-	}
-	if check.Clicked() {
-		*approve = true
-		if done := b.columnID("完成"); done != "" {
+		if done := b.columnIDByRole(model.ColumnRoleDone); done != "" {
 			b.moveTask(task.ID, done, "", true)
 		}
 	}
@@ -1176,251 +1688,512 @@ func (b *board) reviewCheckButtonOverlay(c *ui.Context, t *ui.Theme, card ui.Ele
 func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 	d := b.detail
 	open := d.open
-	w, h := c.Size()
-	ui.Modal(c, &open, func() {
-		ui.Column(c).Width(t.Space(130)).MaxWidth(w - t.Space(20)).Gap(t.Space(4)).Children(func() {
-			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "任务详情").FontSize(fmd(t)).FontWeight(600)
-				ui.Spacer(c)
-				if ui.Button(c, "关闭").Label("关闭详情").Clicked() {
-					open = false
-				}
-			})
-			ui.Scroll(c).FillWidth().MaxHeight(max(h-t.Space(56), t.Space(30))).Children(func() {
-				ui.Column(c).FillWidth().Gap(t.Space(4)).Children(func() {
-					if d.pushed != nil && d.dirty() {
-						ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-							ui.Text(c, fmt.Sprintf("该任务已被 %s 更新到 v%d，你的编辑尚未保存。",
-								agentName(d.pushBy), d.pushed.Version)).
-								FontSize(fsm(t)).TextColor(t.Warning)
-						})
-					}
-
-					// Title / body stay as TextInput / TextArea always (borderless,
-					// transparent). Swapping Text ↔ input on hover shifted layout
-					// because the widgets disagree on intrinsic padding.
-					//
-					// Unfilled title/body fields align directly with the sheet header.
-					ui.TextInput(c, &d.title).Label("任务标题").Placeholder("任务标题").
-						FillWidth().FontSize(fmd(t)).FontWeight(500).
-						BorderWidth(0).Background(ui.Transparent).
-						Padding(0, 0)
-					d.editTitle = false
-
-					bodyInput := ui.TextArea(c, &d.body).Label("任务正文").Placeholder("添加任务描述，可粘贴图片…").
-						FillWidth().MinHeight(t.Space(30)).
-						BorderWidth(0).Background(ui.Transparent).
-						Padding(0, 0)
-					b.imageInput(bodyInput, d, &d.body, &d.bodyImage, mygo.Clipboard.ReadImage)
-					b.imagePreview(c.Key("body-preview"), &d.body, &d.bodyImage, "正文")
-					d.editBody = false
-
-					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(t.Space(3)).Children(func() {
-						names := b.columnNames()
-						if d.column == "" {
-							if t := b.task(d.id); t != nil {
-								d.column = b.columnName(t.ColumnID)
-							} else {
-								d.column = names[0]
-							}
-						}
-						// Keep the complete rounded border inside the scroll viewport.
-						if ui.Select(c, &d.column, names).Label("移动到列").Changed() {
-							if colID := b.columnID(d.column); colID != "" {
-								b.moveTask(d.id, colID, "", false)
-							}
-						}
-						ui.Text(c, provenance(&d.snap)).FontSize(fxs(t)).TextColor(t.TextMuted).
-							MaxLines(1).Ellipsis("…").Tooltip(provenance(&d.snap)).Grow(1).TextAlign(ui.End)
-					})
-
-					// Comments: section label + Gap only (no hairline divider).
-					ui.Row(c).FillWidth().Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "评论").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
-						if n := len(d.comments); n > 0 {
-							ui.Text(c, strconv.Itoa(n)).FontSize(fxs(t)).TextColor(t.TextMuted).
-								Label(strconv.Itoa(n) + " 条评论")
-						}
-						ui.Spacer(c)
-						if d.loading {
-							loading.LinearDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入评论")
-						}
-					})
-					if len(d.comments) == 0 && !d.loading {
-						ui.Text(c, "还没有评论").FontSize(fsm(t)).TextColor(t.TextMuted)
-					}
-					if len(d.comments) > 0 {
-						ui.Column(c).FillWidth().Gap(t.Space(2)).Children(func() {
-							for i := range d.comments {
-								cm := &d.comments[i]
-								// Align the surface with the sheet; inset its content equally.
-								ui.Box(c.Key("c-"+cm.ID)).FillWidth().
-									Padding(t.Space(2.5), t.Space(3)).Gap(t.Space(1.5)).
-									Radius(t.Radius + 2).BorderWidth(0).
-									Background(t.SurfaceHover.Alpha(0.55)).Children(func() {
-									ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-										ui.Avatar(c, cm.Author, nil).Size(20, 20)
-										ui.Text(c, cm.Author).FontSize(fsm(t)).FontWeight(600).
-											Grow(1).MaxLines(1).Ellipsis("…").Tooltip(cm.Author)
-										ui.Text(c, cm.CreatedAt.Format("01-02 15:04")).
-											FontSize(fxs(t)).TextColor(t.TextMuted)
-									})
-									b.detailMarkdown(c, cm.Text)
-								})
-							}
-						})
-					}
-				})
-			})
-			// The outer surface supplies equal insets; the input adds none.
-			ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5)).Gap(t.Space(2)).
-				Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4)).
-				Children(func() {
+	pane := ui.Column(c).Key("task-detail").Fill().Gap(t.Space(4)).Padding(t.Space(5), t.Space(6)).
+		Background(t.Background)
+	pane.Children(func() {
+		ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "任务详情").FontSize(fmd(t)).FontWeight(600)
+			ui.Spacer(c)
+			if b.saving && b.savingID == d.id {
+				loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
+			}
+			if ui.Button(c, "关闭").Label("关闭详情").Clicked() {
+				open = false
+			}
+		})
+		// The content is the sheet's one flexible row: it takes what
+		// the fixed header and comment composer leave, and scrolls
+		// what does not fit. A height computed from the window alone
+		// ignored those rows, so on a short window the sheet overflowed.
+		ui.Scroll(c).FillWidth().Grow(1).Children(func() {
+			// A scroll container lays its content out with an unbounded
+			// main size, so every row keeps its own height and the
+			// viewport scrolls it: nothing is squashed into anything
+			// else when the sheet is capped by a short window.
+			ui.Column(c).FillWidth().Gap(t.Space(4)).Children(func() {
+				if d.pushed != nil && d.dirty() {
 					ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-						input := ui.TextArea(c, &d.comment).Placeholder("写评论或粘贴图片，回车发送").Label("写评论").
-							Lines(1, 4).MinHeight(0).Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent).
-							Padding(0, 0)
-						b.imageInput(input, d, &d.comment, &d.commentImage, mygo.Clipboard.ReadImage)
-						input.OnTextKey(func(key ui.TextKey) bool {
-							if key.Key != ui.KeyEnter || key.Mods&ui.Shift != 0 {
-								return false
-							}
-							d.comment = key.Text()
-							b.sendComment()
-							key.SetText(d.comment)
-							return true
-						})
-						if b.commenting {
-							loading.BouncingDots(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在发送评论")
+						ui.Text(c, fmt.Sprintf("该任务已被 %s 更新到 v%d，你的编辑尚未保存。",
+							agentName(d.pushBy), d.pushed.Version)).
+							FontSize(fsm(t)).TextColor(t.Warning)
+					})
+				}
+
+				// Title stays directly editable. The body reads as Markdown so an
+				// image appears in place of its source; clicking the body opens
+				// its source editor without a separate edit control.
+				ui.TextInput(c, &d.title).Label("任务标题").Placeholder("任务标题").
+					FillWidth().FontSize(fmd(t)).FontWeight(500).
+					BorderWidth(0).Background(ui.Transparent).
+					Padding(0, 0)
+				d.editTitle = false
+				ui.Text(c, "任务正文").FontSize(fsm(t)).TextColor(t.TextMuted)
+				if d.editBody {
+					bodyInput := ui.TextArea(c, &d.body).Label("正文编辑器").Placeholder("添加任务描述，可粘贴图片…").
+						FillWidth().MinHeight(detailBodyMinHeight(d.body, t)).
+						BorderWidth(0).Background(ui.Transparent).
+						Padding(0, 0)
+					if localImageMarkdown.MatchString(d.body) {
+						// TextArea defaults to three lines even when MinHeight is
+						// smaller. Start image-bearing descriptions at one line and
+						// let the outer detail scroll hold the full body.
+						bodyInput.Lines(1, 1000)
+					} else {
+						bodyInput.Lines(0, 0)
+					}
+					// A fresh TextArea reveals its caret, placed at the end;
+					// move it to the head once so a long description opens
+					// showing its first line instead of its tail.
+					if d.bodyTop {
+						bodyInput.SetTextSelection(0, 0)
+						d.bodyTop = false
+					}
+					b.imageInput(bodyInput, d, &d.body, &d.bodyImage, mygo.Clipboard.ReadImage)
+					b.imageRemoveControls(c, &d.body, &d.bodyImage, "正文")
+				} else {
+					body := ui.Box(c.Key("detail-body")).FillWidth().MinHeight(t.Space(8))
+					body.Children(func() {
+						if strings.TrimSpace(d.body) == "" {
+							ui.Text(c, "添加任务描述，可粘贴图片…").FontSize(fsm(t)).TextColor(t.TextMuted)
+						} else {
+							b.detailMarkdown(c, d.body)
 						}
-						send := ui.Button(c, "发送").Label("发送评论").
-							Padding(t.Space(1.5), t.Space(2.5)).BorderWidth(0).
-							Disabled(b.commenting || d.commentImage.busy() || strings.TrimSpace(d.comment) == "")
-						if input.Submitted() || send.Clicked() {
-							b.sendComment()
+						edit := ui.ButtonBase(c.Key("detail-body-edit")).Absolute().Fill().
+							Padding(0).BorderWidth(0).Background(ui.Transparent).
+							Focusable().Cursor(ui.CursorPointer).Label("编辑任务正文")
+						if edit.Clicked() {
+							d.editBody = true
+							d.bodyTop = true
 						}
 					})
-					ui.Scroll(c).FillWidth().MaxHeight(t.Space(40)).Children(func() {
-						b.imagePreview(c.Key("comment-preview"), &d.comment, &d.commentImage, "评论")
-					})
+				}
+
+				ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(t.Space(3)).Children(func() {
+					names := b.columnNames()
+					currentTask := b.task(d.id)
+					if d.column == "" {
+						if currentTask != nil {
+							d.column = b.columnName(currentTask.ColumnID)
+						} else {
+							d.column = names[0]
+						}
+					}
+					// Keep the complete rounded border inside the scroll viewport.
+					if ui.Select(c, &d.column, names).Label("移动到列").Changed() {
+						if colID := b.columnID(d.column); colID != "" {
+							b.moveTask(d.id, colID, "", false)
+						}
+					}
+					if currentTask != nil && b.columnHasRole(currentTask.ColumnID, model.ColumnRoleReview) &&
+						ui.PrimaryButton(c, "完成").Label("结束任务").Clicked() {
+						if done := b.columnIDByRole(model.ColumnRoleDone); done != "" {
+							b.moveTask(d.id, done, "", true)
+						}
+					}
+					ui.Text(c, provenance(&d.snap)).FontSize(fxs(t)).TextColor(t.TextMuted).
+						MaxLines(1).Ellipsis("…").Tooltip(provenance(&d.snap)).Grow(1).TextAlign(ui.End)
 				})
 
-			// Archive / save footer: Gap only, no hairline divider.
-			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-				if ui.Button(c, "归档").Label("归档任务").Cursor(ui.CursorPointer).
-					TextColor(t.Danger).Clicked() {
-					b.archiveTask(d.id)
+				// Comments: section label + Gap only (no hairline divider).
+				ui.Row(c).FillWidth().Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "评论").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
+					if n := len(d.comments); n > 0 {
+						ui.Text(c, strconv.Itoa(n)).FontSize(fxs(t)).TextColor(t.TextMuted).
+							Label(strconv.Itoa(n) + " 条评论")
+					}
+					ui.Spacer(c)
+					if d.loading {
+						loading.LinearDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入评论")
+					}
+				})
+				if len(d.comments) == 0 && !d.loading {
+					ui.Text(c, "还没有评论").FontSize(fsm(t)).TextColor(t.TextMuted)
 				}
-				if b.archiving {
-					loading.Arc(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在归档任务")
-				}
-				ui.Spacer(c)
-				if b.saving {
-					loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
-				}
-				if ui.PrimaryButton(c, "保存").Label("保存任务").Disabled(b.saving || d.bodyImage.busy() || d.commentImage.busy()).Clicked() {
-					b.saveDetail()
+				if len(d.comments) > 0 {
+					// Comments live in the outer Grow scroll (above the fixed composer).
+					// A nested MaxHeight(h-Space(140)) overestimated remaining room and
+					// clipped the bottom of the list under the composer — same class of
+					// bug the outer sheet already fixed by using Grow instead of window math.
+					ui.Column(c).FillWidth().Gap(t.Space(2)).
+						Padding(0, 0, t.Space(2), 0).Children(func() {
+						b.commentThreads(c, t, d)
+					})
 				}
 			})
 		})
+		// A trailing @ at a word start is the user addressing an agent. It
+		// never lands in the text: the address is stored as a field, so prose
+		// (an email, a quoted @) can never route work.
+		if !d.mentionOpen && justTypedMention(d.comment) {
+			d.comment = strings.TrimSuffix(d.comment, "@")
+			d.mentionOpen = true
+			d.mentionIndex = 0
+		}
+		// The outer surface supplies equal insets; the input adds none.
+		composer := ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5)).Gap(t.Space(2)).
+			Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4))
+		b.mentionMenu(c, t, d, composer)
+		composer.
+			Children(func() {
+				ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+					if d.commentParentID != "" {
+						if ui.Button(c.Key("reply-target-chip"), "回复 @"+d.commentParentAuthor+" ×").
+							Label("取消回复目标").Tooltip("正在回复 @"+d.commentParentAuthor+"；点击取消").
+							FontSize(fxs(t)).Padding(t.Space(0.5), t.Space(1)).
+							BorderWidth(0).Radius(t.Space(2)).
+							Background(t.Accent.Alpha(0.16)).TextColor(t.Accent).Clicked() {
+							d.commentParentID, d.commentParentAuthor = "", ""
+						}
+					}
+					if d.commentMention != "" {
+						if ui.Button(c.Key("mention-chip"), "@"+runtimeLabel(d.commentMention)).
+							Label("取消提醒 "+runtimeLabel(d.commentMention)).
+							Tooltip("发送后交给 "+runtimeLabel(d.commentMention)+"；点击取消").
+							FontSize(fxs(t)).Padding(t.Space(0.5), t.Space(1)).
+							BorderWidth(0).Radius(t.Space(2)).
+							Background(t.Accent.Alpha(0.16)).TextColor(t.Accent).Clicked() {
+							d.commentMention = ""
+						}
+					}
+					autoFollowup := taskHasReturnedSession(d.snap)
+					originalRuntime := ""
+					if d.snap.Execution != nil {
+						originalRuntime = d.snap.Execution.Channel()
+					}
+					input := ui.TextArea(c, &d.comment).Placeholder(commentPlaceholder(d.commentMention, autoFollowup, originalRuntime)).Label("写评论").
+						Lines(1, 4).MinHeight(0).Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent).
+						Padding(0, 0)
+					// Read here, as the field is built: an element cannot be
+					// read again from the key handler, which runs later.
+					if start, end := input.TextSelection(); start == 0 && end == 0 {
+						d.commentCaretStart = true
+					} else {
+						d.commentCaretStart = false
+					}
+					if d.commentFocus > 0 {
+						// Focus the frame the button vanishes, not just after: a
+						// disappearing node otherwise hands the keys elsewhere.
+						input.Focus()
+						d.commentFocus--
+					}
+					b.imageInput(input, d, &d.comment, &d.commentImage, mygo.Clipboard.ReadImage)
+					input.OnTextKey(func(key ui.TextKey) bool {
+						if d.mentionOpen && key.Mods == 0 {
+							channels := executor.Runtimes()
+							switch key.Key {
+							case ui.KeyDown:
+								d.mentionIndex = (d.mentionIndex + 1) % len(channels)
+								return true
+							case ui.KeyUp:
+								d.mentionIndex = (d.mentionIndex + len(channels) - 1) % len(channels)
+								return true
+							case ui.KeyEnter:
+								if len(channels) > 0 {
+									index := d.mentionIndex
+									if index < 0 || index >= len(channels) {
+										index = 0
+									}
+									b.selectMentionChannel(d, channels[index].ID)
+								}
+								return true
+							}
+						}
+						// The address sits before the draft, so Backspace with
+						// the caret at the start deletes the address, as a
+						// token in a chat composer does, and leaves the text.
+						if key.Key == ui.KeyBackspace && d.commentCaretStart && d.commentMention != "" && key.Mods == 0 {
+							d.commentMention = ""
+							key.SetText(key.Text())
+							return true
+						}
+						if key.Key != ui.KeyEnter || key.Mods&ui.Shift != 0 {
+							return false
+						}
+						d.comment = key.Text()
+						b.sendComment()
+						key.SetText(d.comment)
+						return true
+					})
+					if b.commenting {
+						loading.BouncingDots(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在发送评论")
+					}
+					if input.Submitted() {
+						b.sendComment()
+					}
+				})
+				ui.Scroll(c).FillWidth().MaxHeight(t.Space(40)).Children(func() {
+					b.imagePreview(c.Key("comment-preview"), &d.comment, &d.commentImage, "评论")
+				})
+			})
 	})
-	if !open {
+	if pane.OverlayShortcut(0, ui.KeyEscape) {
+		open = false
+	}
+	if b.detail != d {
+		return // Saving can dismiss this detail while its view is being built.
+	}
+	if !open && d.dirty() {
+		// Closing the detail sheet commits title/body edits. This keeps the
+		// composer as the only bottom control without dropping task edits.
+		d.open = true
+		b.saveDetail()
+		return
+	}
+	if !open || !d.open {
 		b.detail = nil
 		return
 	}
 	d.open = open
 }
 
-// searchView is an immersive centered search overlay (same spirit as
-// taskComposeImmersive): large input + matching tasks listed underneath.
+// searchView uses one surface for the input and matching tasks.
 // Esc / backdrop / 关闭 clears the query and closes.
-func (b *board) searchView(c *ui.Context, t *ui.Theme) {
-	open := b.searchOpen
-	ui.Modal(c, &open, func() {
-		ui.Column(c).Width(t.Space(140)).Gap(t.Space(3)).
-			AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "搜索任务").FontSize(fsm(t)).TextColor(t.TextMuted)
-			shell := ui.Column(c).FillWidth().
-				Padding(t.Space(4), t.Space(4)).
-				Gap(t.Space(2.5)).
-				Radius(t.Radius + 10).
-				Background(t.Surface).
-				BorderWidth(0)
-			shell.Children(func() {
-				ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-					ui.Icon(c, searchGlass).Size(20, 20).TextColor(t.TextMuted)
-					ui.TextInput(c, &b.searchQuery).Label("搜索任务").
-						Placeholder("搜索任务…").
-						Grow(1).
-						MinHeight(t.Space(12)).
-						Padding(t.Space(1), t.Space(1)).
-						BorderWidth(0).
-						Background(ui.Transparent).
-						FontSize(flg(t)).
-						AutoFocus()
-					if ui.Button(c, "关闭").Label("关闭搜索").
-						Padding(t.Space(1), t.Space(2)).BorderWidth(0).
-						TextColor(t.TextMuted).Clicked() {
-						open = false
+func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
+	children := make(map[string][]model.Comment)
+	var roots []model.Comment
+	for _, cm := range d.comments {
+		if cm.ParentCommentID == "" {
+			roots = append(roots, cm)
+		} else {
+			children[cm.ParentCommentID] = append(children[cm.ParentCommentID], cm)
+		}
+	}
+	var render func(model.Comment, int)
+	render = func(cm model.Comment, depth int) {
+		indent := min(depth, 5) * 3
+		ui.Box(c.Key("c-"+cm.ID)).FillWidth().
+			Padding(t.Space(2.5), t.Space(3)+t.Space(float32(indent))).Gap(t.Space(1.5)).
+			Radius(t.Radius + 2).BorderWidth(0).
+			Background(t.SurfaceHover.Alpha(0.55)).Children(func() {
+			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+				ui.Avatar(c, cm.Author, nil).Size(20, 20)
+				ui.Text(c, cm.Author).FontSize(fsm(t)).FontWeight(600).
+					MaxLines(1).Ellipsis("…").Tooltip(cm.Author)
+				if cm.ParentCommentID != "" {
+					parentAuthor := "评论"
+					for _, parent := range d.comments {
+						if parent.ID == cm.ParentCommentID {
+							parentAuthor = parent.Author
+							break
+						}
 					}
-				})
-				hits := b.searchHits()
-				if strings.TrimSpace(b.searchQuery) == "" {
-					ui.Text(c, "输入标题或描述中的关键词").
-						FontSize(fsm(t)).TextColor(t.TextMuted)
-				} else if len(hits) == 0 {
-					ui.Text(c, "没有匹配的任务").
-						FontSize(fsm(t)).TextColor(t.TextMuted)
-				} else {
-					ui.Scroll(c).FillWidth().MaxHeight(t.Space(80)).Children(func() {
-						ui.Column(c).FillWidth().Gap(t.Space(1)).Children(func() {
-							for _, hit := range hits {
-								hit := hit
-								row := ui.Button(c.Key("search-hit-"+hit.ID), "").
-									FillWidth().Radius(t.Radius).
-									Padding(t.Space(2), t.Space(2.5)).
-									BorderWidth(0).
-									TextAlign(ui.Start).Justify(ui.Start).
-									Label("打开任务 " + hit.Title)
-								face := ui.Transparent
-								switch {
-								case row.Pressed():
-									face = t.SurfacePressed
-								case row.Hovered():
-									face = t.SurfaceHover
-								}
-								row.Background(face)
-								row.Children(func() {
-									ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
-										ui.Text(c, hit.Title).FontSize(t.FontSize).FontWeight(500).
-											TextColor(t.Text).FillWidth().MaxLines(1).Ellipsis("…")
-										meta := b.columnName(hit.ColumnID)
-										if snip := firstLines(hit.Description, 1); snip != "" {
-											if meta != "" {
-												meta = meta + " · " + snip
-											} else {
-												meta = snip
-											}
-										}
-										if meta != "" {
-											ui.Text(c, meta).FontSize(fxs(t)).TextColor(t.TextMuted).
-												FillWidth().MaxLines(1).Ellipsis("…")
-										}
-									})
-								})
-								if row.Clicked() {
-									b.openDetail(hit)
-									open = false
-								}
-							}
-						})
+					ui.Text(c, "回复 @"+parentAuthor).FontSize(fxs(t)).TextColor(t.TextMuted).
+						MaxLines(1).Ellipsis("…").Tooltip("回复 @" + parentAuthor)
+				}
+				if cm.Mention != "" {
+					ui.Text(c, "@"+runtimeLabel(cm.Mention)).FontSize(fxs(t)).
+						TextColor(t.Accent).MaxLines(1).Ellipsis("…").
+						Tooltip("这条评论指定由 " + runtimeLabel(cm.Mention) + " 处理")
+				}
+				ui.Spacer(c)
+				ui.Text(c, commentTimestamp(cm.CreatedAt)).
+					FontSize(fxs(t)).TextColor(t.TextMuted)
+				if ui.Button(c.Key("reply-comment-"+cm.ID), "回复").Label("回复评论").
+					Tooltip("回复这条评论").Clicked() {
+					b.beginCommentReply(cm)
+				}
+				if cm.Author == b.agent {
+					more := ui.ButtonBase(c.Key("comment-more-"+cm.ID)).
+						Label("更多评论操作").Tooltip("更多评论操作").
+						Padding(t.Space(1), t.Space(1)).BorderWidth(0).Radius(t.Radius).
+						Disabled(b.commenting)
+					more.Menu(func(m *ui.Menu) {
+						if m.Item("编辑").Chosen() {
+							b.beginCommentEdit(cm)
+						}
+						if m.Item("删除").Chosen() {
+							copy := cm
+							b.confirmDeleteComment = &copy
+						}
+					})
+					face := ui.Transparent
+					if more.Pressed() {
+						face = t.SurfacePressed
+					} else if more.Hovered() {
+						face = t.SurfaceHover
+					}
+					more.Background(face).Children(func() {
+						ui.Icon(c, commentMore).Size(14, 14).TextColor(t.TextMuted)
 					})
 				}
 			})
+			if d.commentEditID == cm.ID {
+				ui.TextArea(c, &d.commentEditText).Label("编辑评论内容").FillWidth().MinHeight(t.Space(12))
+				ui.Row(c).Gap(t.Space(2)).Children(func() {
+					if ui.Button(c.Key("save-comment-"+cm.ID), "保存").Disabled(b.commenting).Clicked() {
+						b.saveCommentEdit()
+					}
+					if ui.Button(c.Key("cancel-comment-"+cm.ID), "取消").Disabled(b.commenting).Clicked() {
+						d.commentEditID, d.commentEditText = "", ""
+					}
+				})
+			} else {
+				b.detailMarkdown(c, cm.Text)
+			}
+			if cm.Author == b.agent && cm.Mention == "" && ui.Button(c.Key("continue-"+cm.ID), "让 AI 跟进").Label("跟进评论："+cm.ID).
+				Tooltip("把这条评论交回任务的原始 AI 会话").Disabled(b.commenting).Clicked() {
+				b.continueComment(d.id, cm.ID)
+			}
+		})
+		replies := children[cm.ID]
+		for i := len(replies) - 1; i >= 0; i-- {
+			render(replies[i], depth+1)
+		}
+	}
+	for i := len(roots) - 1; i >= 0; i-- {
+		render(roots[i], 0)
+	}
+}
+
+func (b *board) searchView(c *ui.Context, t *ui.Theme) {
+	open := b.searchOpen
+	ui.DialogBase(c, &open, func(back, panel ui.Element) {
+		w, h := c.Size()
+		textInset := t.Space(4) + 18 + t.Space(2.5)
+		back.Background(ui.RGBA(0, 0, 0, 0.4))
+		// DialogBase supplies focus trapping and dismissal without Modal's
+		// extra background and padding around the search surface.
+		panel.Width(t.Space(140)).MaxWidth(w-t.Space(10)).
+			Padding(0).Gap(0).Radius(t.Space(4)).
+			Background(t.Surface).BorderWidth(0).
+			Shadow(0, 12, 36, 0, ui.RGBA(0, 0, 0, 0.24)).Label("任务搜索面板")
+		ui.Column(c).FillWidth().Gap(0).Children(func() {
+			ui.Row(c).FillWidth().Gap(t.Space(2.5)).Padding(t.Space(3), t.Space(4)).AlignItems(ui.Center).Children(func() {
+				ui.Icon(c, searchGlass).Size(18, 18).TextColor(t.TextMuted)
+				ui.TextInput(c, &b.searchQuery).Label("搜索任务").
+					Placeholder("搜索任务…").
+					Grow(1).
+					MinHeight(t.Space(9)).
+					Padding(t.Space(1), 0).
+					BorderWidth(0).
+					Background(ui.Transparent).
+					FontSize(t.FontSize + 5).
+					AutoFocus().
+					OnTextKey(func(key ui.TextKey) bool {
+						if key.Mods != 0 {
+							return false
+						}
+						hits := b.searchHits()
+						switch key.Key {
+						case ui.KeyDown, ui.KeyUp:
+							if len(hits) == 0 {
+								return true
+							}
+							if b.searchSelectionQuery != b.searchQuery {
+								b.searchSelectionQuery = b.searchQuery
+								b.searchSelection = -1
+							}
+							if key.Key == ui.KeyDown {
+								b.searchSelection = (b.searchSelection + 1) % len(hits)
+							} else if b.searchSelection < 0 {
+								b.searchSelection = len(hits) - 1
+							} else {
+								b.searchSelection = (b.searchSelection + len(hits) - 1) % len(hits)
+							}
+							return true
+						case ui.KeyEnter:
+							if b.searchSelection >= 0 && b.searchSelection < len(hits) {
+								b.openDetail(hits[b.searchSelection])
+								open = false
+								b.searchOpen = false
+								b.searchQuery = ""
+								b.searchSelection = -1
+								b.searchSelectionQuery = ""
+								return true
+							}
+						}
+						return false
+					})
+				close := ui.Button(c, "关闭").Label("关闭搜索").
+					MinHeight(t.Space(8)).Padding(t.Space(1), t.Space(2)).
+					Radius(t.Space(2)).BorderWidth(0).
+					FontSize(fxs(t)).TextColor(t.TextMuted)
+				closeFace := ui.Transparent
+				switch {
+				case close.Pressed():
+					closeFace = t.SurfacePressed
+				case close.Hovered():
+					closeFace = t.SurfaceHover
+				}
+				close.Background(closeFace)
+				if close.Clicked() {
+					open = false
+				}
+			})
+			ui.Divider(c).FillWidth().Background(t.Border.Alpha(0.5))
+			hits := b.searchHits()
+			if b.searchSelectionQuery != b.searchQuery {
+				b.searchSelectionQuery = b.searchQuery
+				b.searchSelection = -1
+			}
+			if b.searchSelection >= len(hits) {
+				b.searchSelection = -1
+			}
+			if len(hits) == 0 || strings.TrimSpace(b.searchQuery) == "" {
+				message := "没有匹配的任务"
+				if strings.TrimSpace(b.searchQuery) == "" {
+					message = "输入标题或描述中的关键词"
+				}
+				ui.Text(c, message).
+					FillWidth().Padding(t.Space(5), t.Space(4), t.Space(5), textInset).
+					FontSize(fsm(t)).TextColor(t.TextMuted)
+			} else {
+				ui.Scroll(c).FillWidth().MaxHeight(min(t.Space(80), h-t.Space(40))).Children(func() {
+					ui.Column(c).FillWidth().Padding(t.Space(2)).Gap(t.Space(0.5)).Children(func() {
+						for i, hit := range hits {
+							hit := hit
+							// Align result text with the input, leaving its icon gutter clear.
+							row := ui.Button(c.Key("search-hit-"+hit.ID), "").
+								FillWidth().Radius(t.Radius).
+								Padding(t.Space(2.5), t.Space(3), t.Space(2.5), textInset-t.Space(2)).
+								BorderWidth(0).
+								TextAlign(ui.Start).Justify(ui.Start).
+								Label("打开任务 " + hit.Title)
+							face := ui.Transparent
+							switch {
+							case row.Pressed():
+								face = t.SurfacePressed
+							case i == b.searchSelection:
+								face = t.Selection
+							case row.Hovered():
+								face = t.SurfaceHover
+							}
+							row.Background(face)
+							if i == b.searchSelection {
+								row.ScrollIntoView()
+							}
+							row.Children(func() {
+								ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
+									ui.Text(c, hit.Title).FontSize(t.FontSize + 1).FontWeight(500).
+										TextColor(t.Text).FillWidth().MaxLines(1).Ellipsis("…")
+									meta := b.columnName(hit.ColumnID)
+									if snip := firstLines(hit.Description, 1); snip != "" {
+										if meta != "" {
+											meta = meta + " · " + snip
+										} else {
+											meta = snip
+										}
+									}
+									if meta != "" {
+										ui.Text(c, meta).FontSize(fxs(t)).TextColor(t.TextMuted).
+											FillWidth().MaxLines(1).Ellipsis("…")
+									}
+								})
+							})
+							if row.Clicked() {
+								b.openDetail(hit)
+								open = false
+							}
+						}
+					})
+				})
+			}
 		})
 	})
 	if !open {
 		b.searchQuery = ""
+		b.searchSelection = -1
+		b.searchSelectionQuery = ""
 		b.searchOpen = false
 		return
 	}
@@ -1439,29 +2212,39 @@ func (b *board) openTaskForm(columnID string) {
 // (used by the sidebar row "+" while another board may be selected).
 func (b *board) openTaskFormIn(projectID, columnID string) {
 	if projectID == "" || projectID == curGlobal {
-		b.toast("无法创建", "请先在侧栏选一个项目，再添加任务。")
-		return
+		projectID = b.prefs.LastTaskProjectID
+		if projectID == "" || b.projectColumnIDByRole(projectID, model.ColumnRoleIntake) == "" {
+			b.toast("无法创建", "请先在侧栏选一个项目，再添加任务。")
+			return
+		}
+		columnID = ""
 	}
 	if columnID == "" {
-		columnID = b.projectColumnID(projectID, "待办")
+		columnID = b.projectColumnIDByRole(projectID, model.ColumnRoleIntake)
 	}
 	if columnID == "" {
 		b.toast("无法创建", "该项目没有可用的列。")
 		return
 	}
 	b.form = &form{open: true, isTask: true, columnID: columnID, projectID: projectID}
+	b.prefs.LastTaskProjectID = projectID
+	_ = saveUIPrefs(b.prefs)
+	// Surfacing is the moment worth hearing: sheet and cue arrive together.
+	// Every entry point (⌘N, the sidebar 新建任务 row, a column "+") lands
+	// here, so the cue tracks the sheet rather than the keystroke that
+	// opened it; the rejected opens above return before any sound.
+	playOpenCue()
 }
 
-// projectColumnID finds a named column on a project (falls back to first).
-func (b *board) projectColumnID(projectID, name string) string {
+// projectColumnIDByRole finds the column playing role on a project (falls
+// back to that project's first column, as the old name lookup did).
+func (b *board) projectColumnIDByRole(projectID, role string) string {
 	for _, p := range b.projects {
 		if p.ID != projectID {
 			continue
 		}
-		for _, c := range p.Columns {
-			if c.Name == name || c.ID == name {
-				return c.ID
-			}
+		if c, ok := p.ColumnByRole(role); ok {
+			return c.ID
 		}
 		if len(p.Columns) > 0 {
 			return p.Columns[0].ID
@@ -1470,9 +2253,9 @@ func (b *board) projectColumnID(projectID, name string) string {
 	return ""
 }
 
-// defaultTaskColumnID prefers 待办, else the first column.
+// defaultTaskColumnID prefers the intake column, else the first column.
 func (b *board) defaultTaskColumnID() string {
-	if id := b.columnID("待办"); id != "" {
+	if id := b.columnIDByRole(model.ColumnRoleIntake); id != "" {
 		return id
 	}
 	if len(b.columns) > 0 {
@@ -1508,6 +2291,18 @@ func (b *board) setAppearance(a appearance) {
 
 // cycleAppearance steps 跟随系统 → 浅色 → 深色 → 跟随系统, as ⌘⇧L does.
 func (b *board) cycleAppearance() { b.setAppearance(b.prefs.Appearance.next()) }
+
+// applyDisplayName saves the 显示名 the settings field carries and hands the
+// new identity to the service client, so writes land under it from the next
+// request on and the board stops reading its own writes as another agent's.
+// A blank name falls back to gui.
+func (b *board) applyDisplayName() {
+	b.agent = b.prefs.windowAgent()
+	if s, ok := b.api.(agentSetter); ok {
+		s.SetAgent(b.agent)
+	}
+	_ = saveUIPrefs(b.prefs)
+}
 
 // appearanceIndex is the appearance in appearanceChoices, for the
 // segmented control, which works in indexes.
@@ -1552,13 +2347,42 @@ func (b *board) settingsView(c *ui.Context, t *ui.Theme) {
 					}
 				}
 			})
-			if ui.Checkbox(c, &b.prefs.TitleOnlyCards, "卡片仅显示标题").
-				Label("卡片仅显示标题").Changed() {
-				_ = saveUIPrefs(b.prefs)
-			}
-			if ui.Checkbox(c, &b.prefs.BoardVertical, "纵向排列状态列").
-				Label("纵向排列状态列").Changed() {
-				_ = saveUIPrefs(b.prefs)
+			// 显示名: the identity every write carries, and what a card's
+			// last-writer line shows. The field is the value, so a blank one
+			// falls back to gui rather than writing as nobody.
+			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "显示名").FontSize(t.FontSize)
+				ui.Spacer(c)
+				if ui.TextInput(c, &b.prefs.DisplayName).
+					Label("显示身份名").
+					Placeholder("未设置时为 " + defaultAgent).
+					Width(t.Space(40)).
+					Changed() {
+					b.applyDisplayName()
+				}
+			})
+			// 全局新建热键: when on, ⌘⇧N opens the create-task sheet even
+			// while the app sits in the background (Carbon global shortcut,
+			// no accessibility permission needed). The toggle registers or
+			// releases the system-wide accelerator at once. A registration
+			// failure (another app owns ⌘⇧N) flips the switch back and
+			// leaves hotkeyErr for this row to render — launch-time
+			// failures arrive before the first frame, when toasts have no
+			// context to attach to, so the error must be readable here.
+			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "全局新建任务 ⌘⇧N").FontSize(t.FontSize)
+				ui.Spacer(c)
+				if ui.Switch(c, &b.prefs.GlobalNewTaskHot).
+					Label("全局热键新建任务").
+					Changed() {
+					_ = saveUIPrefs(b.prefs)
+					b.syncGlobalHotkey()
+				}
+			})
+			if b.hotkeyErr != "" {
+				ui.Row(c).FillWidth().Gap(t.Space(2)).Children(func() {
+					ui.Text(c, b.hotkeyErr).FontSize(t.FontSize).TextColor(c.Theme().Danger)
+				})
 			}
 			ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
 				if ui.Button(c, "关闭").Label("关闭设置").Clicked() {
@@ -1574,16 +2398,33 @@ func (b *board) settingsView(c *ui.Context, t *ui.Theme) {
 	s.open = open
 }
 
+const composeLiftPercent float32 = 14
+
 func (b *board) formView(c *ui.Context, t *ui.Theme) {
 	f := b.form
 	open := f.open
 	// DialogBase so the outer card radius can be much larger than inner chips.
 	ui.DialogBase(c, &open, func(back, panel ui.Element) {
-		back.Background(ui.RGBA(0, 0, 0, 0.7))
+		back.Material(glass.Blur{Radius: 8}).
+			Background(ui.RGBA(0, 0, 0, 0.58)).
+			Transition(ui.ElementTransition{
+				Duration: 260 * time.Millisecond,
+				Ease:     ui.EaseOut,
+				Enter:    &ui.Motion{Opacity: 0},
+			})
 		if f.isTask {
-			w, _ := c.Size()
+			panel.Transition(ui.ElementTransition{
+				Duration: 380 * time.Millisecond,
+				Ease:     ui.EaseOut,
+				Enter:    &ui.Motion{Y: t.Space(12), Opacity: 0},
+				Animation: &ui.Animation{Spring: ui.SpringOptions{
+					Duration: 380 * time.Millisecond,
+					Bounce:   0.02,
+				}},
+			})
+			w, h := c.Size()
 			// Chrome-free wrapper: the pill row inside carries the surface.
-			panel.Padding(0).Gap(0).
+			panel.Padding(0).Gap(0).Translate(0, -h*composeLiftPercent/100).
 				Radius(0).
 				Background(ui.Transparent).
 				BorderWidth(0).
@@ -1608,10 +2449,13 @@ func (b *board) formView(c *ui.Context, t *ui.Theme) {
 			ui.Text(c, hint).
 				FontSize(fsm(t)).TextColor(t.TextMuted)
 			input := ui.TextInput(c, &f.name).Label("项目名").
-				Placeholder("项目名").AutoFocus().
+				Placeholder("项目名").AutoFocus().ReadOnly(f.creating).
 				OnTextKey(func(k ui.TextKey) bool {
 					if k.Key != ui.KeyEnter {
 						return false
+					}
+					if f.creating {
+						return true
 					}
 					name := strings.TrimSpace(k.Text())
 					if name == "" {
@@ -1620,17 +2464,10 @@ func (b *board) formView(c *ui.Context, t *ui.Theme) {
 					}
 					f.name = name
 					if editing {
-						k.SetText("")
 						b.saveProjectEdit()
-						open = false
 						return true
 					}
-					stay := k.Mods&ui.Shift != 0
-					k.SetText("")
-					b.createProject(stay)
-					if !stay {
-						open = false
-					}
+					b.createProject(k.Mods&ui.Shift != 0)
 					return true
 				})
 			ui.Column(c).FillWidth().Gap(t.Space(1)).Children(func() {
@@ -1642,50 +2479,97 @@ func (b *board) formView(c *ui.Context, t *ui.Theme) {
 					}
 					ui.Text(c, pathLabel).FontSize(fsm(t)).TextColor(t.TextMuted).
 						Grow(1).MaxLines(1).Ellipsis("…").Tooltip(f.workspacePath)
-					if ui.Button(c, "浏览…").Label("选择工作目录").
+					// The native sheet runs on its own goroutine and reports back
+					// through b.post: awaiting it inside this render callback would
+					// stall the frame that is asking for it.
+					if ui.Button(c, "浏览…").Label("选择工作目录").Disabled(f.creating || f.pickingWorkspace).
 						Padding(t.Space(1), t.Space(2)).BorderWidth(0).Clicked() {
-						dirs, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
-							Title:             "选择项目工作目录",
-							ButtonLabel:       "选择",
-							Directory:         true,
-							CreateDirectories: true,
-							DefaultPath:       f.workspacePath,
-						})
-						if err != nil {
-							b.toast("无法选择目录", err.Error())
-						} else if len(dirs) > 0 {
-							f.workspacePath = dirs[0]
-							if strings.TrimSpace(f.name) == "" {
-								f.name = filepath.Base(dirs[0])
-							}
-						}
+						b.pickWorkspace(f)
 					}
 					if f.workspacePath != "" {
 						if ui.Button(c, "清除").Label("清除工作目录").
 							Padding(t.Space(1), t.Space(1.5)).BorderWidth(0).
-							TextColor(t.TextMuted).Clicked() {
+							TextColor(t.TextMuted).Disabled(f.creating).Clicked() {
 							f.workspacePath = ""
 						}
 					}
 				})
 			})
+			ui.Column(c).FillWidth().Gap(t.Space(1)).Children(func() {
+				ui.Text(c, "卡片颜色").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
+				ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+					// A swatch row: clicking a chip adopts that accent for the
+					// project (cards in 全部项目 carry it); 自动 uses the
+					// project's stable palette slot instead.
+					for _, color := range projectColorPalette {
+						selected := f.color == color
+						chip := ui.ButtonBase(c.Key("project-color-"+strings.TrimPrefix(color, "#"))).
+							Size(t.Space(5), t.Space(5)).Radius(t.Space(5) / 2).
+							Background(ui.Hex(color)).
+							Tooltip(color).
+							Label("项目颜色 " + color).
+							Disabled(f.creating)
+						if chip.Clicked() {
+							f.color = color
+						}
+						chip.Draw(func(p *ui.Painter, r ui.Rect) {
+							if selected {
+								stroke := t.Text.Alpha(0.9)
+								p.Stroke(ui.Rect{X: r.X - 1, Y: r.Y - 1, W: r.W + 2, H: r.H + 2}, stroke, 1, 0)
+							}
+						})
+					}
+					auto := f.color == ""
+					autoChip := ui.ButtonBase(c.Key("project-color-auto")).
+						Size(t.Space(5), t.Space(5)).Radius(t.Space(5) / 2).
+						Background(t.Text.Alpha(0.12)).
+						Tooltip("自动（稳定配色槽）").
+						Label("项目颜色 自动").
+						Disabled(f.creating)
+					if autoChip.Clicked() {
+						f.color = ""
+					}
+					autoChip.Draw(func(p *ui.Painter, r ui.Rect) {
+						if auto {
+							stroke := t.Text.Alpha(0.9)
+							p.Stroke(ui.Rect{X: r.X - 1, Y: r.Y - 1, W: r.W + 2, H: r.H + 2}, stroke, 1, 0)
+						}
+						// A slash reads as "unset".
+						center := ui.Rect{X: r.X, Y: r.Y + r.H/2 - 0.5, W: r.W, H: 1}
+						p.Fill(center, t.Text.Alpha(0.35), 0)
+					})
+				})
+			})
+			if editing {
+				ui.Row(c).FillWidth().Justify(ui.Start).Children(func() {
+					if ui.Button(c, "删除项目").Label("删除项目").
+						TextColor(t.Danger).Disabled(f.creating).Clicked() {
+						if p, ok := b.projectByID(f.editingProjectID); ok {
+							pp := p
+							b.confirmDelete = &pp
+						}
+					}
+				})
+			}
 			ui.Row(c).FillWidth().Gap(t.Space(2)).Justify(ui.End).Children(func() {
-				if ui.Button(c, "取消").Clicked() {
+				if ui.Button(c, "取消").Disabled(f.creating).Clicked() {
 					open = false
 				}
-				if ui.PrimaryButton(c, saveLabel).Clicked() {
+				if ui.PrimaryButton(c, saveLabel).Disabled(f.creating).Clicked() {
 					if editing {
 						b.saveProjectEdit()
 					} else {
 						b.createProject(false)
 					}
-					open = false
 				}
 			})
 			_ = input
 		})
 	})
-	if !open {
+	if f.creating {
+		open = true
+	}
+	if !open || !f.open {
 		b.form = nil
 		return
 	}
@@ -1696,40 +2580,102 @@ func (b *board) formView(c *ui.Context, t *ui.Theme) {
 // circular ↑ button nested at the right end — Enter creates+closes,
 // Shift+Enter creates and stays for the next title.
 func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *bool) {
-	projName := b.projectNameByID(f.projectID)
-	colName := b.columnName(f.columnID)
-	if colName == "" || colName == f.columnID {
-		for _, p := range b.projects {
-			if p.ID != f.projectID {
-				continue
-			}
-			for _, col := range p.Columns {
-				if col.ID == f.columnID {
-					colName = col.Name
-					break
-				}
+	channels := executor.Runtimes()
+	labels := make([]string, len(channels))
+	for i, channel := range channels {
+		labels[i] = channel.Label
+	}
+	if f.runtimeLabel == "" {
+		f.runtimeLabel = labels[0]
+		for _, channel := range channels {
+			if channel.ID == b.prefs.LastTaskRuntime {
+				f.runtimeLabel = channel.Label
+				break
 			}
 		}
 	}
-	dest := "新任务"
-	switch {
-	case projName != "" && colName != "" && colName != f.columnID:
-		dest = projName + " · " + colName
-	case projName != "":
-		dest = projName
-	case colName != "" && colName != f.columnID:
-		dest = colName
+	// These labels sit directly on the dark modal backdrop in both appearances.
+	hintColor := t.Text
+	if !t.Dark {
+		hintColor = t.Background
 	}
-
+	projName := b.projectNameByID(f.projectID)
+	projectTarget := projName
+	if columnName := b.columnName(f.columnID); columnName != "" && columnName != f.columnID {
+		projectTarget += " · " + columnName
+	}
+	startCreate := func(title, runtime string, stay bool) {
+		f.creating = true
+		desc := buildComposeDescription(f.composeImages)
+		if !b.createTaskAndDispatch(f.projectID, f.columnID, title, desc, runtime, func(created bool) {
+			f.creating = false
+			if created && b.form == f {
+				f.name = ""
+				f.composeImages = nil
+				f.composeImage.pending = nil
+				if !stay {
+					f.open = false
+				}
+			}
+		}) {
+			f.creating = false
+		}
+	}
 	ui.Column(c).Width(t.Space(140)).Gap(t.Space(1.5)).
 		AlignItems(ui.Center).Children(func() {
-		ui.Text(c, dest).FontSize(fsm(t)).TextColor(t.Text.Alpha(0.6))
-		// Single-row pill (reference style): input fills the bar, circular
-		// ↑ button nested at the right end. Backdrop click / Esc closes.
-		ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).
+		ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
+			projectPicker := ui.ButtonBase(c.Key("compose-project")).
+				Label("目标项目").Tooltip("选择任务所属项目").
+				Padding(t.Space(1), t.Space(1)).Gap(t.Space(1)).
+				BorderWidth(0).Radius(t.Radius)
+			projectPicker.Background(crumbFace(t, projectPicker)).Children(func() {
+				ui.Text(c, projectTarget).FontSize(fsm(t)).TextColor(hintColor.Alpha(0.9))
+				ui.Icon(c, chevronDown).Size(12, 12).TextColor(hintColor.Alpha(0.75))
+			})
+			projectPicker.Menu(func(m *ui.Menu) {
+				for _, project := range b.projects {
+					p := project
+					if m.Item(p.Name).Checked(f.projectID == p.ID).Chosen() {
+						f.projectID = p.ID
+						b.prefs.LastTaskProjectID = p.ID
+						_ = saveUIPrefs(b.prefs)
+						if len(p.Columns) > 0 {
+							f.columnID = p.Columns[0].ID
+						}
+					}
+				}
+			})
+			channelPicker := ui.ButtonBase(c.Key("compose-channel")).
+				Label("执行渠道").Tooltip("选择创建并派发的执行渠道").
+				Padding(t.Space(1), t.Space(1)).Gap(t.Space(1)).
+				BorderWidth(0).Radius(t.Radius)
+			channelPicker.Background(crumbFace(t, channelPicker)).Children(func() {
+				ui.Text(c, f.runtimeLabel).FontSize(fsm(t)).TextColor(hintColor.Alpha(0.9))
+				ui.Icon(c, chevronDown).Size(12, 12).TextColor(hintColor.Alpha(0.75))
+			})
+			channelPicker.Menu(func(m *ui.Menu) {
+				for _, channel := range channels {
+					if m.Item(channel.Label).Checked(f.runtimeLabel == channel.Label).Chosen() {
+						f.runtimeLabel = channel.Label
+						b.prefs.LastTaskRuntime = channel.ID
+						_ = saveUIPrefs(b.prefs)
+					}
+				}
+			})
+		})
+		if len(f.composeImages) > 0 || f.composeImage.uploading {
+			b.composeThumbStrip(c, t, f)
+		}
+		// The input pill owns its entrance motion so the upward travel is visible,
+		// independent of DialogBase's panel positioning.
+		ui.Row(c).Key("compose-input-pill").Transition(ui.ElementTransition{
+			Duration:  420 * time.Millisecond,
+			Enter:     &ui.Motion{Y: t.Space(10), Opacity: 0},
+			Animation: &ui.Animation{Spring: ui.SpringOptions{Duration: 420 * time.Millisecond, Bounce: 0.04}},
+		}).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).
 			Padding(t.Space(1.5), t.Space(3)).
 			Radius(t.Space(5.5)).
-			Background(t.Surface).
+			Background(ui.RGB(255, 255, 255)).
 			BorderWidth(0).
 			Shadow(0, 12, 36, 0, ui.RGBA(0, 0, 0, 0.35)).
 			Children(func() {
@@ -1738,64 +2684,54 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 					Grow(1).
 					BorderWidth(0).
 					Background(ui.Transparent).
+					TextColor(ui.RGB(31, 31, 36)).
 					FontSize(flg(t)).
 					AutoFocus().
+					ReadOnly(f.creating || f.composeImage.uploading).
 					OnTextKey(func(k ui.TextKey) bool {
 						if k.Key != ui.KeyEnter {
 							return false
+						}
+						if f.creating || f.composeImage.busy() {
+							return true
 						}
 						title := strings.TrimSpace(k.Text())
 						if title == "" {
 							b.toast("无法创建", "任务标题不能为空。")
 							return true
 						}
-						stay := k.Mods&ui.Shift != 0
-						k.SetText("")
-						f.name = ""
-						// The card goes in from here, not from the submit
-						// observer: clearing the field would make that one
-						// read an empty title and skip the create.
-						b.createTop(f.projectID, f.columnID, title)
-						if !stay {
-							// Plain Enter: the engine marks this key as a
-							// submit right after the callback, so the build
-							// below closes the sheet on it — Enter dismisses
-							// the prompt instead of only clearing the field.
-							b.pendingCompose = &composeSubmit{projectID: f.projectID, columnID: f.columnID, title: title}
+						if k.Mods&ui.Cmd != 0 {
+							for _, channel := range channels {
+								if channel.Label == f.runtimeLabel {
+									startCreate(title, channel.ID, false)
+									break
+								}
+							}
+							return true
 						}
-						// Shift+Enter consumes the key to stay for the next
-						// title; plain Enter lets it through to the engine.
-						return stay
+						stay := k.Mods&ui.Shift != 0
+						startCreate(title, "", stay)
+						return true
 					})
-				// The engine's Enter arrives as a submit as well as through
-				// the key callback, which already took the title out of the
-				// field and left it in b.pendingCompose. Reading the submit
-				// here closes the sheet on the frame the key landed, so Enter
-				// dismisses the prompt instead of only clearing it.
-				// takeComposeSubmit runs every build so a submit that never
-				// arrives cannot leave a stale title behind.
-				submit := b.takeComposeSubmit()
-				if input.Submitted() && submit != nil {
-					f.name = ""
-					*open = false
-				}
+				b.composePaste(input, f)
+				// mygo's RGBA alpha is 0–1. A byte-scale 18 clamps to opaque
+				// black, which hides this dark ↑ on the white pill.
 				send := ui.Button(c, "").Label("创建任务").
-					Tooltip("回车创建并关闭 · Shift+回车继续").
+					Disabled(f.creating || f.composeImage.busy()).
+					Tooltip("回车创建并关闭 · Shift+回车继续 · ⌘Enter 创建并派发").
 					Width(t.Space(8)).Height(t.Space(8)).
 					Padding(0).BorderWidth(0).Radius(t.Space(4)).
-					Background(t.Text.Alpha(0.12)).
+					Background(ui.RGBA(0, 0, 0, 0.12)).
 					AlignItems(ui.Center).Justify(ui.Center).
 					Children(func() {
-						ui.Text(c, "↑").FontSize(fmd(t)).FontWeight(600).TextColor(t.Text)
+						ui.Text(c, "↑").FontSize(fmd(t)).FontWeight(600).TextColor(ui.RGB(31, 31, 36))
 					})
 				if send.Clicked() {
 					title := strings.TrimSpace(f.name)
 					if title == "" {
 						b.toast("无法创建", "任务标题不能为空。")
 					} else {
-						b.createTop(f.projectID, f.columnID, title)
-						f.name = ""
-						*open = false
+						startCreate(title, "", false)
 					}
 				}
 			})
@@ -1803,6 +2739,38 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 }
 
 // --- conflict ---
+
+// confirmDeleteView asks once before the irreversible delete; Esc and
+// clicking outside both cancel.
+func (b *board) confirmDeleteView(c *ui.Context, t *ui.Theme) {
+	p := b.confirmDelete
+	open := true
+	choice := ui.AlertDialog(c, &open, "删除项目「"+p.Name+"」",
+		"将删除该项目及其全部卡片（含已归档），不可恢复。", "删除", "取消")
+	switch {
+	case choice == 0:
+		b.confirmDelete = nil
+		b.deleteProject(*p)
+	case !open:
+		b.confirmDelete = nil
+	}
+}
+
+func (b *board) confirmDeleteCommentView(c *ui.Context, t *ui.Theme) {
+	cm := b.confirmDeleteComment
+	if cm == nil {
+		return
+	}
+	open := true
+	choice := ui.AlertDialog(c, &open, "删除这条评论？", "删除后无法恢复。若评论已交给 AI 处理，删除不会撤回已发送内容。", "删除", "取消")
+	switch {
+	case choice == 0:
+		b.confirmDeleteComment = nil
+		b.deleteComment(*cm)
+	case !open:
+		b.confirmDeleteComment = nil
+	}
+}
 
 func (b *board) conflictView(c *ui.Context, t *ui.Theme) {
 	cf := b.conflict
@@ -1835,14 +2803,16 @@ func (b *board) conflictView(c *ui.Context, t *ui.Theme) {
 // --- format helpers ---
 
 // provenance is a card's quiet history line: the version once the task
-// has moved past v1, the agent that last wrote it when that wasn't this
-// window, and always the time.
+// has moved past v1, the agent that completed it (or its last writer), and
+// always the time. Manual moves must not obscure successful execution.
 func provenance(task *model.Task) string {
 	var parts []string
 	if task.Version > 1 {
 		parts = append(parts, "v"+strconv.Itoa(task.Version))
 	}
-	if task.UpdatedBy != "" && task.UpdatedBy != "local" {
+	if task.CompletedBy != "" {
+		parts = append(parts, task.CompletedBy+" 完成")
+	} else if task.UpdatedBy != "" && task.UpdatedBy != "local" {
 		parts = append(parts, task.UpdatedBy)
 	}
 	if s := stamp(task.UpdatedAt); s != "" {
@@ -1856,13 +2826,22 @@ func stamp(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	if d := time.Since(t); d >= 0 && d < time.Minute {
+	beijing := t.In(beijingLocation)
+	now := time.Now().In(beijingLocation)
+	if d := now.Sub(beijing); d >= 0 && d < time.Minute {
 		return "刚刚"
 	}
-	if time.Since(t) < 24*time.Hour && t.Day() == time.Now().Day() {
-		return t.Format("15:04")
+	if now.Sub(beijing) < 24*time.Hour && beijing.Year() == now.Year() && beijing.YearDay() == now.YearDay() {
+		return beijing.Format("15:04")
 	}
-	return t.Format("01-02")
+	return beijing.Format("01-02")
+}
+
+var beijingLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
+
+// commentTimestamp uses Beijing time regardless of the machine's local zone.
+func commentTimestamp(t time.Time) string {
+	return t.In(beijingLocation).Format("01-02 15:04")
 }
 
 // cardText is a card's summary on a stacked board: every line, with the

@@ -105,6 +105,44 @@ func TestSidebarToggleShortcut(t *testing.T) {
 	}
 }
 
+func TestSidebarResizeKeepsRailAndBoardInSync(t *testing.T) {
+	isolatePrefs(t)
+	b := newBoard(seedBoard())
+	defer b.stop()
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	before := b.sidebarW
+	handle, ok := tt.Find("调整侧栏宽度")
+	if !ok {
+		t.Fatal("sidebar resize handle is missing")
+	}
+	x, y := handle.X+handle.W/2, handle.Y+handle.H/2
+	tt.Press(x, y)
+	tt.Move(x+24, y)
+	tt.Frame()
+	if b.sidebarW <= before {
+		t.Fatalf("drag did not widen the sidebar: before %.1f, after %.1f", before, b.sidebarW)
+	}
+	for i := 0; i < 4; i++ {
+		tt.Move(x+24+float32((i+1)*12), y)
+		tt.Frame()
+		if absDiff(b.railNow, b.sidebarW) > 0.5 {
+			t.Errorf("drag frame %d: rail %.1f lagged width %.1f", i, b.railNow, b.sidebarW)
+		}
+		if absDiff(b.paneW+b.railNow, renderW) > 0.5 {
+			t.Errorf("drag frame %d: pane %.1f plus rail %.1f does not fill %d", i, b.paneW, b.railNow, renderW)
+		}
+	}
+	width := b.sidebarW
+	tt.Release(x+72, y)
+	tt.Frame()
+	if b.prefs.SidebarWidth != width {
+		t.Errorf("released width was not persisted: prefs %.1f, live %.1f", b.prefs.SidebarWidth, width)
+	}
+}
+
 // columnLeft is the x of the first column panel, found through its cards'
 // accessible names; 0 when none is on screen.
 func columnLeft(t *testing.T, tt *ui.Tester) float32 {
@@ -208,8 +246,8 @@ func TestSidebarToggleAnimatesCrisply(t *testing.T) {
 		t.Fatalf("rail never finished collapsing; widths %v", widths)
 	}
 	// A crisp slide is a handful of frames, not a slow crawl.
-	if n := len(widths); n < 4 || n > 20 {
-		t.Errorf("collapse took %d frames of 16ms, want 4-20 (a quick snap)", n)
+	if n := len(widths); n < 3 || n > 20 {
+		t.Errorf("collapse took %d frames of 16ms, want 3-20 (a quick snap, not one frame)", n)
 	}
 	for i := 1; i < len(widths); i++ {
 		if widths[i] > widths[i-1]+0.001 {

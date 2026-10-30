@@ -13,6 +13,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -92,13 +93,31 @@ func runWindow() {
 	}
 
 	srv, err := service.Start("", "")
+	addr := ""
 	if err != nil {
-		log.Fatal(err)
+		// A separately launched `tb serve` already owns the default port.
+		// Reuse that service instead of silently exiting; it is the sole
+		// writer for the shared database, so do not start a second server.
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			log.Fatal(err)
+		}
+		addr = service.DefaultListenAddr()
+	} else {
+		defer srv.Close()
+		addr = srv.Addr
 	}
-	defer srv.Close()
 
-	cl := client.New(&client.Discover{Addr: srv.Addr}, "gui")
+	// The window signs every write with the saved 显示名, or with gui when
+	// the user has not set one; newBoard keeps the client in step from here.
+	cl := client.New(&client.Discover{Addr: addr}, loadUIPrefs().windowAgent())
 	b := newBoard(cl)
+	// The saved appearance (uiprefs' appearance) asks the whole app for it
+	// before the window exists, so the first frame and the window chrome
+	// open in it instead of flashing the desktop's appearance. Following the
+	// desktop needs no call: it is mygo's default.
+	if b.prefs.Appearance != appearSystem {
+		mygo.Theme.SetSource(b.prefs.Appearance.source())
+	}
 	// TitleBarHiddenInset + empty Title: no macOS title text.
 	// Traffic lights sit in the sidebar's top rail (Grok Bolt–style).
 	// Y≈14 centers ~12px lights in the 40 DIP (Space(10)) rail; X≈14 is
@@ -106,19 +125,30 @@ func runWindow() {
 	lights := &mygo.Point{X: 14, Y: 14}
 
 	mygo.App.WhenReady(func() {
+		// The display's backing scale decides how dense a pasted screenshot is
+		// assumed to be; only the main thread can ask for it.
+		syncDisplayScale()
 		b.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:                 "",
-			TitleBarStyle:         mygo.TitleBarHiddenInset,
+			Title:                "",
+			TitleBarStyle:        mygo.TitleBarHiddenInset,
 			TrafficLightPosition: lights,
-			TitleBarHeight:        32, // page title-bar band (helps Linux/Win; mac uses position)
-			Width:                 1280,
-			Height:                800,
-			MinWidth:              960,
-			MinHeight:             560,
-			Content:               ui.View(b.view),
+			TitleBarHeight:       32, // page title-bar band (helps Linux/Win; mac uses position)
+			Width:                1280,
+			Height:               800,
+			MinWidth:             960,
+			MinHeight:            560,
+			Content:              ui.View(b.view),
 		})
+		// The saved ⌘⇧N global shortcut needs a running app to bind, so it
+		// registers here rather than at board construction. The settings
+		// toggle re-runs the same sync while the window lives.
+		b.syncGlobalHotkey()
 	})
-	mygo.App.OnWindowAllClosed(func() {})
+	// Closing the last window quits the app. Registering even an empty
+	// OnWindowAllClosed listener keeps mygo running forever, which left a
+	// window-less process holding 127.0.0.1:47826 and the SQLite writer
+	// after the user had closed the board. With no listener mygo quits, and
+	// the deferred srv.Close / b.stop release the port and the file.
 	defer b.stop()
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)

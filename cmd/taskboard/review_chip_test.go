@@ -12,10 +12,8 @@ import (
 )
 
 // TestReviewCheckChipGeometry pins the 评审 ✓ chip's geometry: a 24×24 chip
-// (a 16px check inside a 4px ring — 28 read as a big empty box), and, in
-// title-only cards, centered on the card's midline. One-line cards then
-// line the chip up with the title; two-line (global) cards center it on
-// the card instead of riding the top corner.
+// (a 16px check inside a 4px ring — 28 read as a big empty box), in the
+// card's bottom-right footer in both title-only and full-card layouts.
 func TestReviewCheckChipGeometry(t *testing.T) {
 	dir := t.TempDir()
 	// Isolate prefs: frames can saveUIPrefs (sidebar width), and the prefs
@@ -40,8 +38,7 @@ func TestReviewCheckChipGeometry(t *testing.T) {
 		t.Errorf("full mode: chip %gx%g, want 24x24", chip.W, chip.H)
 	}
 
-	// Title-only, project view: one-line cards, so the chip centered on the
-	// card must sit on the title's midline — the alignment the board shows.
+	// Title-only, project view: keep the title compact and put actions below it.
 	b.prefs.TitleOnlyCards = true
 	b.cur = "local"
 	b.post(func() {})
@@ -56,16 +53,18 @@ func TestReviewCheckChipGeometry(t *testing.T) {
 	if !ok {
 		t.Fatalf("title-only mode: 评审 card title missing")
 	}
-	chipMid := chip.Y + chip.H/2
-	titleMid := title.Y + title.H/2
-	if d := chipMid - titleMid; d < -1.5 || d > 1.5 {
-		t.Errorf("title-only mode: chip midline %.1f vs title midline %.1f (Δ%.1f), want |Δ| ≤ 1.5", chipMid, titleMid, d)
+	if title.Y+title.H > chip.Y {
+		t.Errorf("title-only mode: chip is not below title: title=%+v chip=%+v", title, chip)
+	}
+	card := b.bounds["t-5"]
+	if gap := card.X + card.W - chip.X - chip.W; gap < 0 || gap > 16 {
+		t.Errorf("title-only mode: chip is not at bottom-right: gap=%v card=%+v chip=%+v", gap, card, chip)
 	}
 	if chip.W != 24 || chip.H != 24 {
 		t.Errorf("title-only mode: chip %gx%g, want 24x24", chip.W, chip.H)
 	}
 
-	// Global view: title + project-name lines; the chip centers on the card.
+	// Global view: title + project-name lines; actions remain in the footer.
 	b.cur = curGlobal
 	tt.Frame()
 	settle(t, tt)
@@ -74,10 +73,8 @@ func TestReviewCheckChipGeometry(t *testing.T) {
 		t.Fatalf("title-only global mode: 评审 chip missing")
 	}
 	bound := b.bounds["t-5"]
-	chipMid = chip.Y + chip.H/2
-	cardMid := bound.Y + bound.H/2
-	if d := chipMid - cardMid; d < -1.5 || d > 1.5 {
-		t.Errorf("title-only global mode: chip midline %.1f vs card midline %.1f (Δ%.1f), want |Δ| ≤ 1.5", chipMid, cardMid, d)
+	if gap := bound.X + bound.W - chip.X - chip.W; gap < 0 || gap > 16 {
+		t.Errorf("title-only global mode: chip is not at bottom-right: gap=%v card=%+v chip=%+v", gap, bound, chip)
 	}
 }
 
@@ -115,8 +112,11 @@ func TestReviewChipStaysInsideCard(t *testing.T) {
 	if !ok {
 		t.Fatalf("评审 title missing")
 	}
-	if title.X+title.W > chip.X {
-		t.Errorf("title runs under the chip: title ends %.1f, chip starts %.1f", title.X+title.W, chip.X)
+	if title.Y+title.H > chip.Y {
+		t.Errorf("title runs into the action row: title ends at %.1f, chip starts at %.1f", title.Y+title.H, chip.Y)
+	}
+	if gap := card.X + card.W - chip.X - chip.W; gap < 0 || gap > 16 {
+		t.Errorf("chip is not at card bottom-right: gap=%v card=%+v chip=%+v", gap, card, chip)
 	}
 
 	// Hovering shows the chip but no floating tip: the themed Tooltip put

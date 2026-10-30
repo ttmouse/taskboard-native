@@ -437,7 +437,9 @@ func TestActiveCardsStaggerAndNeighborsStayFlat(t *testing.T) {
 			t.Fatalf("passive neighbor %s lifted", id)
 		}
 		r, _ := tt.Find("打开任务：" + b.task(id).Title)
-		if r.W != before[id].W || r.H != before[id].H {
+		// Transformed bounds subtract float32 coordinates; translation can
+		// introduce rounding noise without changing the card's actual size.
+		if math.Abs(float64(r.W-before[id].W)) > 0.02 || math.Abs(float64(r.H-before[id].H)) > 0.02 {
 			t.Fatalf("neighbor %s scaled: %+v -> %+v", id, before[id], r)
 		}
 	}
