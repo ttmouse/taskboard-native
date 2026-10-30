@@ -21,6 +21,16 @@ func start(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	// Legacy scenarios that exercise task lifecycle explicitly create their
+	// own fixture board; a newly opened service now starts projectless.
+	status, raw := request(t, srv, http.MethodPost, "/api/projects", "test", map[string]any{"name": "local"})
+	if status != http.StatusCreated {
+		t.Fatalf("fixture project: %d %s", status, raw)
+	}
+	project := decode[model.Project](t, raw)
+	for i, title := range []string{"欢迎使用 taskboard", "接上 CLI 与 MCP", "检查实时推送"} {
+		_, _ = request(t, srv, http.MethodPost, "/api/tasks", "test", map[string]any{"projectId": project.ID, "columnId": project.Columns[i].ID, "title": title, "description": title + "的说明"})
+	}
 	t.Cleanup(func() {
 		if err := srv.Close(); err != nil {
 			t.Fatalf("close: %v", err)
@@ -62,6 +72,24 @@ func request(t *testing.T, srv *Server, method, path, agent string, body any) (i
 	return resp.StatusCode, raw
 }
 
+// fixtureProjectID resolves the fixture board's id by name: created
+// projects no longer receive the literal "local" id.
+func fixtureProjectID(t *testing.T, srv *Server) string {
+	t.Helper()
+	status, raw := request(t, srv, http.MethodGet, "/api/projects", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("projects = %d %s", status, raw)
+	}
+	projects := decode[[]model.Project](t, raw)
+	for _, p := range projects {
+		if p.Name == "local" {
+			return p.ID
+		}
+	}
+	t.Fatalf("fixture project missing: %+v", projects)
+	return ""
+}
+
 func decode[T any](t *testing.T, raw []byte) T {
 	t.Helper()
 	var v T
@@ -84,7 +112,7 @@ func TestHealthAndProjects(t *testing.T) {
 		t.Fatalf("projects = %d %s", status, raw)
 	}
 	projects := decode[[]model.Project](t, raw)
-	if len(projects) != 1 || projects[0].ID != "local" {
+	if len(projects) != 1 || projects[0].Name != "local" {
 		t.Fatalf("projects = %+v", projects)
 	}
 	if len(projects[0].Columns) != 4 || projects[0].Columns[0].Name != "待办" {
@@ -98,12 +126,13 @@ func TestHealthAndProjects(t *testing.T) {
 func TestBoardIsProjectScoped(t *testing.T) {
 	srv := start(t)
 
-	status, raw := request(t, srv, http.MethodGet, "/api/projects/local/board", "", nil)
+	projectID := fixtureProjectID(t, srv)
+	status, raw := request(t, srv, http.MethodGet, "/api/projects/"+projectID+"/board", "", nil)
 	if status != http.StatusOK {
 		t.Fatalf("board = %d %s", status, raw)
 	}
 	board := decode[Board](t, raw)
-	if board.Project.ID != "local" || len(board.Columns) != 4 || len(board.Tasks) != 3 {
+	if board.Project.ID != projectID || len(board.Columns) != 4 || len(board.Tasks) != 3 {
 		t.Fatalf("board = %+v", board)
 	}
 	if len(board.Tasks) != 3 {
@@ -120,13 +149,13 @@ func TestBoardIsProjectScoped(t *testing.T) {
 			t.Fatalf("%s = %d %s, want 400", path, status, raw)
 		}
 	}
-	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local", "", nil)
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId="+projectID, "", nil)
 	tasks := decode[[]model.Task](t, raw)
 	if status != http.StatusOK || len(tasks) != 3 {
 		t.Fatalf("tasks = %d %s", status, raw)
 	}
 	for _, task := range tasks {
-		if task.ProjectID != "local" {
+		if task.ProjectID != projectID {
 			t.Fatalf("task leaked from another project: %+v", task)
 		}
 	}
@@ -137,14 +166,15 @@ func TestBoardIsProjectScoped(t *testing.T) {
 
 func TestTaskListFiltersPaginationAndSummary(t *testing.T) {
 	srv := start(t)
-	_, raw := request(t, srv, http.MethodGet, "/api/projects/local/board", "", nil)
+	projectID := fixtureProjectID(t, srv)
+	_, raw := request(t, srv, http.MethodGet, "/api/projects/"+projectID+"/board", "", nil)
 	board := decode[Board](t, raw)
 	todo, doing := board.Columns[0].ID, board.Columns[1].ID
 
 	create := func(column, title, description, assignee string) model.Task {
 		t.Helper()
 		status, raw := request(t, srv, http.MethodPost, "/api/tasks", "task-list-test", map[string]any{
-			"projectId": "local", "columnId": column, "title": title, "description": description, "assignee": assignee,
+			"projectId": projectID, "columnId": column, "title": title, "description": description, "assignee": assignee,
 		})
 		if status != http.StatusCreated {
 			t.Fatalf("create %q = %d %s", title, status, raw)
@@ -161,22 +191,22 @@ func TestTaskListFiltersPaginationAndSummary(t *testing.T) {
 		t.Fatalf("create comment = %d %s", status, raw)
 	}
 
-	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=alice&limit=1&offset=1", "", nil)
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv)+"&columnId="+todo+"&assignee=alice&limit=1&offset=1", "", nil)
 	page := decode[[]model.Task](t, raw)
 	if status != http.StatusOK || len(page) != 1 || page[0].ID != second.ID {
 		t.Fatalf("filtered page = %d %s", status, raw)
 	}
 
-	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=missing", "", nil)
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv)+"&columnId="+todo+"&assignee=missing", "", nil)
 	if got := decode[[]model.Task](t, raw); status != http.StatusOK || len(got) != 0 || !strings.Contains(string(raw), "[]") {
 		t.Fatalf("empty filtered result = %d %s", status, raw)
 	}
-	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=alice&limit=1&offset=20", "", nil)
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv)+"&columnId="+todo+"&assignee=alice&limit=1&offset=20", "", nil)
 	if got := decode[[]model.Task](t, raw); status != http.StatusOK || len(got) != 0 {
 		t.Fatalf("out-of-range page = %d %s", status, raw)
 	}
 
-	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&columnId="+todo+"&assignee=alice&summary=true", "", nil)
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv)+"&columnId="+todo+"&assignee=alice&summary=true", "", nil)
 	var summaries []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &summaries); err != nil {
 		t.Fatalf("decode summary %s: %v", raw, err)
@@ -206,7 +236,7 @@ func TestTaskListFiltersPaginationAndSummary(t *testing.T) {
 	}
 
 	// The no-filter list remains an unpaginated array of full tasks.
-	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local", "", nil)
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv), "", nil)
 	all := decode[[]model.Task](t, raw)
 	if status != http.StatusOK || len(all) != 7 {
 		t.Fatalf("legacy full list = %d %s", status, raw)
@@ -219,20 +249,20 @@ func TestTaskListFiltersPaginationAndSummary(t *testing.T) {
 func TestTaskListRejectsInvalidFiltersAndForeignColumns(t *testing.T) {
 	srv := start(t)
 	cases := []string{
-		"?projectId=local&columnId=",
-		"?projectId=local&limit=",
-		"?projectId=local&limit=0",
-		"?projectId=local&limit=201",
-		"?projectId=local&limit=abc",
-		"?projectId=local&offset=0",
-		"?projectId=local&limit=1&offset=",
-		"?projectId=local&limit=1&offset=-1",
-		"?projectId=local&summary=TRUE",
-		"?projectId=local&summary=1",
-		"?projectId=local&columnId=x&columnId=y",
-		"?projectId=local&assignee=a&assignee=b",
-		"?projectId=local&limit=1&limit=2",
-		"?projectId=local&summary=true&summary=false",
+		"?projectId=" + fixtureProjectID(t, srv) + "&columnId=",
+		"?projectId=" + fixtureProjectID(t, srv) + "&limit=",
+		"?projectId=" + fixtureProjectID(t, srv) + "&limit=0",
+		"?projectId=" + fixtureProjectID(t, srv) + "&limit=201",
+		"?projectId=" + fixtureProjectID(t, srv) + "&limit=abc",
+		"?projectId=" + fixtureProjectID(t, srv) + "&offset=0",
+		"?projectId=" + fixtureProjectID(t, srv) + "&limit=1&offset=",
+		"?projectId=" + fixtureProjectID(t, srv) + "&limit=1&offset=-1",
+		"?projectId=" + fixtureProjectID(t, srv) + "&summary=TRUE",
+		"?projectId=" + fixtureProjectID(t, srv) + "&summary=1",
+		"?projectId=" + fixtureProjectID(t, srv) + "&columnId=x&columnId=y",
+		"?projectId=" + fixtureProjectID(t, srv) + "&assignee=a&assignee=b",
+		"?projectId=" + fixtureProjectID(t, srv) + "&limit=1&limit=2",
+		"?projectId=" + fixtureProjectID(t, srv) + "&summary=true&summary=false",
 	}
 	for _, path := range cases {
 		if status, raw := request(t, srv, http.MethodGet, "/api/tasks"+path, "", nil); status != http.StatusBadRequest {
@@ -247,7 +277,7 @@ func TestTaskListRejectsInvalidFiltersAndForeignColumns(t *testing.T) {
 	other := decode[model.Project](t, raw)
 	foreignColumn := other.Columns[0].ID
 	for _, columnID := range []string{"unknown-column", foreignColumn} {
-		path := "/api/tasks?projectId=local&columnId=" + columnID
+		path := "/api/tasks?projectId=" + fixtureProjectID(t, srv) + "&columnId=" + columnID
 		if status, raw := request(t, srv, http.MethodGet, path, "", nil); status != http.StatusBadRequest {
 			t.Fatalf("foreign/unknown column %q = %d %s, want 400", columnID, status, raw)
 		}
@@ -256,13 +286,13 @@ func TestTaskListRejectsInvalidFiltersAndForeignColumns(t *testing.T) {
 
 func TestTaskLifecycle(t *testing.T) {
 	srv := start(t)
-	_, raw := request(t, srv, http.MethodGet, "/api/projects/local/board", "", nil)
+	_, raw := request(t, srv, http.MethodGet, "/api/projects/"+fixtureProjectID(t, srv)+"/board", "", nil)
 	board := decode[Board](t, raw)
 	todo, doing := board.Columns[0].ID, board.Columns[1].ID
 
 	// Create.
 	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "cli-test", map[string]any{
-		"projectId": "local", "columnId": todo, "title": "新卡片", "description": "正文",
+		"projectId": fixtureProjectID(t, srv), "columnId": todo, "title": "新卡片", "description": "正文",
 	})
 	if status != http.StatusCreated {
 		t.Fatalf("create = %d %s", status, raw)
@@ -274,7 +304,7 @@ func TestTaskLifecycle(t *testing.T) {
 
 	// Create without a column lands in the first column.
 	status, raw = request(t, srv, http.MethodPost, "/api/tasks", "local", map[string]any{
-		"projectId": "local", "title": "默认列",
+		"projectId": fixtureProjectID(t, srv), "title": "默认列",
 	})
 	if status != http.StatusCreated || decode[model.Task](t, raw).ColumnID != todo {
 		t.Fatalf("default column create = %d %s", status, raw)
@@ -333,13 +363,13 @@ func TestTaskLifecycle(t *testing.T) {
 	if status != http.StatusOK || !decode[model.Task](t, raw).Archived {
 		t.Fatalf("archive = %d %s", status, raw)
 	}
-	_, raw = request(t, srv, http.MethodGet, "/api/projects/local/board", "", nil)
+	_, raw = request(t, srv, http.MethodGet, "/api/projects/"+fixtureProjectID(t, srv)+"/board", "", nil)
 	for _, listed := range decode[Board](t, raw).Tasks {
 		if listed.ID == task.ID {
 			t.Fatalf("archived card still on board")
 		}
 	}
-	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId=local&includeArchived=true", "", nil)
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv)+"&includeArchived=true", "", nil)
 	found := false
 	for _, listed := range decode[[]model.Task](t, raw) {
 		if listed.ID == task.ID && listed.Archived {
@@ -360,11 +390,11 @@ func TestValidationErrors(t *testing.T) {
 		want int
 	}{
 		{"missing projectId", "/api/tasks", map[string]any{"title": "x"}, http.StatusBadRequest},
-		{"missing title", "/api/tasks", map[string]any{"projectId": "local"}, http.StatusBadRequest},
+		{"missing title", "/api/tasks", map[string]any{"projectId": fixtureProjectID(t, srv)}, http.StatusBadRequest},
 		{"unknown project", "/api/tasks", map[string]any{"projectId": "nope", "title": "x"}, http.StatusNotFound},
-		{"unknown column", "/api/tasks", map[string]any{"projectId": "local", "title": "x", "columnId": "nope"}, http.StatusBadRequest},
+		{"unknown column", "/api/tasks", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "x", "columnId": "nope"}, http.StatusBadRequest},
 		{"malformed json", "/api/tasks", json.RawMessage(`{"projectId":`), http.StatusBadRequest},
-		{"wrong type", "/api/tasks", map[string]any{"projectId": "local", "title": 42}, http.StatusBadRequest},
+		{"wrong type", "/api/tasks", map[string]any{"projectId": fixtureProjectID(t, srv), "title": 42}, http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		body := tc.body
@@ -382,7 +412,7 @@ func TestValidationErrors(t *testing.T) {
 
 	// Unknown fields are ignored so a client may echo a whole Task back.
 	if status, raw := request(t, srv, http.MethodPost, "/api/tasks", "", map[string]any{
-		"projectId": "local", "title": "带多余字段", "position": 5, "version": 9, "archived": true,
+		"projectId": fixtureProjectID(t, srv), "title": "带多余字段", "position": 5, "version": 9, "archived": true,
 	}); status != http.StatusCreated {
 		t.Fatalf("create with extra fields = %d %s", status, raw)
 	} else if task := decode[model.Task](t, raw); task.Position <= 0 || task.Version != 1 || task.Archived {
@@ -390,7 +420,7 @@ func TestValidationErrors(t *testing.T) {
 	}
 
 	// version is required on patch and archive.
-	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "", map[string]any{"projectId": "local", "title": "v"})
+	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "v"})
 	task := decode[model.Task](t, raw)
 	if status != http.StatusCreated {
 		t.Fatalf("create = %d %s", status, raw)
@@ -429,7 +459,7 @@ func rawRequest(t *testing.T, srv *Server, method, path string, body []byte) (in
 
 func TestVersionConflictReturnsCurrentTask(t *testing.T) {
 	srv := start(t)
-	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "a", map[string]any{"projectId": "local", "title": "冲突"})
+	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "a", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "冲突"})
 	task := decode[model.Task](t, raw)
 	if status != http.StatusCreated {
 		t.Fatalf("create = %d %s", status, raw)
@@ -462,9 +492,10 @@ func TestVersionConflictReturnsCurrentTask(t *testing.T) {
 
 // sseReader subscribes to /api/events and exposes parsed messages.
 type sseReader struct {
-	resp   *http.Response
-	events chan model.Event
-	raw    chan string
+	resp      *http.Response
+	events    chan model.Event
+	snapshots chan model.BoardSnapshot
+	raw       chan string
 }
 
 func subscribe(t *testing.T, srv *Server, query string) *sseReader {
@@ -483,7 +514,7 @@ func subscribe(t *testing.T, srv *Server, query string) *sseReader {
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Fatalf("content-type = %q", ct)
 	}
-	s := &sseReader{resp: resp, events: make(chan model.Event, 16), raw: make(chan string, 32)}
+	s := &sseReader{resp: resp, events: make(chan model.Event, 16), snapshots: make(chan model.BoardSnapshot, 1), raw: make(chan string, 32)}
 	go func() {
 		defer close(s.events)
 		scanner := bufio.NewScanner(resp.Body)
@@ -496,7 +527,11 @@ func subscribe(t *testing.T, srv *Server, query string) *sseReader {
 					var ev model.Event
 					if err := json.Unmarshal([]byte(data), &ev); err == nil {
 						ev.Type = eventType
-						s.events <- ev
+						if ev.Type == model.EventBoardSnapshot && ev.Snapshot != nil {
+							s.snapshots <- *ev.Snapshot
+						} else {
+							s.events <- ev
+						}
 					}
 				}
 				eventType, data = "", ""
@@ -533,18 +568,22 @@ func nextEvent(t *testing.T, s *sseReader) model.Event {
 func TestSSEEvents(t *testing.T) {
 	srv := start(t)
 	stream := subscribe(t, srv, "")
-	// The stream opens with a comment line; wait for it so the subscription
-	// is registered before the write happens.
-	select {
-	case line := <-stream.raw:
-		if !strings.HasPrefix(line, ": ") {
-			t.Fatalf("first line = %q, want comment", line)
+	// Wait for the post-snapshot comment so the subscription is ready before
+	// the write happens. The preceding snapshot also carries an SSE id line.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-stream.raw:
+			if line == ": connected" {
+				goto connected
+			}
+		case <-deadline:
+			t.Fatalf("stream did not open")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("stream did not open")
 	}
+connected:
 
-	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": "local", "title": "事件卡"})
+	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "事件卡"})
 	task := decode[model.Task](t, raw)
 	if status != http.StatusCreated {
 		t.Fatalf("create = %d %s", status, raw)
@@ -553,7 +592,7 @@ func TestSSEEvents(t *testing.T) {
 	if created.Type != model.EventTaskCreated || created.ID != task.ID || created.By != "cli" || created.Task == nil {
 		t.Fatalf("created event = %+v", created)
 	}
-	if created.Seq <= 0 || created.ProjectID != "local" {
+	if created.Seq <= 0 || created.ProjectID == "" {
 		t.Fatalf("created event metadata = %+v", created)
 	}
 
@@ -562,6 +601,15 @@ func TestSSEEvents(t *testing.T) {
 	ev := nextEvent(t, stream)
 	if ev.Type != model.EventTaskUpdated || ev.Version != updated.Version {
 		t.Fatalf("updated event = %+v", ev)
+	}
+
+	execution := model.Execution{TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "running"}
+	if err := srv.store.SaveExecution(execution); err != nil {
+		t.Fatalf("save execution: %v", err)
+	}
+	executionEvent := nextEvent(t, stream)
+	if executionEvent.Type != model.EventTaskUpdated || executionEvent.Version != updated.Version || executionEvent.Task == nil || executionEvent.Task.Execution == nil || *executionEvent.Task.Execution != execution {
+		t.Fatalf("execution event = %+v", executionEvent)
 	}
 
 	// A rejected write (unknown column) must not push an event.
@@ -575,7 +623,7 @@ func TestSSEEvents(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	_, raw = request(t, srv, http.MethodGet, "/api/projects/local/board", "", nil)
+	_, raw = request(t, srv, http.MethodGet, "/api/projects/"+fixtureProjectID(t, srv)+"/board", "", nil)
 	board := decode[Board](t, raw)
 	target := board.Columns[1].ID
 	_, raw = request(t, srv, http.MethodPatch, "/api/tasks/"+task.ID, "gui", map[string]any{"version": updated.Version, "columnId": target})
@@ -604,12 +652,48 @@ func TestSSEEvents(t *testing.T) {
 	}
 }
 
+func TestSSEReconnectSnapshotClosesEventGap(t *testing.T) {
+	srv := start(t)
+	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "断线期间创建"})
+	if status != http.StatusCreated {
+		t.Fatalf("create during disconnect = %d %s", status, raw)
+	}
+	want := decode[model.Task](t, raw)
+	stream := subscribe(t, srv, "")
+	select {
+	case snapshot := <-stream.snapshots:
+		found := false
+		for _, board := range snapshot.Boards {
+			for _, task := range board.Tasks {
+				if task.ID == want.ID {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("reconnect snapshot seq=%d did not contain task %s", snapshot.Seq, want.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconnect did not send a board snapshot")
+	}
+
+	status, raw = request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "连接后创建"})
+	if status != http.StatusCreated {
+		t.Fatalf("create after reconnect = %d %s", status, raw)
+	}
+	created := decode[model.Task](t, raw)
+	if ev := nextEvent(t, stream); ev.Type != model.EventTaskCreated || ev.ID != created.ID || ev.Seq <= 0 {
+		t.Fatalf("incremental event after snapshot = %+v", ev)
+	}
+}
+
 func TestSSEProjectFilter(t *testing.T) {
 	srv := start(t)
-	_, raw := request(t, srv, http.MethodGet, "/api/tasks?projectId=local", "", nil)
+	_, raw := request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv), "", nil)
 	_ = decode[[]model.Task](t, raw)
 
-	scoped := subscribe(t, srv, "?projectId=local")
+	fixtureID := fixtureProjectID(t, srv)
+	scoped := subscribe(t, srv, "?projectId="+fixtureID)
 	other := subscribe(t, srv, "?projectId=other")
 	for _, s := range []*sseReader{scoped, other} {
 		select {
@@ -619,11 +703,11 @@ func TestSSEProjectFilter(t *testing.T) {
 		}
 	}
 
-	request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": "local", "title": "过滤"})
+	request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "过滤"})
 
 	select {
 	case ev := <-scoped.events:
-		if ev.ProjectID != "local" || ev.Type != model.EventTaskCreated {
+		if ev.ProjectID != fixtureID || ev.Type != model.EventTaskCreated {
 			t.Fatalf("scoped event = %+v", ev)
 		}
 	case <-time.After(5 * time.Second):
@@ -734,7 +818,7 @@ func TestSSEPing(t *testing.T) {
 		}
 	}
 	// A message plus a ping arrives on the wire.
-	request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": "local", "title": "ping 卡"})
+	request(t, srv, http.MethodPost, "/api/tasks", "cli", map[string]any{"projectId": fixtureProjectID(t, srv), "title": "ping 卡"})
 	select {
 	case ev, ok := <-stream.events:
 		if !ok {
@@ -794,6 +878,60 @@ func TestCreateProject(t *testing.T) {
 	}
 }
 
+// TestProjectColorCreatePatch covers the project accent color across the
+// HTTP surface: creation carries it, the patch changes and clears it, and
+// malformed values are rejected at the boundary (store trusts HTTP).
+func TestProjectColorCreatePatch(t *testing.T) {
+	srv := start(t)
+
+	status, raw := request(t, srv, http.MethodPost, "/api/projects", "gui", map[string]any{
+		"name": "彩色项目", "color": "#2563eb",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create with color = %d %s", status, raw)
+	}
+	project := decode[model.Project](t, raw)
+	if project.Color != "#2563eb" {
+		t.Fatalf("created color = %q", project.Color)
+	}
+
+	// Invalid hex is rejected without creating anything.
+	if status, raw := request(t, srv, http.MethodPost, "/api/projects", "gui", map[string]any{
+		"name": "坏颜色", "color": "blue",
+	}); status != http.StatusBadRequest {
+		t.Fatalf("bad color create = %d %s, want 400", status, raw)
+	}
+	if status, raw := request(t, srv, http.MethodPost, "/api/projects", "gui", map[string]any{
+		"name": "坏颜色2", "color": "#12345",
+	}); status != http.StatusBadRequest {
+		t.Fatalf("short color create = %d %s, want 400", status, raw)
+	}
+
+	// PATCH changes the color; empty string clears it back to automatic.
+	status, raw = request(t, srv, http.MethodPatch, "/api/projects/"+project.ID, "gui",
+		map[string]any{"color": "#10b981"})
+	if status != http.StatusOK {
+		t.Fatalf("patch color = %d %s", status, raw)
+	}
+	patched := decode[model.Project](t, raw)
+	if patched.Color != "#10b981" {
+		t.Fatalf("patched color = %q", patched.Color)
+	}
+	status, raw = request(t, srv, http.MethodPatch, "/api/projects/"+project.ID, "gui",
+		map[string]any{"color": ""})
+	if status != http.StatusOK {
+		t.Fatalf("clear color = %d %s", status, raw)
+	}
+	cleared := decode[model.Project](t, raw)
+	if cleared.Color != "" {
+		t.Fatalf("cleared color = %q", cleared.Color)
+	}
+	if status, raw := request(t, srv, http.MethodPatch, "/api/projects/"+project.ID, "gui",
+		map[string]any{"color": "nope"}); status != http.StatusBadRequest {
+		t.Fatalf("bad color patch = %d %s, want 400", status, raw)
+	}
+}
+
 func TestCreateProjectWorkspacePathPersistence(t *testing.T) {
 	srv := start(t)
 	workspace := t.TempDir()
@@ -841,6 +979,41 @@ func TestCreateProjectWorkspacePathPersistence(t *testing.T) {
 	}
 }
 
+// TestPatchProjectExpandsTildePath covers the typed-path flow: a leading ~
+// resolves to the home directory, which exists, so the patch succeeds and
+// the stored path is the expanded absolute one.
+func TestPatchProjectExpandsTildePath(t *testing.T) {
+	srv := start(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home dir: %v", err)
+	}
+
+	status, raw := request(t, srv, http.MethodPost, "/api/projects", "cli", map[string]any{"name": "tilde"})
+	if status != http.StatusCreated {
+		t.Fatalf("create = %d %s", status, raw)
+	}
+	created := decode[model.Project](t, raw)
+
+	status, raw = request(t, srv, http.MethodPatch, "/api/projects/"+created.ID, "cli", map[string]any{"workspacePath": "~"})
+	if status != http.StatusOK {
+		t.Fatalf("patch ~ = %d %s", status, raw)
+	}
+	got := decode[model.Project](t, raw)
+	if got.WorkspacePath != home {
+		t.Fatalf("~ expanded to %q, want %q", got.WorkspacePath, home)
+	}
+
+	status, raw = request(t, srv, http.MethodPatch, "/api/projects/"+created.ID, "cli", map[string]any{"workspacePath": "~/."})
+	if status != http.StatusOK {
+		t.Fatalf("patch ~/. = %d %s", status, raw)
+	}
+	got = decode[model.Project](t, raw)
+	if got.WorkspacePath != filepath.Clean(home) {
+		t.Fatalf("~/. expanded to %q, want %q", got.WorkspacePath, filepath.Clean(home))
+	}
+}
+
 func TestCreateProjectRejectsInvalidWorkspacePath(t *testing.T) {
 	srv := start(t)
 	file := filepath.Join(t.TempDir(), "not-a-directory")
@@ -859,5 +1032,74 @@ func TestCreateProjectRejectsInvalidWorkspacePath(t *testing.T) {
 		if status != http.StatusBadRequest {
 			t.Errorf("workspacePath %q = %d %s, want 400", path, status, raw)
 		}
+	}
+}
+
+func TestCommentEditDeleteRequireAuthor(t *testing.T) {
+	srv := start(t)
+	status, raw := request(t, srv, http.MethodGet, "/api/tasks?projectId="+fixtureProjectID(t, srv), "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("tasks = %d %s", status, raw)
+	}
+	task := decode[[]model.Task](t, raw)[0]
+	status, raw = request(t, srv, http.MethodPost, "/api/tasks/"+task.ID+"/comments", "alice", map[string]any{"text": "原文"})
+	if status != http.StatusCreated {
+		t.Fatalf("create comment = %d %s", status, raw)
+	}
+	comment := decode[model.Comment](t, raw)
+	path := "/api/tasks/" + task.ID + "/comments/" + comment.ID
+	if status, raw = request(t, srv, http.MethodPatch, path, "bob", map[string]any{"text": "越权编辑"}); status != http.StatusForbidden {
+		t.Fatalf("foreign edit = %d %s", status, raw)
+	}
+	if status, raw = request(t, srv, http.MethodPatch, path, "alice", map[string]any{"text": ""}); status != http.StatusBadRequest {
+		t.Fatalf("blank edit = %d %s", status, raw)
+	}
+	if status, raw = request(t, srv, http.MethodPatch, path, "alice", map[string]any{"text": "已编辑"}); status != http.StatusOK || decode[model.Comment](t, raw).Text != "已编辑" {
+		t.Fatalf("edit = %d %s", status, raw)
+	}
+	if status, raw = request(t, srv, http.MethodDelete, path, "bob", nil); status != http.StatusForbidden {
+		t.Fatalf("foreign delete = %d %s", status, raw)
+	}
+	if status, raw = request(t, srv, http.MethodDelete, path, "alice", nil); status != http.StatusNoContent || len(raw) != 0 {
+		t.Fatalf("delete = %d %s", status, raw)
+	}
+	status, raw = request(t, srv, http.MethodGet, "/api/tasks/"+task.ID+"/comments", "", nil)
+	if status != http.StatusOK || len(decode[[]model.Comment](t, raw)) != 0 {
+		t.Fatalf("remaining comments = %d %s", status, raw)
+	}
+}
+
+func TestCommentRepliesAndParentDeletion(t *testing.T) {
+	srv := start(t)
+	projectID := fixtureProjectID(t, srv)
+	status, raw := request(t, srv, http.MethodGet, "/api/tasks?projectId="+projectID, "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("tasks = %d %s", status, raw)
+	}
+	task := decode[[]model.Task](t, raw)[0]
+	base := "/api/tasks/" + task.ID + "/comments"
+	status, raw = request(t, srv, http.MethodPost, base, "alice", map[string]any{"text": "主评论"})
+	if status != http.StatusCreated {
+		t.Fatalf("create root = %d %s", status, raw)
+	}
+	root := decode[model.Comment](t, raw)
+	status, raw = request(t, srv, http.MethodPost, base, "bob", map[string]any{"text": "回复", "parentCommentId": root.ID})
+	if status != http.StatusCreated {
+		t.Fatalf("create reply = %d %s", status, raw)
+	}
+	reply := decode[model.Comment](t, raw)
+	if reply.ParentCommentID != root.ID {
+		t.Fatalf("reply parent = %q, want %q", reply.ParentCommentID, root.ID)
+	}
+	if status, raw = request(t, srv, http.MethodPost, base, "bob", map[string]any{"text": "wrong task parent", "parentCommentId": "missing"}); status != http.StatusBadRequest {
+		t.Fatalf("missing parent = %d %s", status, raw)
+	}
+	if status, raw = request(t, srv, http.MethodDelete, base+"/"+root.ID, "alice", nil); status != http.StatusNoContent {
+		t.Fatalf("delete root = %d %s", status, raw)
+	}
+	status, raw = request(t, srv, http.MethodGet, base, "", nil)
+	comments := decode[[]model.Comment](t, raw)
+	if status != http.StatusOK || len(comments) != 1 || comments[0].ID != reply.ID || comments[0].ParentCommentID != "" {
+		t.Fatalf("comments after root deletion = %d %+v", status, comments)
 	}
 }

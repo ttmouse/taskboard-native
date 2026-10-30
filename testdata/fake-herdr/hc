@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+	get)
+		state=${TASKBOARD_TEST_HERDR_STATE:-done}
+		if [ "$state" = "unreachable" ]; then
+			printf 'terminal unreachable\n' >&2
+			exit 1
+		fi
+		# A one-shot flap: the first N probes fail, later ones answer. Uses its
+		# own counter file so it never interferes with herdr-app's tab counter.
+		if [ -n "${TASKBOARD_TEST_HERDR_FAIL_FIRST:-}" ]; then
+			flap_counter=${TASKBOARD_TEST_HERDR_COUNTER:-/tmp/taskboard-hc-flap}.hc
+			n=0
+			[ -f "$flap_counter" ] && n=$(cat "$flap_counter")
+			n=$((n + 1))
+			printf '%s' "$n" > "$flap_counter"
+			if [ "$n" -le "$TASKBOARD_TEST_HERDR_FAIL_FIRST" ]; then
+				printf 'terminal unavailable\n' >&2
+				exit 1
+			fi
+		fi
+		# A state-only `done` response from a newly created terminal is ambiguous:
+		# the production tracker treats turn=0 as idle before the first run.
+		# This shared fixture represents an observed, completed turn; tests for
+		# the initial idle state provide their own hc command.
+		printf '{"address":"%s","state":"%s","turn":1,"status":{"state":"%s"}}' "$2" "$state" "$state"
+		;;
+	send)
+		printf '%s\n' "$*" >> "$TASKBOARD_TEST_HC_SENDS"
+		;;
+	*)
+		printf 'unexpected hc command: %s\n' "$*" >&2
+		exit 2
+		;;
+esac

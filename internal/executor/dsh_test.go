@@ -24,13 +24,13 @@ func newTestStore(t *testing.T) *store.Store {
 	return st
 }
 
-// installFakeDsh puts a stub `dsh` on PATH whose behaviour the test scripts.
-func installFakeDsh(t *testing.T, body string) {
+// installFakeCLI puts a stub `codex` on PATH whose behaviour the test scripts.
+func installFakeCLI(t *testing.T, body string) {
 	t.Helper()
 	dir := t.TempDir()
-	script := filepath.Join(dir, "dsh")
+	script := filepath.Join(dir, "codex")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
-		t.Fatalf("write fake dsh: %v", err)
+		t.Fatalf("write fake CLI: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
@@ -68,13 +68,10 @@ func waitFor(t *testing.T, what string, cond func() (bool, string)) {
 }
 
 func TestBuildTaskText(t *testing.T) {
-	task := model.Task{Title: "修复崩溃", Description: "点卡片会崩。\n"}
-	project := model.Project{Name: "demo"}
-	text := BuildTaskText(task, project)
-	for _, want := range []string{"【看板任务派发】", "项目：demo", "任务标题：修复崩溃", "任务正文：", "点卡片会崩。", "不要向看板写评论"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("task text missing %q:\n%s", want, text)
-		}
+	task := model.Task{ID: "task-123", Title: "修复崩溃", Description: "点卡片会崩。\n"}
+	text := BuildTaskText(task)
+	if want := "使用 manage-taskboard-native 执行任务 task-123。"; text != want {
+		t.Fatalf("task text = %q, want %q", text, want)
 	}
 }
 
@@ -95,7 +92,7 @@ func TestDispatchValidation(t *testing.T) {
 	defer d.Close()
 	_, task := projectWithWorkspace(t, st)
 
-	if err := d.Dispatch(task.ID, "codex", "test"); err == nil || !errors.As(err, new(*store.InvalidError)) {
+	if err := d.Dispatch(task.ID, "unknown-runtime", "test"); err == nil || !errors.As(err, new(*store.InvalidError)) {
 		t.Errorf("unknown runtime: want InvalidError, got %v", err)
 	}
 	if err := d.Dispatch("no-such-task", "dsh", "test"); !errors.Is(err, store.ErrNotFound) {
@@ -139,56 +136,44 @@ func TestDispatchValidation(t *testing.T) {
 	}
 }
 
-func TestDispatchRunsFakeDsh(t *testing.T) {
-	installFakeDsh(t, `echo "fake-ok out"`)
+func TestDispatchRunsFakeCLIWithoutClaimingOrWritingOutcome(t *testing.T) {
 	st := newTestStore(t)
-	d := NewDispatcher(st)
 	p, task := projectWithWorkspace(t, st)
-
-	if err := d.Dispatch(task.ID, "dsh", "tester"); err != nil {
-		t.Fatalf("Dispatch: %v", err)
+	installFakeHerdr(t, p.WorkspacePath, "done")
+	d := NewDispatcher(st)
+	defer d.Close()
+	if err := d.Dispatch(task.ID, "codex", "tester"); err != nil {
+		t.Fatal(err)
 	}
-	reviewID := p.Columns[2].ID // 评审
-	doingID := p.Columns[1].ID  // 进行中
-	waitFor(t, "task to land in 评审 with a result comment", func() (bool, string) {
-		cur, err := st.Task(task.ID)
-		if err != nil {
-			return false, "task read: " + err.Error()
-		}
-		if cur.ColumnID != reviewID {
-			return false, "column=" + cur.ColumnID
-		}
-		cs, err := st.Comments(task.ID)
-		if err != nil {
-			return false, "comments read: " + err.Error()
-		}
-		if len(cs) < 2 {
-			return false, "comments=" + fmt.Sprint(len(cs))
-		}
-		joined := cs[0].Text + cs[len(cs)-1].Text
-		ok := strings.Contains(cs[0].Text, "派发 dsh 执行") &&
-			strings.Contains(joined, "fake-ok out")
-		return ok, fmt.Sprintf("comments=%d first=%q last=%q", len(cs), cs[0].Text, cs[len(cs)-1].Text)
+	waitFor(t, "Herdr session returned", func() (bool, string) {
+		run, err := st.Execution(task.ID)
+		return err == nil && run != nil && run.Status == "returned", fmt.Sprint(run, err)
 	})
-	// The claim moved the card through 进行中 on the way to 评审; check the
-	// final state and that a 进行中 move actually happened by ordering.
 	cur, _ := st.Task(task.ID)
-	if cur.ColumnID != reviewID {
-		t.Fatalf("final column = %s, want 评审", cur.ColumnID)
+	if cur.ColumnID != task.ColumnID || cur.Version != task.Version {
+		t.Fatalf("dispatcher changed task: %+v", cur)
 	}
-	_ = doingID
+	if run, _ := st.Execution(task.ID); run.SessionID != "herdr:test-terminal-1" {
+		t.Fatalf("execution did not retain Herdr terminal: %+v", run)
+	}
+	for _, c := range cur.Comments {
+		if strings.Contains(c.Text, "fake-ok out") || strings.Contains(c.Text, "执行完成（") {
+			t.Fatalf("dispatcher wrote agent outcome: %s", c.Text)
+		}
+	}
 }
 
 func TestDispatchFailureKeepsColumn(t *testing.T) {
-	installFakeDsh(t, `echo "boom" >&2; exit 3`)
 	st := newTestStore(t)
-	d := NewDispatcher(st)
 	p, task := projectWithWorkspace(t, st)
+	installFakeHerdr(t, filepath.Join(p.WorkspacePath, "missing"), "done")
+	d := NewDispatcher(st)
+	defer d.Close()
 
-	if err := d.Dispatch(task.ID, "dsh", "tester"); err != nil {
+	if err := d.Dispatch(task.ID, "codex", "tester"); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
-	doingID := p.Columns[1].ID
+	doingID := p.Columns[0].ID
 	waitFor(t, "failure comment", func() (bool, string) {
 		cs, err := st.Comments(task.ID)
 		if err != nil {
@@ -202,7 +187,7 @@ func TestDispatchFailureKeepsColumn(t *testing.T) {
 		for i, c := range cs {
 			fmt.Fprintf(&all, "#%d [%s] %q; ", i, c.Author, c.Text)
 		}
-		return len(cs) >= 2 && strings.Contains(last, "执行失败"),
+		return len(cs) >= 2 && strings.Contains(last, "Herdr 派发 codex 失败"),
 			fmt.Sprintf("comments=%d all=%s", len(cs), all.String())
 	})
 	cur, _ := st.Task(task.ID)
@@ -212,44 +197,39 @@ func TestDispatchFailureKeepsColumn(t *testing.T) {
 }
 
 func TestDispatchInFlightMutex(t *testing.T) {
-	installFakeDsh(t, `sleep 1`)
 	st := newTestStore(t)
+	p, task := projectWithWorkspace(t, st)
+	installFakeHerdr(t, p.WorkspacePath, "working")
 	d := NewDispatcher(st)
-	_, task := projectWithWorkspace(t, st)
 
-	if err := d.Dispatch(task.ID, "dsh", "tester"); err != nil {
+	if err := d.Dispatch(task.ID, "codex", "tester"); err != nil {
 		t.Fatalf("first Dispatch: %v", err)
 	}
-	if err := d.Dispatch(task.ID, "dsh", "tester"); !errors.Is(err, ErrInProgress) {
+	if err := d.Dispatch(task.ID, "codex", "tester"); !errors.Is(err, ErrInProgress) {
 		t.Fatalf("second Dispatch: want ErrInProgress, got %v", err)
 	}
-	waitFor(t, "in-flight entry to clear", func() (bool, string) {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		return len(d.inflight) == 0, fmt.Sprintf("inflight=%d", len(d.inflight))
-	})
+	d.Close()
 }
 
 func TestCloseCancelsRunning(t *testing.T) {
-	installFakeDsh(t, `sleep 30`)
 	st := newTestStore(t)
+	p, task := projectWithWorkspace(t, st)
+	_, sendsLog := installFakeHerdr(t, p.WorkspacePath, "working")
 	d := NewDispatcher(st)
-	_, task := projectWithWorkspace(t, st)
 
-	if err := d.Dispatch(task.ID, "dsh", "tester"); err != nil {
+	if err := d.Dispatch(task.ID, "codex", "tester"); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
-	d.Close()
-	waitFor(t, "cancel comment", func() (bool, string) {
-		cs, err := st.Comments(task.ID)
-		if err != nil {
-			return false, "comments read: " + err.Error()
-		}
-		if len(cs) == 0 {
-			return false, "no comments yet"
-		}
-		last := cs[len(cs)-1].Text
-		return len(cs) >= 2 && strings.Contains(last, "被取消"),
-			fmt.Sprintf("comments=%d last=%q", len(cs), last)
+	waitFor(t, "Herdr session tracking", func() (bool, string) {
+		run, err := st.Execution(task.ID)
+		return err == nil && run != nil && run.Status == "running", fmt.Sprint(run, err)
 	})
+	d.Close()
+	run, err := st.Execution(task.ID)
+	if err != nil || (run.Status != "running" && run.Status != "disconnected") || run.SessionID != "herdr:test-terminal-1" {
+		t.Fatalf("closing the service must leave the Herdr terminal recorded: %+v %v", run, err)
+	}
+	if _, err := os.Stat(sendsLog); !os.IsNotExist(err) {
+		t.Fatalf("closing the service unexpectedly talked to or killed the terminal: err=%v", err)
+	}
 }

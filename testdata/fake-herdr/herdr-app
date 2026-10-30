@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "ls" ]; then
+	printf '{"spaces":[{"id":"test-space","folder":"%s"}]}' "${TASKBOARD_TEST_HERDR_FOLDER:-}"
+	exit 0
+fi
+
+if [ "${1:-}" = "do" ] && [ "${2:-}" = "tab.new" ]; then
+	printf '%s\n' "$@" >> "$TASKBOARD_TEST_HERDR_ARGS"
+	count=0
+	if [ -f "$TASKBOARD_TEST_HERDR_COUNTER" ]; then
+		count=$(cat "$TASKBOARD_TEST_HERDR_COUNTER")
+	fi
+	count=$((count + 1))
+	printf '%s' "$count" > "$TASKBOARD_TEST_HERDR_COUNTER"
+	printf '{"terminal":"test-terminal-%s"}' "$count"
+	exit 0
+fi
+
+printf 'unexpected herdr-app command: %s\n' "$*" >&2
+exit 2

@@ -96,12 +96,30 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	sub := s.hub.subscribe(projectID)
 	defer s.hub.unsubscribe(sub)
 
+	// Subscribe first, then capture a consistent snapshot. Mutations made
+	// after that snapshot stay queued and follow it; older queued events are
+	// already represented by the snapshot and can be skipped.
+	snapshot, err := s.store.Snapshot(projectID)
+	if err != nil {
+		http.Error(w, "无法读取看板快照", http.StatusInternalServerError)
+		return
+	}
+	initial, err := json.Marshal(model.Event{
+		Seq: snapshot.Seq, Type: model.EventBoardSnapshot,
+		Snapshot: &snapshot,
+	})
+	if err != nil {
+		http.Error(w, "无法编码看板快照", http.StatusInternalServerError)
+		return
+	}
+
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", snapshot.Seq, model.EventBoardSnapshot, initial)
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
@@ -120,11 +138,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-s.closed:
 			return
 		case ev := <-sub.events:
+			if ev.Seq <= snapshot.Seq {
+				continue
+			}
 			raw, err := json.Marshal(ev)
 			if err != nil {
 				continue
 			}
-			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, raw); err != nil {
+			if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, raw); err != nil {
 				return
 			}
 			flusher.Flush()

@@ -113,12 +113,14 @@ func StartOptions(opts Options) (*Server, error) {
 		return nil, err
 	}
 	h := newHub()
-	st.OnEvent = h.publish
-
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		st.Close()
 		return nil, err
+	}
+	boardHost, boardPort, _ := net.SplitHostPort(ln.Addr().String())
+	if ip := net.ParseIP(boardHost); ip != nil && ip.IsUnspecified() {
+		boardHost = "127.0.0.1"
 	}
 	s := &Server{
 		Addr:     ln.Addr().String(),
@@ -127,9 +129,15 @@ func StartOptions(opts Options) (*Server, error) {
 		store:    st,
 		hub:      h,
 		slow:     slow,
-		dispatch: executor.NewDispatcher(st),
+		dispatch: executor.NewDispatcher(st, dbPath+".runtimes.json", "http://"+net.JoinHostPort(boardHost, boardPort)),
 		closed:   make(chan struct{}),
 		listener: ln,
+	}
+	st.OnEvent = func(ev model.Event) {
+		h.publish(ev)
+		if ev.Task != nil && (ev.Type == model.EventTaskCreated || ev.Type == model.EventTaskMoved || ev.Type == model.EventTaskArchived) {
+			go s.dispatch.NoteProjectRun(*ev.Task)
+		}
 	}
 	s.URL = "http://" + s.Addr
 	s.http = &http.Server{
@@ -173,15 +181,27 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/projects", s.handleProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
 	mux.HandleFunc("PATCH /api/projects/{id}", s.handlePatchProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", s.handleDeleteProject)
+	mux.HandleFunc("PATCH /api/projects/{id}/columns/{columnID}", s.handlePatchColumn)
 	mux.HandleFunc("GET /api/projects/{id}/board", s.handleBoard)
+	mux.HandleFunc("POST /api/projects/{id}/run", s.handleStartProjectRun)
+	mux.HandleFunc("GET /api/projects/{id}/run", s.handleProjectRun)
+	mux.HandleFunc("POST /api/projects/{id}/run/stop", s.handleStopProjectRun)
 	mux.HandleFunc("GET /api/tasks", s.handleTasks)
 	mux.HandleFunc("POST /api/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleTask)
+	mux.HandleFunc("POST /api/tasks/{id}/images", s.handleUploadImage)
+	mux.HandleFunc("POST /api/images", s.handleUploadStandaloneImage)
+	mux.HandleFunc("GET /api/images/{hash}", s.handleImage)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.handlePatchTask)
 	mux.HandleFunc("POST /api/tasks/{id}/archive", s.handleArchive)
 	mux.HandleFunc("POST /api/tasks/{id}/dispatch", s.handleDispatch)
+	mux.HandleFunc("POST /api/tasks/{id}/execution/release", s.handleReleaseExecution)
 	mux.HandleFunc("GET /api/tasks/{id}/comments", s.handleComments)
 	mux.HandleFunc("POST /api/tasks/{id}/comments", s.handleAddComment)
+	mux.HandleFunc("PATCH /api/tasks/{id}/comments/{commentId}", s.handleUpdateComment)
+	mux.HandleFunc("DELETE /api/tasks/{id}/comments/{commentId}", s.handleDeleteComment)
+	mux.HandleFunc("POST /api/tasks/{id}/comments/{commentId}/continue", s.handleContinue)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	return s.middleware(mux)
 }
@@ -229,14 +249,19 @@ type errorBody struct {
 func writeError(w http.ResponseWriter, err error) {
 	var invalid *store.InvalidError
 	var conflict *store.VersionError
+	var roleConflict *store.RoleConflictError
 	switch {
 	case errors.As(err, &conflict):
 		cur := conflict.Current
 		writeJSON(w, http.StatusConflict, errorBody{Error: "version_conflict", Task: &cur})
+	case errors.As(err, &roleConflict):
+		writeJSON(w, http.StatusConflict, errorBody{Error: "role_conflict"})
 	case errors.As(err, &invalid):
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error()})
 	case errors.Is(err, store.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errorBody{Error: "not_found"})
+	case errors.Is(err, store.ErrForbidden):
+		writeJSON(w, http.StatusForbidden, errorBody{Error: "comment_author_mismatch"})
 	default:
 		log.Printf("taskboard: %v", err)
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: "internal_error"})
@@ -277,20 +302,63 @@ func (s *Server) handleProjects(w http.ResponseWriter, _ *http.Request) {
 type newProject struct {
 	Name          string `json:"name"`
 	WorkspacePath string `json:"workspacePath"`
+	Color         string `json:"color,omitempty"`
+}
+
+// checkColor validates an optional project accent color: empty means "the
+// window assigns a stable slot"; otherwise it must be a "#rrggbb" hex string
+// so the GUI can paint with it without parsing surprises.
+func checkColor(w http.ResponseWriter, raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", true
+	}
+	if len(raw) != 7 || raw[0] != '#' {
+		writeBadRequest(w, "color must be a #rrggbb hex string or empty")
+		return "", false
+	}
+	for i := 1; i < len(raw); i++ {
+		c := raw[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			continue
+		}
+		writeBadRequest(w, "color must be a #rrggbb hex string or empty")
+		return "", false
+	}
+	return raw, true
+}
+
+// expandHome expands a leading "~" or "~/" to the user's home directory,
+// so paths like ~/Projects/demo work when typed by hand. "~user" is not
+// supported — only the current user's home.
+func expandHome(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return filepath.Join(home, p[2:])
 }
 
 // checkWorkspacePath validates an optional workspace path: empty means
-// "none"; otherwise it must be an existing absolute directory. Returns the
-// cleaned path. Shared by project create and project edit.
+// "none"; otherwise it must be an existing absolute directory (~ expands
+// to the home directory first). Returns the cleaned path. Shared by
+// project create and project edit.
 func checkWorkspacePath(w http.ResponseWriter, raw string) (string, bool) {
 	if raw == "" {
 		return "", true
 	}
-	if !filepath.IsAbs(raw) {
+	expanded := expandHome(strings.TrimSpace(raw))
+	if !filepath.IsAbs(expanded) {
 		writeBadRequest(w, "workspacePath must be an absolute directory")
 		return "", false
 	}
-	cleaned := filepath.Clean(raw)
+	cleaned := filepath.Clean(expanded)
 	info, err := os.Stat(cleaned)
 	if err != nil || !info.IsDir() {
 		writeBadRequest(w, "workspacePath must be an existing directory")
@@ -312,7 +380,11 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	project, err := s.store.CreateProjectWithPath(req.Name, workspacePath, agent(r))
+	color, ok := checkColor(w, req.Color)
+	if !ok {
+		return
+	}
+	project, err := s.store.CreateProjectWithColor(req.Name, workspacePath, color, agent(r))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -323,6 +395,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 type projectPatch struct {
 	Name          *string `json:"name"`
 	WorkspacePath *string `json:"workspacePath"`
+	Color         *string `json:"color"`
 }
 
 // handlePatchProject edits a project's name and/or workspace path. Absent
@@ -333,13 +406,20 @@ func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	patch := store.ProjectPatch{Name: req.Name, WorkspacePath: req.WorkspacePath}
+	patch := store.ProjectPatch{Name: req.Name, WorkspacePath: req.WorkspacePath, Color: req.Color}
 	if req.WorkspacePath != nil && *req.WorkspacePath != "" {
 		cleaned, ok := checkWorkspacePath(w, *req.WorkspacePath)
 		if !ok {
 			return
 		}
 		patch.WorkspacePath = &cleaned
+	}
+	if req.Color != nil {
+		cleaned, ok := checkColor(w, *req.Color)
+		if !ok {
+			return
+		}
+		patch.Color = &cleaned
 	}
 	if req.Name != nil && strings.TrimSpace(*req.Name) == "" {
 		writeBadRequest(w, "name is required")
@@ -351,6 +431,46 @@ func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, project)
+}
+
+// handleDeleteProject removes a project with its columns and every card
+// under it — archived ones included. The GUI confirms with card counts
+// before calling; the server keeps no undo.
+func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
+	if err := s.dispatch.DeleteProject(r.PathValue("id"), agent(r)); err != nil {
+		var busy *executor.ErrProjectBusy
+		if errors.As(err, &busy) || errors.Is(err, store.ErrActiveExecution) {
+			writeJSON(w, http.StatusConflict, errorBody{Error: "project_busy"})
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+type columnPatch struct {
+	Role *string `json:"role"`
+}
+
+// handlePatchColumn sets a column's workflow role (empty clears it). The
+// store enforces the role enum, project ownership and role uniqueness; this
+// boundary only adds the "field must be present" rule.
+func (s *Server) handlePatchColumn(w http.ResponseWriter, r *http.Request) {
+	var req columnPatch
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Role == nil {
+		writeBadRequest(w, "role is required")
+		return
+	}
+	column, err := s.store.SetColumnRole(r.PathValue("id"), r.PathValue("columnID"), *req.Role, agent(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, column)
 }
 
 func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
@@ -529,6 +649,9 @@ type newTask struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Assignee    string `json:"assignee"`
+	// DispatchRuntime turns the create into the one-call "create and
+	// dispatch" mode; empty keeps the plain create-only mode.
+	DispatchRuntime string `json:"dispatchRuntime"`
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -544,10 +667,42 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, "title is required")
 		return
 	}
+	runtime := strings.TrimSpace(req.DispatchRuntime)
+	if runtime != "" {
+		// Reject a bad handoff before the card exists, so a 400 leaves
+		// nothing behind to clean up.
+		if !executor.KnownRuntime(runtime) {
+			writeBadRequest(w, "unknown runtime %q", runtime)
+			return
+		}
+		project, err := s.store.Project(req.ProjectID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		dir := strings.TrimSpace(project.WorkspacePath)
+		if dir == "" {
+			writeBadRequest(w, "project %q has no workspacePath; set one before dispatching", project.Name)
+			return
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			writeBadRequest(w, "workspacePath %q is not a directory on this machine", dir)
+			return
+		}
+	}
 	task, err := s.store.CreateTask(req.ProjectID, req.ColumnID, req.Title, req.Description, req.Assignee, agent(r))
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if runtime != "" {
+		// A fresh card cannot be in flight, so a failure here is rare
+		// (store hiccup, workspace deleted in between). The card stays;
+		// the failed handoff is recorded on it instead of 500-ing away
+		// the successful creation.
+		if err := s.dispatch.Dispatch(task.ID, runtime, agent(r)); err != nil {
+			_, _ = s.store.AddComment(task.ID, "派发失败："+err.Error(), agent(r))
+		}
 	}
 	writeJSON(w, http.StatusCreated, task)
 }
@@ -618,9 +773,42 @@ type dispatchRequest struct {
 	Runtime string `json:"runtime"`
 }
 
+// handleReleaseExecution converges a card's execution record to detached so it
+// stops holding the write lock. People use it when the original session is gone
+// and the automatic Herdr grace window is not enough (or never applied). A run
+// that may still be writing is refused: releasing it would allow a second
+// writer on the same card.
+func (s *Server) handleReleaseExecution(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	run, err := s.store.Execution(taskID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if run == nil {
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "no_execution"})
+		return
+	}
+	if !run.Releasable() {
+		writeJSON(w, http.StatusConflict, errorBody{Error: "execution_active"})
+		return
+	}
+	detail := fmt.Sprintf("人工释放执行记录（%s）：原会话不可用，写锁已释放，可重新派发或评论跟进", agent(r))
+	if _, err := s.store.ReleaseExecution(taskID, detail); err != nil {
+		writeError(w, err)
+		return
+	}
+	task, err := s.store.Task(taskID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
+}
+
 // handleDispatch starts an async execution of the task on an execution
-// runtime. The body is optional: with no runtime named, the only runtime
-// the service ships (dsh) is used. The run's progress lands as normal task
+// runtime. The body is optional: with no runtime named, dsh remains the
+// default. The run's progress lands as normal task
 // comments and column moves, so clients need no new event types.
 func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	var req dispatchRequest
@@ -653,6 +841,42 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"taskId": taskID, "runtime": runtime})
 }
 
+func (s *Server) handleStartProjectRun(w http.ResponseWriter, r *http.Request) {
+	var req dispatchRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	run, err := s.dispatch.StartProjectRun(r.PathValue("id"), strings.TrimSpace(req.Runtime), agent(r))
+	if err != nil {
+		var busy *executor.ErrProjectBusy
+		if errors.As(err, &busy) {
+			writeJSON(w, http.StatusConflict, errorBody{Error: busy.Error()})
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, run)
+}
+
+func (s *Server) handleProjectRun(w http.ResponseWriter, r *http.Request) {
+	run, err := s.store.ProjectRun(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) handleStopProjectRun(w http.ResponseWriter, r *http.Request) {
+	run, err := s.dispatch.StopProjectRun(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
 func (s *Server) handleComments(w http.ResponseWriter, r *http.Request) {
 	comments, err := s.store.Comments(r.PathValue("id"))
 	if err != nil {
@@ -664,6 +888,22 @@ func (s *Server) handleComments(w http.ResponseWriter, r *http.Request) {
 
 type newComment struct {
 	Text string `json:"text"`
+	// Mention addresses the comment to one execution channel (@ in the
+	// composer). Empty keeps the current behaviour: the card's session answers.
+	Mention         string `json:"mention,omitempty"`
+	ParentCommentID string `json:"parentCommentId,omitempty"`
+}
+
+func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request) {
+	if err := s.dispatch.Continue(r.PathValue("id"), r.PathValue("commentId"), agent(r)); err != nil {
+		if errors.Is(err, executor.ErrInProgress) {
+			writeJSON(w, http.StatusConflict, errorBody{Error: "原会话仍在执行或接收状态不确定，请先核对原会话"})
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"taskId": r.PathValue("id"), "commentId": r.PathValue("commentId")})
 }
 
 func (s *Server) handleAddComment(w http.ResponseWriter, r *http.Request) {
@@ -675,10 +915,69 @@ func (s *Server) handleAddComment(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, "text is required")
 		return
 	}
-	c, err := s.store.AddComment(r.PathValue("id"), req.Text, agent(r))
+	mention := strings.TrimSpace(req.Mention)
+	if mention != "" && !executor.KnownRuntime(mention) {
+		writeBadRequest(w, "%s", "unknown mention channel: "+mention)
+		return
+	}
+	// An addressed comment on a card in review is actionable feedback. Return
+	// that card to the project's intake column before the caller starts the
+	// mentioned execution. Keep ordinary discussion in review.
+	var returnToIntake *struct {
+		task     model.Task
+		columnID string
+	}
+	if mention != "" {
+		task, err := s.store.Task(r.PathValue("id"))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		project, err := s.store.Project(task.ProjectID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if review, ok := project.ColumnByRole(model.ColumnRoleReview); ok && task.ColumnID == review.ID {
+			if intake, ok := project.ColumnByRole(model.ColumnRoleIntake); ok {
+				returnToIntake = &struct {
+					task     model.Task
+					columnID string
+				}{task: task, columnID: intake.ID}
+			}
+		}
+	}
+	c, err := s.store.AddCommentWithParent(r.PathValue("id"), req.Text, agent(r), mention, strings.TrimSpace(req.ParentCommentID))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	if returnToIntake != nil {
+		if _, err := s.store.MoveTask(returnToIntake.task.ID, returnToIntake.task.Version, returnToIntake.columnID, "", agent(r)); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) handleUpdateComment(w http.ResponseWriter, r *http.Request) {
+	var req newComment
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	comment, err := s.store.UpdateComment(r.PathValue("id"), r.PathValue("commentId"), req.Text, agent(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, comment)
+}
+
+func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteComment(r.PathValue("id"), r.PathValue("commentId"), agent(r)); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
