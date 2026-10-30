@@ -111,6 +111,11 @@ type Client struct {
 	Token string
 	Agent string
 	HTTP  *http.Client
+
+	// agent is Agent as the background goroutines read it: the SSE stream
+	// runs on its own goroutine while the window's main thread changes the
+	// identity (the 显示名 preference), so the value is swapped atomically.
+	agent atomic.Value // string
 }
 
 // New builds a client for d, with agent "local" when empty.
@@ -122,12 +127,38 @@ func New(d *Discover, agent string) *Client {
 			agent = "local"
 		}
 	}
-	return &Client{
+	c := &Client{
 		Base:  "http://" + d.HostPort(),
 		Token: d.Token,
-		Agent: agent,
 		HTTP:  &http.Client{Timeout: 10 * time.Second},
 	}
+	// Store through SetAgent so every client, however it was built, is
+	// readable on the request and stream goroutines from the start.
+	c.SetAgent(agent)
+	return c
+}
+
+// SetAgent changes the identity every later request carries, which the
+// window does when the user edits 显示名. An empty name keeps the current
+// one: the caller resolves the fallback, not this method.
+func (c *Client) SetAgent(agent string) {
+	if agent == "" {
+		return
+	}
+	c.Agent = agent
+	c.agent.Store(agent)
+}
+
+// currentAgent is the identity to send now, as both the request path and
+// the SSE goroutine read it.
+func (c *Client) currentAgent() string {
+	if v, ok := c.agent.Load().(string); ok && v != "" {
+		return v
+	}
+	if c.Agent != "" {
+		return c.Agent
+	}
+	return "local"
 }
 
 // Dial finds the service and checks that it answers.
@@ -156,7 +187,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Agent", c.Agent)
+	req.Header.Set("X-Agent", c.currentAgent())
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
@@ -184,6 +215,16 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	if resp.StatusCode == http.StatusConflict {
 		if t, ok := decodeConflict(raw); ok {
 			return &ConflictError{Current: t}
+		}
+		// A taskless 409 is not a stale version: the service uses it for
+		// "this session is busy or its receipt is uncertain". Keep its words
+		// instead of flattening every 409 into "版本冲突".
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &e)
+		if msg := strings.TrimSpace(e.Error); msg != "" {
+			return &HTTPError{Status: resp.StatusCode, Msg: msg}
 		}
 		return &HTTPError{Status: resp.StatusCode, Msg: "版本冲突"}
 	}
@@ -217,11 +258,7 @@ func decodeConflict(raw []byte) (model.Task, bool) {
 // --- wire types ---
 
 // Board is one project's columns and live tasks.
-type Board struct {
-	Project model.Project  `json:"project"`
-	Columns []model.Column `json:"columns"`
-	Tasks   []model.Task   `json:"tasks"`
-}
+type Board = model.ProjectBoard
 
 // NewTask is the body of POST /api/tasks.
 type NewTask struct {
@@ -230,6 +267,11 @@ type NewTask struct {
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
 	Assignee    string `json:"assignee,omitempty"`
+	// DispatchRuntime turns the create into the one-call "create and
+	// dispatch" mode: the service validates the channel and the project's
+	// workspacePath first, so a rejected call leaves no card behind.
+	// Empty keeps the plain create-only mode.
+	DispatchRuntime string `json:"dispatchRuntime,omitempty"`
 }
 
 // TaskPatch is the body of PATCH /api/tasks/{id}.
@@ -267,10 +309,19 @@ func (c *Client) CreateProject(name string) (model.Project, error) {
 
 // CreateProjectWithPath adds a project and optionally binds a local workspace directory.
 func (c *Client) CreateProjectWithPath(name, workspacePath string) (model.Project, error) {
+	return c.CreateProjectWithColor(name, workspacePath, "")
+}
+
+// CreateProjectWithColor adds a project with an optional workspace directory
+// and an accent color ("#rrggbb", empty for the window's stable slot).
+func (c *Client) CreateProjectWithColor(name, workspacePath, color string) (model.Project, error) {
 	var p model.Project
 	body := map[string]string{"name": name}
 	if workspacePath != "" {
 		body["workspacePath"] = workspacePath
+	}
+	if color != "" {
+		body["color"] = color
 	}
 	err := c.do(context.Background(), "POST", "/api/projects", body, &p)
 	return p, err
@@ -279,10 +330,22 @@ func (c *Client) CreateProjectWithPath(name, workspacePath string) (model.Projec
 // UpdateProject saves a project's name and workspace path (the GUI edit
 // form sends both). An empty workspacePath clears the path.
 func (c *Client) UpdateProject(id, name, workspacePath string) (model.Project, error) {
+	return c.UpdateProjectWithColor(id, name, workspacePath, "")
+}
+
+// UpdateProjectWithColor saves a project's name, workspace path and accent
+// color; an empty color clears it back to the automatic slot.
+func (c *Client) UpdateProjectWithColor(id, name, workspacePath, color string) (model.Project, error) {
 	var p model.Project
 	err := c.do(context.Background(), "PATCH", "/api/projects/"+url.PathEscape(id),
-		map[string]string{"name": name, "workspacePath": workspacePath}, &p)
+		map[string]string{"name": name, "workspacePath": workspacePath, "color": color}, &p)
 	return p, err
+}
+
+// DeleteProject removes a project and every card under it — archived ones
+// included. The GUI confirms before calling; the server keeps no undo.
+func (c *Client) DeleteProject(id string) error {
+	return c.do(context.Background(), "DELETE", "/api/projects/"+url.PathEscape(id), nil, nil)
 }
 
 // Board reads a project's columns and live tasks in one call, falling back
@@ -369,6 +432,24 @@ func (c *Client) CreateTask(projectID, columnID, title, description, assignee st
 	return t, err
 }
 
+// CreateTaskAndDispatch adds a task and hands it to a runtime in the same
+// call — the "建卡并派发" mode. An empty runtime keeps the create-only
+// mode. The service validates the channel and the project's workspacePath
+// before the card exists, so a rejected call leaves nothing behind.
+func (c *Client) CreateTaskAndDispatch(projectID, columnID, title, description, assignee, runtime string) (model.Task, error) {
+	in := NewTask{
+		ProjectID:       projectID,
+		ColumnID:        columnID,
+		Title:           title,
+		Description:     description,
+		Assignee:        assignee,
+		DispatchRuntime: runtime,
+	}
+	var t model.Task
+	err := c.do(context.Background(), "POST", "/api/tasks", in, &t)
+	return t, err
+}
+
 // Update patches a task's text; version 0 reads the current version first.
 func (c *Client) Update(id string, version int, title, description, assignee *string) (model.Task, error) {
 	if version == 0 {
@@ -415,6 +496,14 @@ func (c *Client) Archive(id string, version int) (model.Task, error) {
 	return t, err
 }
 
+// ReleaseExecution converges the card's execution record to detached so it no
+// longer blocks dispatch or comment follow-up.
+func (c *Client) ReleaseExecution(taskID string) (model.Task, error) {
+	var t model.Task
+	err := c.do(context.Background(), "POST", "/api/tasks/"+url.PathEscape(taskID)+"/execution/release", nil, &t)
+	return t, err
+}
+
 // Restore puts an archived card back: the service clears the flag, bumps
 // the version and places the card at the bottom of its own column. version
 // 0 reads the current one first.
@@ -442,14 +531,70 @@ func (c *Client) Comments(taskID string) ([]model.Comment, error) {
 
 // AddComment appends a comment.
 func (c *Client) AddComment(taskID, text string) (model.Comment, error) {
+	return c.AddCommentTo(taskID, text, "")
+}
+
+// AddCommentTo posts a comment addressed to one execution channel (@mention).
+// An empty mention means the comment carries no address.
+func (c *Client) AddCommentTo(taskID, text, mention string) (model.Comment, error) {
+	return c.AddCommentWithParent(taskID, text, mention, "")
+}
+
+// AddCommentWithParent posts a comment or a reply to another comment on the same task.
+func (c *Client) AddCommentWithParent(taskID, text, mention, parentCommentID string) (model.Comment, error) {
+	body := map[string]string{"text": text}
+	if mention != "" {
+		body["mention"] = mention
+	}
+	if parentCommentID != "" {
+		body["parentCommentId"] = parentCommentID
+	}
 	var cm model.Comment
-	err := c.do(context.Background(), "POST", "/api/tasks/"+url.PathEscape(taskID)+"/comments",
-		map[string]string{"text": text}, &cm)
+	err := c.do(context.Background(), "POST", "/api/tasks/"+url.PathEscape(taskID)+"/comments", body, &cm)
 	return cm, err
 }
 
+// UpdateComment edits one comment authored by this client identity.
+func (c *Client) UpdateComment(taskID, commentID, text string) (model.Comment, error) {
+	var cm model.Comment
+	err := c.do(context.Background(), "PATCH", "/api/tasks/"+url.PathEscape(taskID)+"/comments/"+url.PathEscape(commentID), map[string]string{"text": text}, &cm)
+	return cm, err
+}
+
+// DeleteComment removes one comment authored by this client identity.
+func (c *Client) DeleteComment(taskID, commentID string) error {
+	return c.do(context.Background(), "DELETE", "/api/tasks/"+url.PathEscape(taskID)+"/comments/"+url.PathEscape(commentID), nil, nil)
+}
+
+// ContinueComment explicitly hands a saved comment back to the original session,
+// or — when the comment @mentioned another channel — opens a session there.
+func (c *Client) ContinueComment(taskID, commentID string) error {
+	return c.do(context.Background(), "POST", "/api/tasks/"+url.PathEscape(taskID)+"/comments/"+url.PathEscape(commentID)+"/continue", nil, nil)
+}
+
+// StartProjectRun fixes one project's card list and starts it on runtime.
+func (c *Client) StartProjectRun(projectID, runtime string) (model.ProjectRun, error) {
+	var run model.ProjectRun
+	err := c.do(context.Background(), "POST", "/api/projects/"+url.PathEscape(projectID)+"/run", map[string]string{"runtime": runtime}, &run)
+	return run, err
+}
+
+// ProjectRun reads the latest handoff for a project.
+func (c *Client) ProjectRun(projectID string) (model.ProjectRun, error) {
+	var run model.ProjectRun
+	err := c.do(context.Background(), "GET", "/api/projects/"+url.PathEscape(projectID)+"/run", nil, &run)
+	return run, err
+}
+
+// StopProjectRun stops dispatching further cards. The current card keeps running.
+func (c *Client) StopProjectRun(projectID string) (model.ProjectRun, error) {
+	var run model.ProjectRun
+	err := c.do(context.Background(), "POST", "/api/projects/"+url.PathEscape(projectID)+"/run/stop", map[string]string{}, &run)
+	return run, err
+}
+
 // Dispatch starts an async execution of the task on an execution runtime
-// ("dsh"). It returns as soon as the service has launched the run; progress
+// ("dsh", "codex", "pi", "claude"). It returns as soon as the service has launched the run; progress
 // lands as task comments and column moves. An empty runtime means the
 // service's default.
 func (c *Client) Dispatch(taskID, runtime string) error {
@@ -487,18 +632,17 @@ func (s StreamState) String() string {
 }
 
 // Subscribe reads the project's events, calling onEvent for each and
-// onState whenever the connection changes. It reconnects with exponential
-// backoff — reset by every connection that stood — resuming from
-// Last-Event-ID so a drop loses nothing, and blocks until ctx ends.
+// onState whenever the connection changes. Every connection begins with a
+// consistent board snapshot, which repairs any gap caused by a disconnect.
+// It reconnects with exponential backoff and blocks until ctx ends.
 func (c *Client) Subscribe(ctx context.Context, projectID string, onEvent func(model.Event), onState func(StreamState)) error {
-	var lastID atomic.Int64
 	backoff := 250 * time.Millisecond
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		reached := false
-		c.consume(ctx, projectID, &lastID, func(ev model.Event) {
+		c.consume(ctx, projectID, func(ev model.Event) {
 			reached = true
 			if onEvent != nil {
 				onEvent(ev)
@@ -532,7 +676,7 @@ func (c *Client) Subscribe(ctx context.Context, projectID string, onEvent func(m
 
 // consume runs one connection, calling onEvent per event and onState on
 // every state change, until the stream ends or ctx ends.
-func (c *Client) consume(ctx context.Context, projectID string, lastID *atomic.Int64, onEvent func(model.Event), onState func(StreamState)) error {
+func (c *Client) consume(ctx context.Context, projectID string, onEvent func(model.Event), onState func(StreamState)) error {
 	u := c.Base + "/api/events"
 	if projectID != "" {
 		u += "?projectId=" + url.QueryEscape(projectID)
@@ -541,13 +685,10 @@ func (c *Client) consume(ctx context.Context, projectID string, lastID *atomic.I
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Agent", c.Agent)
+	req.Header.Set("X-Agent", c.currentAgent())
 	req.Header.Set("Accept", "text/event-stream")
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	if id := lastID.Load(); id > 0 {
-		req.Header.Set("Last-Event-ID", strconv.FormatInt(id, 10))
 	}
 	hc := &http.Client{} // no timeout: the stream stays open
 	resp, err := hc.Do(req)
@@ -575,9 +716,6 @@ func (c *Client) consume(ctx context.Context, projectID string, lastID *atomic.I
 					if ev.Type == "" {
 						ev.Type = evType
 					}
-					if ev.Seq > 0 {
-						lastID.Store(ev.Seq)
-					}
 					if onEvent != nil {
 						onEvent(ev)
 					}
@@ -591,9 +729,7 @@ func (c *Client) consume(ctx context.Context, projectID string, lastID *atomic.I
 		case strings.HasPrefix(line, "data:"):
 			data = append(data, strings.TrimSpace(line[len("data:"):])...)
 		case strings.HasPrefix(line, "id:"):
-			if id, err := strconv.ParseInt(strings.TrimSpace(line[len("id:"):]), 10, 64); err == nil {
-				lastID.Store(id)
-			}
+			// Sequence IDs are diagnostic; recovery uses the snapshot frame.
 		}
 	}
 	if err := sc.Err(); err != nil {

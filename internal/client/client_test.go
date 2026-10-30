@@ -2,7 +2,10 @@ package client_test
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,26 @@ import (
 	"taskboard-native/internal/model"
 	"taskboard-native/internal/service"
 )
+
+// A 409 without a task body is not a stale version: the service uses it for a
+// busy or uncertain session. Flattening it to "版本冲突" hid the real reason.
+func TestTasklessConflictKeepsServiceReason(t *testing.T) {
+	const reason = "原会话仍在执行或接收状态不确定，请先核对原会话"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"` + reason + `"}`))
+	}))
+	defer ts.Close()
+	c := client.New(&client.Discover{Addr: strings.TrimPrefix(ts.URL, "http://")}, "test-agent")
+	err := c.ContinueComment("t-1", "c-1")
+	if err == nil || !strings.Contains(err.Error(), reason) {
+		t.Fatalf("continue error = %v, want the service reason", err)
+	}
+	if strings.Contains(err.Error(), "版本冲突") {
+		t.Fatalf("taskless 409 flattened to a version conflict: %v", err)
+	}
+}
 
 // newService starts the real HTTP service on a random port with a fresh
 // database, so the client is exercised over the wire and not against a
@@ -24,6 +47,11 @@ func newService(t *testing.T) (*service.Server, *client.Client) {
 	c := client.New(&client.Discover{Addr: srv.Addr}, "test-agent")
 	if _, err := c.Health(); err != nil {
 		t.Fatalf("health: %v", err)
+	}
+	// A newly opened service starts projectless; these scenarios exercise the
+	// task lifecycle, so give them one fixture board.
+	if _, err := c.CreateProject("local"); err != nil {
+		t.Fatalf("fixture project: %v", err)
 	}
 	return srv, c
 }

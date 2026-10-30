@@ -22,6 +22,8 @@ import (
 
 // ErrNotFound reports a missing project, column, task or comment.
 var ErrNotFound = errors.New("not found")
+var ErrForbidden = errors.New("comment author mismatch")
+var ErrActiveExecution = errors.New("project has an active execution")
 
 // VersionError reports an optimistic-concurrency mismatch. Current is the
 // task as stored, so callers can return it to the client.
@@ -45,6 +47,7 @@ CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   workspace_path TEXT NOT NULL DEFAULT '',
+  color TEXT NOT NULL DEFAULT '',
   position INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -53,7 +56,8 @@ CREATE TABLE IF NOT EXISTS "columns" (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
   name TEXT NOT NULL,
-  position INTEGER NOT NULL DEFAULT 0
+  position INTEGER NOT NULL DEFAULT 0,
+  role TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS columns_project ON "columns"(project_id, position);
 CREATE TABLE IF NOT EXISTS tasks (
@@ -77,18 +81,42 @@ CREATE TABLE IF NOT EXISTS comments (
   task_id TEXT NOT NULL,
   author TEXT NOT NULL,
   body TEXT NOT NULL,
+  mention TEXT NOT NULL DEFAULT '',
+  parent_comment_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id, created_at);
+CREATE TABLE IF NOT EXISTS executions (
+  task_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS followups (
+  comment_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_runs (
+  project_id TEXT PRIMARY KEY,
+  runtime TEXT NOT NULL,
+  status TEXT NOT NULL,
+  task_ids TEXT NOT NULL,
+  cursor INTEGER NOT NULL DEFAULT 0,
+  current_task_id TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
 `
 
-// DefaultColumns returns the seeded board layout.
+// DefaultColumns returns the seeded board layout, each column carrying the
+// workflow role users and tools know it by.
 func DefaultColumns() []model.Column {
 	return []model.Column{
-		{Name: "待办"},
-		{Name: "进行中"},
-		{Name: "评审"},
-		{Name: "完成"},
+		{Name: "待办", Role: model.ColumnRoleIntake},
+		{Name: "进行中", Role: model.ColumnRoleDoing},
+		{Name: "等你", Role: model.ColumnRoleReview},
+		{Name: "完成", Role: model.ColumnRoleDone},
 	}
 }
 
@@ -103,7 +131,7 @@ type Store struct {
 	OnEvent func(model.Event)
 }
 
-// Open opens (creating and seeding when empty) the database at path.
+// Open opens (creating when absent) the database at path.
 func Open(path string) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("store: empty database path")
@@ -118,10 +146,6 @@ func Open(path string) (*Store, error) {
 	}
 	s := &Store{db: db}
 	if err := s.migrate(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := s.seed(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -146,59 +170,114 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	// CREATE TABLE does not add fields to an existing database. Preserve
 	// existing projects and cards while upgrading older installations.
+	executionColumns, err := s.db.Query(ctx, `PRAGMA table_info(executions)`)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"runtime", "followup_id", "previous_turn_id"} {
+		found := false
+		for _, column := range executionColumns.Values {
+			if str(column[1]) == name {
+				found = true
+			}
+		}
+		if !found {
+			if _, err := s.db.Execute(ctx, `ALTER TABLE executions ADD COLUMN `+name+` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+	}
+	// Comments gained an address field: the channel an author @mentioned.
+	// Older databases keep every comment, they simply have no address.
+	commentColumns, err := s.db.Query(ctx, `PRAGMA table_info(comments)`)
+	if err != nil {
+		return fmt.Errorf("store: comment schema: %w", err)
+	}
+	hasMention, hasParentCommentID := false, false
+	for _, column := range commentColumns.Values {
+		switch str(column[1]) {
+		case "mention":
+			hasMention = true
+		case "parent_comment_id":
+			hasParentCommentID = true
+		}
+	}
+	if !hasMention {
+		if _, err := s.db.Execute(ctx, `ALTER TABLE comments ADD COLUMN mention TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: comment mention migration: %w", err)
+		}
+	}
+	if !hasParentCommentID {
+		if _, err := s.db.Execute(ctx, `ALTER TABLE comments ADD COLUMN parent_comment_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: comment reply migration: %w", err)
+		}
+	}
+	// Column roles: add the field to older databases, then backfill the
+	// meaning each legacy fixed name carried. The backfill only fills an
+	// empty role and never takes a role another column of the same project
+	// already holds, so an explicit choice is not overwritten, roles stay
+	// unique per project, and a second open changes nothing.
+	columnColumns, err := s.db.Query(ctx, `PRAGMA table_info("columns")`)
+	if err != nil {
+		return fmt.Errorf("store: column schema: %w", err)
+	}
+	hasRole := false
+	for _, column := range columnColumns.Values {
+		if str(column[1]) == "role" {
+			hasRole = true
+		}
+	}
+	if !hasRole {
+		if _, err := s.db.Execute(ctx, `ALTER TABLE "columns" ADD COLUMN role TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: column role migration: %w", err)
+		}
+		for _, role := range model.ColumnRoles {
+			name := model.LegacyColumnName(role)
+			if name == "" {
+				continue
+			}
+			if _, err := s.db.Execute(ctx,
+				`UPDATE "columns" SET role = ? WHERE name = ? AND role = ''
+			 AND NOT EXISTS (SELECT 1 FROM "columns" taken WHERE taken.project_id = "columns".project_id AND taken.role = ?)`,
+				role, name, role,
+			); err != nil {
+				return fmt.Errorf("store: column role backfill: %w", err)
+			}
+		}
+	}
+	// The review step is now presented as 等你. Rename only the old default
+	// label on columns that already carry the review role; custom labels stay
+	// intact, and the role backfill above still recognizes legacy databases.
+	if _, err := s.db.Execute(ctx,
+		`UPDATE "columns" SET name = '等你' WHERE role = ? AND name = '评审'`,
+		model.ColumnRoleReview,
+	); err != nil {
+		return fmt.Errorf("store: review column label migration: %w", err)
+	}
 	columns, err := s.db.Query(ctx, `PRAGMA table_info(projects)`)
 	if err != nil {
 		return fmt.Errorf("store: project schema: %w", err)
 	}
+	hasWorkspace, hasColor := false, false
 	for _, column := range columns.Values {
-		if str(column[1]) == "workspace_path" {
-			return nil
+		switch str(column[1]) {
+		case "workspace_path":
+			hasWorkspace = true
+		case "color":
+			hasColor = true
 		}
 	}
-	if _, err = s.db.Execute(ctx, `ALTER TABLE projects ADD COLUMN workspace_path TEXT NOT NULL DEFAULT ''`); err != nil {
-		return fmt.Errorf("store: project workspace migration: %w", err)
+	if !hasWorkspace {
+		if _, err = s.db.Execute(ctx, `ALTER TABLE projects ADD COLUMN workspace_path TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: project workspace migration: %w", err)
+		}
+	}
+	if !hasColor {
+		if _, err = s.db.Execute(ctx, `ALTER TABLE projects ADD COLUMN color TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: project color migration: %w", err)
+		}
 	}
 	return nil
-}
-
-// seed installs the local project, its four columns and three demo cards
-// the first time the database is opened.
-func (s *Store) seed(ctx context.Context) error {
-	rows, err := s.db.Query(ctx, `SELECT COUNT(*) FROM projects`)
-	if err != nil {
-		return err
-	}
-	if n, _ := rows.Values[0][0].(int64); n > 0 {
-		return nil
-	}
-	now := timestamp(nowUTC())
-	stmts := []sqlite.Statement{{
-		SQL:  `INSERT INTO projects (id, name, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		Args: []any{"local", "local", 0, now, now},
-	}}
-	cols := DefaultColumns()
-	for i := range cols {
-		cols[i].ID = newID()
-		stmts = append(stmts, sqlite.Statement{
-			SQL:  `INSERT INTO "columns" (id, project_id, name, position) VALUES (?, ?, ?, ?)`,
-			Args: []any{cols[i].ID, "local", cols[i].Name, (i + 1) * 1000},
-		})
-	}
-	demos := []struct{ title, body, column string }{
-		{"欢迎使用 taskboard", "这是本地看板的第一张卡片：拖动它试试。", cols[0].ID},
-		{"接上 CLI 与 MCP", "代理可用 tb 或 MCP 写入，窗口会实时收到事件。", cols[1].ID},
-		{"检查实时推送", "任何写入都会通过 SSE 推送到已打开窗口。", cols[2].ID},
-	}
-	// One demo card per column, each the first card of its column.
-	for _, d := range demos {
-		stmts = append(stmts, sqlite.Statement{
-			SQL: `INSERT INTO tasks (id, project_id, column_id, title, body, assignee, position, version, archived, last_agent, created_at, updated_at)
-			      VALUES (?, ?, ?, ?, ?, '', 1000, 1, 0, 'local', ?, ?)`,
-			Args: []any{newID(), "local", d.column, d.title, d.body, now, now},
-		})
-	}
-	_, err = s.db.Transaction(ctx, stmts)
-	return err
 }
 
 // newID returns a 16-byte random hex id.

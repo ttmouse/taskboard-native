@@ -96,3 +96,64 @@ func TestUpdateProjectValidation(t *testing.T) {
 		t.Fatalf("empty patch: %v", err)
 	}
 }
+
+// TestProjectColorPersists covers the accent color end to end: set on
+// create, kept on reread, changed by patch, cleared back to empty, and
+// surviving the projects list (the data the global view colors from).
+func TestProjectColorPersists(t *testing.T) {
+	s := newEditTestStore(t)
+	p, err := s.CreateProjectWithColor("colored", t.TempDir(), "#2563eb", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Color != "#2563eb" {
+		t.Fatalf("created color = %q", p.Color)
+	}
+	got, err := s.Project(p.ID)
+	if err != nil || got.Color != "#2563eb" {
+		t.Fatalf("reread = %+v %v", got, err)
+	}
+	// A patch changes the color; the projects list reads it back.
+	newColor := "#10b981"
+	if _, err := s.UpdateProject(p.ID, ProjectPatch{Color: &newColor}, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	ps, err := s.Projects()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range ps {
+		if item.ID == p.ID {
+			found = true
+			if item.Color != "#10b981" {
+				t.Fatalf("list color = %q", item.Color)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("project missing from list")
+	}
+	// Clearing (empty string) is a legitimate patch — back to automatic slot.
+	clear := ""
+	if _, err := s.UpdateProject(p.ID, ProjectPatch{Color: &clear}, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.Project(p.ID)
+	if got.Color != "" {
+		t.Fatalf("cleared color = %q", got.Color)
+	}
+}
+
+// TestCreateProjectColorDefaultEmpty makes sure plain creates carry no color
+// so the window's stable palette slot stays the default.
+func TestCreateProjectColorDefaultEmpty(t *testing.T) {
+	s := newEditTestStore(t)
+	p, err := s.CreateProject("plain", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Color != "" {
+		t.Fatalf("plain create color = %q", p.Color)
+	}
+}

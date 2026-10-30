@@ -1,9 +1,12 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
+
+	"github.com/egoist/mygo/plugins/sqlite"
 
 	"taskboard-native/internal/model"
 )
@@ -14,6 +17,21 @@ func openTemp(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	now := timestamp(nowUTC())
+	cols := DefaultColumns()
+	stmts := []sqlite.Statement{{SQL: `INSERT INTO projects(id,name,position,created_at,updated_at) VALUES('local','local',0,?,?)`, Args: []any{now, now}}}
+	for i := range cols {
+		cols[i].ID = newID()
+		stmts = append(stmts, sqlite.Statement{SQL: `INSERT INTO "columns"(id,project_id,name,position,role) VALUES(?,'local',?,?,?)`, Args: []any{cols[i].ID, cols[i].Name, (i + 1) * 1000, cols[i].Role}})
+	}
+	if _, err := s.db.Transaction(context.Background(), stmts); err != nil {
+		t.Fatalf("fixture project: %v", err)
+	}
+	for i, title := range []string{"欢迎使用 taskboard", "接上 CLI 与 MCP", "检查实时推送"} {
+		if _, err := s.CreateTask("local", cols[i].ID, title, "", "", "test"); err != nil {
+			t.Fatalf("fixture task: %v", err)
+		}
+	}
 	t.Cleanup(func() {
 		if err := s.Close(); err != nil {
 			t.Fatalf("close: %v", err)
@@ -23,40 +41,25 @@ func openTemp(t *testing.T) *Store {
 }
 
 func TestSeed(t *testing.T) {
-	s := openTemp(t)
+	s, err := Open(filepath.Join(t.TempDir(), "taskboard.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
 
 	projects, err := s.Projects()
 	if err != nil {
 		t.Fatalf("projects: %v", err)
 	}
-	if len(projects) != 1 || projects[0].ID != "local" {
-		t.Fatalf("projects = %+v, want one local project", projects)
+	if len(projects) != 0 {
+		t.Fatalf("fresh database projects = %+v, want none", projects)
 	}
-	names := []string{}
-	for _, c := range projects[0].Columns {
-		names = append(names, c.Name)
-	}
-	want := []string{"待办", "进行中", "评审", "完成"}
-	if len(names) != len(want) {
-		t.Fatalf("columns = %v, want %v", names, want)
-	}
-	for i := range want {
-		if names[i] != want[i] {
-			t.Fatalf("columns = %v, want %v", names, want)
-		}
-	}
-
-	tasks, err := s.TasksByProject("local", false)
+	rows, err := s.db.Query(context.Background(), `SELECT COUNT(*) FROM tasks`)
 	if err != nil {
 		t.Fatalf("tasks: %v", err)
 	}
-	if len(tasks) != 3 {
-		t.Fatalf("seeded tasks = %d, want 3", len(tasks))
-	}
-	for _, task := range tasks {
-		if task.Version != 1 || task.Archived {
-			t.Fatalf("seeded task %s = %+v, want v1 live", task.ID, task)
-		}
+	if got := rows.Values[0][0].(int64); got != 0 {
+		t.Fatalf("fresh database tasks = %d, want none", got)
 	}
 }
 
@@ -81,8 +84,8 @@ func TestSeedIsIdempotent(t *testing.T) {
 		t.Fatalf("reopen changed task count: %d -> %d", len(firstTasks), len(secondTasks))
 	}
 	projects, _ := second.Projects()
-	if len(projects) != 1 {
-		t.Fatalf("reopen seeded another project: %d", len(projects))
+	if len(projects) != 0 {
+		t.Fatalf("reopen created a project: %d", len(projects))
 	}
 }
 
