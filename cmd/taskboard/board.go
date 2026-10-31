@@ -448,6 +448,7 @@ type board struct {
 	streaming    bool                 // the SSE reader is running
 	recent       map[string]time.Time // task ID → until when it shows as changed
 	bounds       map[string]ui.Rect
+	cardHeights  map[string]float32 // persist row height for virtual list placeholders
 	sfxMuteUntil map[string]time.Time // per-task debounce for column-change cues
 	motionState                       // accepted motion shared with the Playground
 }
@@ -969,6 +970,9 @@ type colScroll struct {
 	lastX, lastY float32
 	armed        bool
 	showUntil    time.Time
+	// lastViewH caches the scroll viewport height for columnCards culling
+	// when Element.Bounds is still zero inside Children.
+	lastViewH float32
 }
 
 func (b *board) columnScroll(id string) *colScroll {

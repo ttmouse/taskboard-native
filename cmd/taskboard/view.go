@@ -1509,7 +1509,15 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 			delete(b.recent, task.ID)
 		}
 	}
-	card.Background(card.AnimateColor("face", face, ui.Animation{Duration: 200 * time.Millisecond, Ease: ui.EaseOut}))
+	// Resting cards skip AnimateColor so 200-card columns do not tween every
+	// face each frame; hover/press/recent flash still animate.
+	animFace := face
+	if card.Hovered() || card.Pressed() {
+		animFace = card.AnimateColor("face", face, ui.Animation{Duration: 200 * time.Millisecond, Ease: ui.EaseOut})
+	} else if _, ok := b.recent[task.ID]; ok {
+		animFace = card.AnimateColor("face", face, ui.Animation{Duration: 200 * time.Millisecond, Ease: ui.EaseOut})
+	}
+	card.Background(animFace)
 	// 全部项目 paints a 3px accent bar down the card's left edge in the
 	// project's color, so cards from different projects read apart at a
 	// glance without the color washing the card face.
@@ -1726,6 +1734,12 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		}
 	})
 	b.bounds[task.ID] = card.Bounds()
+	if h := b.bounds[task.ID].H; h > 0 {
+		if b.cardHeights == nil {
+			b.cardHeights = map[string]float32{}
+		}
+		b.cardHeights[task.ID] = h
+	}
 
 	if card.Clicked() && !approve && !openExecution {
 		b.openDetail(*task)
