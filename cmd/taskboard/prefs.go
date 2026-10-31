@@ -95,6 +95,10 @@ type uiPrefs struct {
 	LastTaskRuntime   string          `json:"lastTaskRuntime,omitempty"`   // execution channel preselected by the next task composer
 	ProjectSort       string          `json:"projectSort,omitempty"`       // sidebar project order: default / updated / created
 	GlobalNewTaskHot  bool            `json:"globalNewTaskHot"`            // ⌘⇧N works while the app is in the background
+	// ProjectGitCommitOnDone: when true for a project id, moving a card into
+	// the done (验收完成) column runs `git add -u && git commit` in that
+	// project's workspacePath. Missing/false → no Git side effect.
+	ProjectGitCommitOnDone map[string]bool `json:"projectGitCommitOnDone,omitempty"`
 }
 
 const uiPrefsFile = "ui-prefs.json"

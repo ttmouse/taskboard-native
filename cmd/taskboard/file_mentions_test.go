@@ -72,6 +72,23 @@ func TestExpandWorkspaceMentionsOnlyLinksExistingInWorkspace(t *testing.T) {
 	}
 }
 
+func TestWorkspaceMentionFilterNeedsAQuery(t *testing.T) {
+	targets := []workspaceMentionTarget{
+		{Path: "main.go"},
+		{Path: "docs/guide.md"},
+	}
+	if got := filterWorkspaceMentionTargets(targets, "", 20); len(got) != 0 {
+		t.Fatalf("empty query listed %d files, want none", len(got))
+	}
+	if got := filterWorkspaceMentionTargets(targets, "  ", 20); len(got) != 0 {
+		t.Fatalf("blank query listed %d files, want none", len(got))
+	}
+	got := filterWorkspaceMentionTargets(targets, "MAIN", 20)
+	if len(got) != 1 || got[0].Path != "main.go" {
+		t.Fatalf("query match = %+v", got)
+	}
+}
+
 func TestCommentFileMentionSuggestsAndInsertsProjectPath(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main"), 0o600); err != nil {
@@ -100,11 +117,17 @@ func TestCommentFileMentionSuggestsAndInsertsProjectPath(t *testing.T) {
 	if err := tt.Click("提及项目文件 main.go"); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.detail.comment; got != "检查 @{main.go} " {
-		t.Fatalf("comment draft = %q, want selected project token", got)
+	if got := b.detail.comment; got != "检查" {
+		t.Fatalf("comment draft = %q, want plain text without duplicated path token", got)
 	}
-	if got := workspaceMentionPaths(b.detail.comment); len(got) != 1 || got[0] != "main.go" {
+	if got := b.detail.commentFiles; len(got) != 1 || got[0] != "main.go" {
 		t.Fatalf("selected file chips = %v", got)
+	}
+	if tt.HasText("@{main.go}") {
+		t.Fatal("composer still shows raw @{path} alongside the badge")
+	}
+	if _, ok := tt.Find("移除文件提及 main.go"); !ok {
+		t.Fatalf("comment file badge not visible inline; texts: %v", tt.Texts())
 	}
 }
 
@@ -129,7 +152,55 @@ func TestTaskComposeFileMentionSuggestsAndInsertsProjectPath(t *testing.T) {
 	if err := tt.Click("提及项目文件 docs"); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.form.name; got != "update @{docs} " {
-		t.Fatalf("task title draft = %q, want selected project directory token", got)
+	if got := b.form.name; got != "update" {
+		t.Fatalf("task title draft = %q, want plain text without duplicated path token", got)
+	}
+	if got := b.form.fileMentions; len(got) != 1 || got[0] != "docs" {
+		t.Fatalf("compose file chips = %v", got)
+	}
+	if tt.HasText("@{docs}") {
+		t.Fatal("compose field still shows raw @{path} alongside the badge")
+	}
+	if _, ok := tt.Find("移除文件提及 docs"); !ok {
+		t.Fatalf("compose file badge not visible inline; texts: %v", tt.Texts())
+	}
+}
+
+func TestQuickAddFileMentionShowsChipWithoutRawToken(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	isolatePrefs(t)
+	if err := saveUIPrefs(uiPrefs{BoardVertical: true}); err != nil {
+		t.Fatal(err)
+	}
+	fake := seedBoard()
+	fake.projects[0].WorkspacePath = root
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+	if err := tt.Click("切换到项目 local"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, tt, "切换到项目", func() bool { return b.cur == "local" })
+	focusQuickAdd(t, tt)
+	tt.Type("@main")
+	waitFor(t, tt, "快速添加文件建议出现", func() bool {
+		_, ok := tt.Find("提及项目文件 main.go")
+		return ok
+	})
+	if err := tt.Click("提及项目文件 main.go"); err != nil {
+		t.Fatal(err)
+	}
+	if b.quickTitle != "" || len(b.quickFileMentions) != 1 || b.quickFileMentions[0] != "main.go" {
+		t.Fatalf("quick add draft = %q, file chips = %v", b.quickTitle, b.quickFileMentions)
+	}
+	if tt.HasText("@{main.go}") {
+		t.Fatal("quick add still shows raw @{path} alongside the badge")
+	}
+	if _, ok := tt.Find("移除文件提及 main.go"); !ok {
+		t.Fatalf("quick add file badge is not visible; texts: %v", tt.Texts())
 	}
 }

@@ -126,6 +126,147 @@ func (b *board) imageInput(input ui.Element, d *detail, value *string, edit *ima
 	}
 }
 
+// commentImageInput collects pasted images as comment attachments. The
+// composer displays thumbnails while the comment is drafted; the Markdown
+// references are added only when the comment is sent.
+func (b *board) commentImageInput(input ui.Element, d *detail, read func() []byte) {
+	input.OnPaste(func(_ string) bool {
+		if d.commentImage.busy() {
+			return true
+		}
+		data := read()
+		if len(data) == 0 {
+			return false
+		}
+		if len(data) > 25<<20 {
+			b.toast("无法粘贴图片", "图片超过 25 MiB，请缩小后重试。")
+			return true
+		}
+		d.commentImage.pending = data
+		return true
+	})
+	if len(d.commentImage.pending) == 0 {
+		input.ReadOnly(d.commentImage.uploading)
+		return
+	}
+	data := d.commentImage.pending
+	d.commentImage.pending = nil
+	b.uploadCommentImage(d, data)
+	input.ReadOnly(d.commentImage.uploading)
+}
+
+func (b *board) uploadCommentImage(d *detail, data []byte) {
+	a, ok := b.api.(imageAPI)
+	if !ok {
+		b.toast("无法粘贴图片", "当前服务不支持图片上传，请更新看板服务。")
+		return
+	}
+	d.commentImage.uploading = true
+	go func() {
+		path, err := a.UploadImage(d.id, data)
+		b.post(func() {
+			d.commentImage.uploading = false
+			if b.detail != d {
+				return
+			}
+			if err != nil {
+				b.toast("图片上传失败", err.Error()+"；原评论已保留，请重新粘贴。")
+				return
+			}
+			d.commentImages = append(d.commentImages, path)
+		})
+	}()
+}
+
+// commentThumbStrip keeps pasted images compact and visible inside the
+// composer, matching the quick-create image treatment.
+func (b *board) commentThumbStrip(c *ui.Context, t *ui.Theme, d *detail) {
+	if len(d.commentImages) == 0 && !d.commentImage.uploading {
+		return
+	}
+	h := t.Space(11)
+	// Parent composer already supplies equal edge insets when this strip is
+	// visible; keep the row full-width so thumbs share that left edge with text.
+	ui.Row(c).FillWidth().Gap(t.Space(1.5)).AlignItems(ui.Start).AlignSelf(ui.Start).
+		Children(func() {
+			for i, path := range d.commentImages {
+				b.commentThumb(c, t, d, path, i, h)
+			}
+			if d.commentImage.uploading {
+				ui.Text(c, "上传图片…").FontSize(t.FontSize-2).TextColor(t.TextMuted).
+					Padding(t.Space(1), 0)
+			}
+		})
+}
+
+func (b *board) commentThumb(c *ui.Context, t *ui.Theme, d *detail, path string, index int, size float32) {
+	src, ok := d.commentThumbs[path]
+	if !ok {
+		if !d.commentThumbLoading[path] {
+			if d.commentThumbs == nil {
+				d.commentThumbs = map[string]ui.ImageSource{}
+			}
+			if d.commentThumbLoading == nil {
+				d.commentThumbLoading = map[string]bool{}
+			}
+			d.commentThumbLoading[path] = true
+			go func() {
+				a, has := b.api.(imageAPI)
+				if !has {
+					return
+				}
+				data, err := a.Image(path)
+				if err != nil {
+					return
+				}
+				bmp, err := ui.DecodeBitmap(data)
+				if err != nil {
+					return
+				}
+				b.post(func() {
+					if b.detail == d {
+						d.commentThumbs[path] = bmp
+					}
+				})
+			}()
+		}
+		ui.Box(c.Key(fmt.Sprintf("comment-thumb-ph-%d", index))).Size(size, size).
+			Radius(t.Radius).Background(t.TextMuted.Alpha(0.15))
+		return
+	}
+	removed := false
+	ui.Box(c.Key(fmt.Sprintf("comment-thumb-%d", index))).Size(size, size).
+		Label(fmt.Sprintf("评论图片缩略图 %d", index+1)).
+		Radius(t.Radius).Clip().Background(t.TextMuted.Alpha(0.1)).Children(func() {
+		ui.Image(c, src).AspectRatio(1).Fit(ui.Cover)
+		if ui.Button(c, "×").Label(fmt.Sprintf("移除评论图片 %d", index+1)).
+			Absolute().Attach(ui.AnchorTopRight, ui.AnchorTopRight).
+			Top(t.Space(0.5)).Right(t.Space(0.5)).
+			Size(t.Space(3), t.Space(3)).Padding(0).
+			BorderWidth(0).Radius(t.Space(1.5)).
+			TextColor(ui.RGB(255, 255, 255)).
+			Background(ui.RGBA(0, 0, 0, 0.55)).
+			Disabled(d.commentImage.busy() || b.commenting).Clicked() {
+			d.commentImages = append(d.commentImages[:index], d.commentImages[index+1:]...)
+			removed = true
+		}
+	})
+	if removed {
+		return
+	}
+}
+
+func commentWithImages(text string, images []string) string {
+	parts := make([]string, 0, len(images)+1)
+	if text = strings.TrimSpace(text); text != "" {
+		parts = append(parts, text)
+	}
+	for _, path := range images {
+		parts = append(parts, "![粘贴的图片]("+path+")")
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 func (b *board) detailMarkdown(c *ui.Context, text string) {
 	d := b.detail
 	if d.markdown == nil {
@@ -142,6 +283,9 @@ func (b *board) detailMarkdown(c *ui.Context, text string) {
 				return b.displayImage(data)
 			},
 			Block: func(c *ui.Context, doc *parser.Document, index int) bool {
+				if b.fitMarkdownTable(c, doc, index) {
+					return true
+				}
 				return b.retinaImageBlock(c, d, doc, index)
 			},
 			OnLink: func(target string) {

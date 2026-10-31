@@ -367,6 +367,35 @@ func TestHerdrExecutionStatusUpdatesInPlace(t *testing.T) {
 	}
 }
 
+func TestHerdrConversationActionWaitsForInitialTurn(t *testing.T) {
+	isolatePrefs(t)
+	fake := seedBoard()
+	task := fake.tasks[0]
+	task.Execution = &model.Execution{
+		TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "running",
+		Detail: "Herdr terminal 已创建，等待初始 turn 开始",
+	}
+	fake.tasks[0] = task
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	if _, ok := tt.Find("打开 Herdr 中的 Codex 对话"); ok {
+		t.Fatal("conversation action appeared before the initial agent turn")
+	}
+
+	updated := task
+	updated.Execution = &model.Execution{
+		TaskID: task.ID, SessionID: "herdr:terminal-1", Runtime: "codex", Status: "running",
+	}
+	fake.push(model.Event{
+		Type: model.EventTaskUpdated, ProjectID: task.ProjectID, ID: task.ID,
+		Version: task.Version, Task: &updated,
+	})
+	waitFor(t, tt, "初始 turn 后的对话入口", func() bool {
+		_, ok := tt.Find("打开 Herdr 中的 Codex 对话")
+		return ok
+	})
+}
+
 func TestHerdrStatusAndActionsShareCardFooter(t *testing.T) {
 	isolatePrefs(t)
 	fake := seedBoard()
@@ -395,6 +424,9 @@ func TestHerdrStatusAndActionsShareCardFooter(t *testing.T) {
 	}
 	if d := (icon.Y + icon.H/2) - (meta.Y + meta.H/2); d < -3 || d > 3 {
 		t.Fatalf("passive execution status is not aligned with provenance: icon=%+v meta=%+v", icon, meta)
+	}
+	if icon.X+icon.W > meta.X {
+		t.Fatalf("passive execution status should lead the provenance text: icon=%+v meta=%+v", icon, meta)
 	}
 	if d := (icon.Y + icon.H/2) - (open.Y + open.H/2); d < -3 || d > 3 {
 		t.Fatalf("open action is not in the same footer row: icon=%+v open=%+v", icon, open)

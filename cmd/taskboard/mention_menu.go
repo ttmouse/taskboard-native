@@ -114,13 +114,20 @@ func (b *board) mentionMenu(c *ui.Context, t *ui.Theme, d *detail, box ui.Elemen
 							MaxLines(1).Ellipsis("…").Tooltip(target.Path)
 					})
 					if item.Clicked() {
-						d.comment = insertWorkspaceMention(d.comment, target.Path)
+						pickWorkspaceMention(&d.comment, &d.commentFiles, target.Path)
 						d.mentionOpen = false
 						d.commentFocus = 3
 					}
 				}
-				if !showChannels && len(files) == 0 {
-					ui.Text(c, "没有匹配的项目文件").FontSize(fsm(t)).
+				if len(files) == 0 {
+					// With no query there is nothing to match yet, so the panel
+					// stays short and says how the file search works instead of
+					// listing paths the user did not ask for.
+					hint := "没有匹配的项目文件"
+					if showChannels {
+						hint = "直接输入即可检索项目文件"
+					}
+					ui.Text(c, hint).FontSize(fsm(t)).
 						TextColor(t.TextMuted).Padding(t.Space(1.5), t.Space(2))
 				}
 			})
@@ -132,6 +139,12 @@ func (b *board) filteredWorkspaceMentions(d *detail, query string) []workspaceMe
 	if d == nil {
 		return nil
 	}
+	// A bare @ has not started a search yet: the menu is channels only. Listing
+	// every workspace path here buried the channels and made the panel tall.
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return nil
+	}
 	if d.fileMentionTargets == nil {
 		if p, ok := b.projectByID(d.snap.ProjectID); ok && strings.TrimSpace(p.WorkspacePath) != "" {
 			d.fileMentionTargets = workspaceMentionTargets(p.WorkspacePath)
@@ -140,9 +153,12 @@ func (b *board) filteredWorkspaceMentions(d *detail, query string) []workspaceMe
 		}
 	}
 	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return nil
+	}
 	out := make([]workspaceMentionTarget, 0, 20)
 	for _, target := range d.fileMentionTargets {
-		if query == "" || strings.Contains(strings.ToLower(target.Path), query) {
+		if strings.Contains(strings.ToLower(target.Path), query) {
 			out = append(out, target)
 			if len(out) == 20 {
 				break
@@ -204,12 +220,16 @@ func (b *board) taskFileMentionMenu(c *ui.Context, t *ui.Theme, f *form, box ui.
 							MaxLines(1).Ellipsis("…").Tooltip(target.Path)
 					})
 					if item.Clicked() {
-						f.name = insertWorkspaceMention(f.name, target.Path)
+						pickWorkspaceMention(&f.name, &f.fileMentions, target.Path)
 						f.fileMentionOpen = false
 					}
 				}
 				if len(files) == 0 {
-					ui.Text(c, "没有匹配的项目文件").FontSize(fsm(t)).TextColor(t.TextMuted).
+					hint := "没有匹配的项目文件"
+					if strings.TrimSpace(query) == "" {
+						hint = "直接输入即可检索项目文件"
+					}
+					ui.Text(c, hint).FontSize(fsm(t)).TextColor(t.TextMuted).
 						Padding(t.Space(1.5), t.Space(2))
 				}
 			})
@@ -269,12 +289,16 @@ func (b *board) quickFileMentionMenu(c *ui.Context, t *ui.Theme, box ui.Element)
 							MaxLines(1).Ellipsis("…").Tooltip(target.Path)
 					})
 					if item.Clicked() {
-						b.quickTitle = insertWorkspaceMention(b.quickTitle, target.Path)
+						pickWorkspaceMention(&b.quickTitle, &b.quickFileMentions, target.Path)
 						b.quickFileMentionOpen = false
 					}
 				}
 				if len(files) == 0 {
-					ui.Text(c, "没有匹配的项目文件").FontSize(fsm(t)).TextColor(t.TextMuted).
+					hint := "没有匹配的项目文件"
+					if strings.TrimSpace(query) == "" {
+						hint = "直接输入即可检索项目文件"
+					}
+					ui.Text(c, hint).FontSize(fsm(t)).TextColor(t.TextMuted).
 						Padding(t.Space(1.5), t.Space(2))
 				}
 			})
@@ -284,9 +308,12 @@ func (b *board) quickFileMentionMenu(c *ui.Context, t *ui.Theme, box ui.Element)
 
 func filterWorkspaceMentionTargets(targets []workspaceMentionTarget, query string, limit int) []workspaceMentionTarget {
 	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return nil
+	}
 	out := make([]workspaceMentionTarget, 0, limit)
 	for _, target := range targets {
-		if query == "" || strings.Contains(strings.ToLower(target.Path), query) {
+		if strings.Contains(strings.ToLower(target.Path), query) {
 			out = append(out, target)
 			if len(out) == limit {
 				break
@@ -296,30 +323,35 @@ func filterWorkspaceMentionTargets(targets []workspaceMentionTarget, query strin
 	return out
 }
 
-func (b *board) workspaceMentionChips(c *ui.Context, t *ui.Theme, value *string, root, key string) {
-	paths := workspaceMentionPaths(*value)
-	if len(paths) == 0 {
+func (b *board) workspaceMentionChips(c *ui.Context, t *ui.Theme, files *[]string, root, key string) {
+	if files == nil || len(*files) == 0 {
 		return
 	}
-	ui.Row(c.Key(key)).FillWidth().Gap(t.Space(1)).Children(func() {
-		for _, rel := range paths {
-			rel := rel
+	// Content-sized row so chips sit after the draft in the composer Row
+	// instead of claiming a full-width strip above/beside the field.
+	ui.Row(c.Key(key)).Gap(t.Space(1)).Children(func() {
+		for i, rel := range *files {
+			i, rel := i, rel
 			icon := "📄"
 			if root != "" {
 				if info, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err == nil && info.IsDir() {
 					icon = "📁"
 				}
 			}
-			label := icon + " " + rel
+			label := icon + " " + filepath.Base(filepath.FromSlash(rel))
 			if ui.Button(c.Key(key+"-"+rel), label+" ×").
 				Label("移除文件提及 "+rel).Tooltip("项目路径："+rel).
 				FontSize(fxs(t)).Padding(t.Space(0.5), t.Space(1)).BorderWidth(0).
 				Radius(t.Space(2)).Background(t.Accent.Alpha(0.16)).TextColor(t.Accent).Clicked() {
-				token := "@{" + rel + "}"
-				*value = strings.Replace(*value, token, "", 1)
+				*files = append((*files)[:i], (*files)[i+1:]...)
 			}
 		}
 	})
+}
+
+func pickWorkspaceMention(text *string, files *[]string, rel string) {
+	*text = clearWorkspaceMentionQuery(*text)
+	*files = appendWorkspaceMention(*files, rel)
 }
 
 func (b *board) selectMentionOption(d *detail, index int) {
@@ -339,7 +371,7 @@ func (b *board) selectMentionOption(d *detail, index int) {
 		if strings.HasPrefix(d.comment, d.mentionSearchBase) {
 			d.comment = d.mentionSearchBase
 		}
-		d.comment = insertWorkspaceMention(d.comment, files[fileIndex].Path)
+		pickWorkspaceMention(&d.comment, &d.commentFiles, files[fileIndex].Path)
 		d.mentionOpen = false
 		d.commentFocus = 3
 	}

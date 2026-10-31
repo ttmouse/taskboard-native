@@ -19,6 +19,7 @@ type playgroundState struct {
 	singleDemo, singleAuto      bool
 	variant, phase              string
 	running, autoStart, compare bool
+	replyDemo                   bool // static review page for comment replies
 	demoCancel                  context.CancelFunc
 	nextStart                   time.Time
 	run                         int
@@ -45,6 +46,9 @@ func (b *board) topBar(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Padding(t.Space(4), t.Space(5)).Gap(t.Space(2)).Children(func() {
 		ui.Row(c).FillWidth().Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "Motion Playground").FontSize(flg(t)).FontWeight(600)
+			// The playground is its own app, so it carries the build version on
+			// screen instead of inheriting the production footer.
+			ui.Text(c, playgroundVersion).FontSize(fxs(t)).TextColor(t.TextMuted)
 			ui.Spacer(c)
 			for _, name := range variants {
 				button := ui.Button(c, name).Label("选择方案 " + name).Disabled(b.running)
@@ -72,6 +76,10 @@ func (b *board) topBar(c *ui.Context, t *ui.Theme) {
 			if ui.Button(c, "单卡 · 抬升 → 移动 → 落稳").Disabled(b.loading || b.running).Clicked() {
 				b.compare, b.autoStart = false, false
 				b.startSingleDemo()
+			}
+			if ui.Button(c, "评论回复样张").Label("打开评论回复静态样张").Clicked() {
+				b.stopDemo()
+				b.replyDemo = true
 			}
 			ui.Text(c, b.variant+"  ·  "+b.motionDescription()).FontSize(fsm(t)).TextColor(t.TextMuted)
 			ui.Spacer(c)

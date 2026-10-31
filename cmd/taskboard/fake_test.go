@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"taskboard-native/internal/client"
+	"taskboard-native/internal/executor"
 	"taskboard-native/internal/model"
 	"taskboard-native/internal/store"
 )
@@ -139,6 +140,45 @@ func (f *fakeBoard) Task(id string) (model.Task, error) {
 		}
 	}
 	return model.Task{}, fmt.Errorf("任务不存在")
+}
+
+
+func (f *fakeBoard) AddRelation(id string, version int, kind, relatedID string) (model.RelationResult, error) {
+	task, err := f.Task(id)
+	if err != nil {
+		return model.RelationResult{}, err
+	}
+	related, err := f.Task(relatedID)
+	if err != nil {
+		return model.RelationResult{}, err
+	}
+	task.Version++
+	if kind == "parent" {
+		task.Relations.Parent = &model.TaskRelationSummary{ID: related.ID, Number: related.Number, Title: related.Title, ColumnID: related.ColumnID}
+	}
+	if kind == "blocked_by" {
+		task.Relations.BlockedBy = append(task.Relations.BlockedBy, model.TaskRelationSummary{ID: related.ID, Number: related.Number, Title: related.Title, ColumnID: related.ColumnID})
+	}
+	return model.RelationResult{Task: task, RelatedTask: related}, nil
+}
+
+func (f *fakeBoard) RemoveRelation(id string, version int, kind, relatedID string) (model.RelationResult, error) {
+	task, err := f.Task(id)
+	if err != nil {
+		return model.RelationResult{}, err
+	}
+	related, err := f.Task(relatedID)
+	if err != nil {
+		return model.RelationResult{}, err
+	}
+	task.Version++
+	if kind == "parent" {
+		task.Relations.Parent = nil
+	}
+	if kind == "blocked_by" {
+		task.Relations.BlockedBy = nil
+	}
+	return model.RelationResult{Task: task, RelatedTask: related}, nil
 }
 
 func (f *fakeBoard) CreateTask(projectID, columnID, title, description, assignee string) (model.Task, error) {
@@ -307,6 +347,10 @@ func (f *fakeBoard) Comments(taskID string) ([]model.Comment, error) {
 		}
 	}
 	return nil, fmt.Errorf("任务不存在")
+}
+
+func (f *fakeBoard) HandoffLog(string) (executor.HandoffLogView, error) {
+	return executor.HandoffLogView{}, nil
 }
 
 func (f *fakeBoard) AddComment(taskID, text string) (model.Comment, error) {

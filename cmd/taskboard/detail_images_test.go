@@ -136,8 +136,11 @@ func TestDetailImagePaste(t *testing.T) {
 	// A second insertion in a comment follows the same path and can send
 	// even when it contains only an image.
 	d.comment = ""
-	b.pasteDetailImage(d, &d.comment, &d.commentImage, 0, 0, func() []byte { return f.data })
-	waitFor(t, tt, "评论图片", func() bool { return !d.commentImage.uploading })
+	b.uploadCommentImage(d, f.data)
+	waitFor(t, tt, "评论缩略图", func() bool { return !d.commentImage.uploading && len(d.commentImages) == 1 })
+	if d.comment != "" {
+		t.Fatalf("pasted image leaked Markdown into the comment input: %q", d.comment)
+	}
 	b.sendComment()
 	waitFor(t, tt, "发送评论图片", func() bool { return !b.commenting })
 	f.mu.Lock()
@@ -230,6 +233,62 @@ func TestImagePasteNativeEditor(t *testing.T) {
 	}
 }
 
+func TestCommentImagePasteShowsThumbnail(t *testing.T) {
+	b, _, f := imageFixture(t)
+	d := b.detail
+	d.comment = "保留这段文字"
+	var readData []byte
+	var expectedGap float32
+	tt := ui.NewTester(func(c *ui.Context) {
+		b.pump()
+		theme := c.Theme()
+		expectedGap = theme.Space(1.5)
+		padY := float32(0)
+		if len(d.commentImages) > 0 || d.commentImage.uploading {
+			padY = theme.Space(2.5)
+		}
+		ui.Box(c).FillWidth().Padding(padY, theme.Space(2.5)).Gap(expectedGap).Label("评论输入容器").Children(func() {
+			b.commentThumbStrip(c, theme, d)
+			ui.Row(c).FillWidth().MinHeight(theme.Space(8)).AlignItems(ui.Center).Children(func() {
+				input := ui.TextArea(c, &d.comment).Label("写评论").FillWidth()
+				b.commentImageInput(input, d, func() []byte { return readData })
+			})
+		})
+	}, 600, 250)
+	if err := tt.Click("写评论"); err != nil {
+		t.Fatal(err)
+	}
+	readData = f.data
+	tt.SetClipboard("")
+	tt.Key(ui.Cmd, ui.KeyV)
+	waitFor(t, tt, "评论图片缩略图", func() bool {
+		_, ok := tt.Find("评论图片缩略图 1")
+		return ok
+	})
+	thumb, _ := tt.Find("评论图片缩略图 1")
+	input, ok := tt.Find("写评论")
+	if thumb.W > 48 || thumb.H > 48 {
+		t.Fatalf("comment image should use a small thumbnail: %+v", thumb)
+	}
+	if !ok || thumb.Y+thumb.H > input.Y {
+		t.Fatalf("comment thumbnail should sit above the input like quick-create: thumb=%+v input=%+v", thumb, input)
+	}
+	gap := input.Y - (thumb.Y + thumb.H)
+	if gap < 0 || gap > expectedGap+1 {
+		t.Fatalf("comment thumbnail-to-input gap = %v; want at most %v", gap, expectedGap)
+	}
+	box, ok := tt.Find("评论输入容器")
+	if !ok {
+		t.Fatal("comment composer box missing")
+	}
+	if inset := thumb.Y - box.Y; inset < 8 {
+		t.Fatalf("comment thumbnail should be inset from composer top edge: inset=%v thumb=%+v box=%+v", inset, thumb, box)
+	}
+	if d.comment != "保留这段文字" || len(d.commentImages) != 1 {
+		t.Fatalf("paste changed comment text or missed attachment: text=%q images=%v", d.comment, d.commentImages)
+	}
+}
+
 func TestImageSummary(t *testing.T) {
 	text := "![粘贴的图片](/api/images/" + strings.Repeat("a", 64) + ")\n\n说明"
 	if got := firstLines(text, 2); got != "[图片] 说明" {
@@ -281,13 +340,17 @@ func TestRemoveDetailImageAndSave(t *testing.T) {
 func TestRemoveCommentDraftImage(t *testing.T) {
 	b, tt, f := imageFixture(t)
 	d := b.detail
-	d.comment = "保留这条评论\n\n![粘贴的图片](/api/images/" + strings.Repeat("a", 64) + ")"
-	tt.Frame()
+	d.comment = "保留这条评论"
+	d.commentImages = []string{"/api/images/" + strings.Repeat("a", 64)}
+	waitFor(t, tt, "评论缩略图载入", func() bool {
+		_, ok := tt.Find("移除评论图片 1")
+		return ok
+	})
 	if err := tt.Click("移除评论图片 1"); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(d.comment) != "保留这条评论" {
-		t.Fatalf("removed comment text: %q", d.comment)
+	if d.comment != "保留这条评论" || len(d.commentImages) != 0 {
+		t.Fatalf("removed comment image: text=%q images=%v", d.comment, d.commentImages)
 	}
 	if err := tt.Click("写评论"); err != nil {
 		t.Fatal(err)

@@ -3,6 +3,7 @@ package main
 import (
 	"image/png"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -166,6 +167,59 @@ func TestMentionMenuKeyboardSelection(t *testing.T) {
 	}
 	if b.detail.comment != "" {
 		t.Fatalf("keyboard selection changed draft: %q", b.detail.comment)
+	}
+}
+
+// A bare @ opens the channel picker alone: workspace files are not listed until
+// the user starts typing, so the menu stays short and a hint explains the search.
+func TestMentionMenuHidesFilesUntilTyping(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"main.go", "readme.md"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return len(b.tasks) > 0 && len(b.projects) > 0 })
+	projectID := b.task("t-1").ProjectID
+	for i := range b.projects {
+		if b.projects[i].ID == projectID {
+			b.projects[i].WorkspacePath = root
+		}
+	}
+	b.openDetail(*b.task("t-1"))
+	tt.Frame()
+	waitFor(t, tt, "评论载入", func() bool { return !b.detail.loading })
+	if err := tt.Click("写评论"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Type("@")
+	tt.Frame()
+	if !b.detail.mentionOpen {
+		t.Fatal("typing @ did not open the picker")
+	}
+	for _, name := range []string{"main.go", "readme.md"} {
+		if tt.HasText("提及项目文件 " + name) {
+			t.Fatalf("%s was listed before any query was typed", name)
+		}
+	}
+	if !tt.HasText("直接输入即可检索项目文件") {
+		t.Fatalf("missing search hint; texts: %v", tt.Texts())
+	}
+	if !tt.HasText("评论提醒 " + executor.Runtimes()[0].Label) {
+		t.Fatalf("channel rows missing; texts: %v", tt.Texts())
+	}
+
+	tt.Type("main")
+	waitFor(t, tt, "输入后匹配项目文件", func() bool {
+		return tt.HasText("提及项目文件 main.go")
+	})
+	if tt.HasText("直接输入即可检索项目文件") {
+		t.Fatal("the hint stayed after a query was typed")
+	}
+	if tt.HasText("提及项目文件 readme.md") {
+		t.Fatal("a non-matching file was listed")
 	}
 }
 

@@ -234,6 +234,7 @@ func (b *board) view(c *ui.Context) {
 	if b.confirmDeleteComment != nil {
 		b.confirmDeleteCommentView(c, t)
 	}
+	c.After(60 * time.Second)
 }
 
 // --- top bar ---
@@ -1260,11 +1261,8 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 	ui.Row(c).FillWidth().
 		Padding(t.Space(2), padR+t.Space(1), t.Space(2), padL+t.Space(1)).
 		Children(func() {
-			if p, ok := b.projectByID(b.cur); ok {
-				b.workspaceMentionChips(c, t, &b.quickFileMentions, p.WorkspacePath, "quick-add-file-chips")
-			}
 			input := ui.TextInput(c.Key("quick-add"), &b.quickTitle).
-				FillWidth().
+				Grow(1).
 				Placeholder("添加任务，回车创建").
 				Label("在「待办」中添加任务").
 				FontSize(t.FontSize).
@@ -1327,6 +1325,9 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 					return true
 				})
 			b.quickFileMentionMenu(c, t, input)
+			if p, ok := b.projectByID(b.cur); ok {
+				b.workspaceMentionChips(c, t, &b.quickFileMentions, p.WorkspacePath, "quick-add-file-chips")
+			}
 		})
 }
 
@@ -1684,6 +1685,9 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 						if n := len(task.Comments); n > 0 {
 							ui.Badge(c, strconv.Itoa(n)).Label(strconv.Itoa(n) + " 条评论")
 						}
+						if n := len(task.Relations.SubIssues); n > 0 {
+							ui.Badge(c, fmt.Sprintf("子 %d", n)).Label(fmt.Sprintf("%d 个子任务", n))
+						}
 						if b.savingID == task.ID && (b.detail == nil || b.detail.id != task.ID) {
 							loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
 						}
@@ -1771,7 +1775,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 			ui.Text(c, "任务详情").FontSize(fmd(t)).FontWeight(600)
 			if num := store.FormatTaskNumber(d.snap.Number); num != "" {
 				ui.Text(c, "#"+num).FontSize(fsm(t)).TextColor(t.TextMuted).
-					Label("任务号 "+num).Tooltip("任务号 "+num)
+					Label("任务号 " + num).Tooltip("任务号 " + num)
 				if ui.Button(c.Key("detail-copy-id"), "复制").Label("复制 ID "+num).
 					FontSize(fxs(t)).Padding(t.Space(0.5), t.Space(1.5)).
 					BorderWidth(0).Radius(t.Space(2)).
@@ -1809,10 +1813,16 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 				// Title stays directly editable. The body reads as Markdown so an
 				// image appears in place of its source; clicking the body opens
 				// its source editor without a separate edit control.
-				ui.TextInput(c, &d.title).Label("任务标题").Placeholder("任务标题").
+				// TextInput is single-line; TextArea + Lines soft-wraps long titles.
+				titleInput := ui.TextArea(c, &d.title).Label("任务标题").Placeholder("任务标题").
 					FillWidth().FontSize(fmd(t)).FontWeight(500).
 					BorderWidth(0).Background(ui.Transparent).
 					Padding(0, 0)
+				titleInput.Lines(1, 12)
+				// Enter should not insert hard newlines into a title; soft wrap still applies.
+				titleInput.OnTextKey(func(k ui.TextKey) bool {
+					return k.Key == ui.KeyEnter && k.Mods == 0
+				})
 				d.editTitle = false
 				ui.Text(c, "任务正文").FontSize(fsm(t)).TextColor(t.TextMuted)
 				if d.editBody {
@@ -1835,6 +1845,22 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						bodyInput.SetTextSelection(0, 0)
 						d.bodyTop = false
 					}
+					bodyInput.OnTextKey(func(k ui.TextKey) bool {
+						if k.Key == ui.KeyEscape && k.Mods == 0 {
+							d.editBody = false
+							d.bodyEditSeenFocus = false
+							return true
+						}
+						return false
+					})
+					if bodyInput.Focused() {
+						d.bodyEditSeenFocus = true
+					}
+					// Blur (and leave) returns to Markdown so tables/images render again.
+					if d.bodyEditSeenFocus && !bodyInput.Focused() && !bodyInput.Hovered() {
+						d.editBody = false
+						d.bodyEditSeenFocus = false
+					}
 					b.imageInput(bodyInput, d, &d.body, &d.bodyImage, mygo.Clipboard.ReadImage)
 					b.imageRemoveControls(c, &d.body, &d.bodyImage, "正文")
 				} else {
@@ -1851,6 +1877,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						if edit.Clicked() {
 							d.editBody = true
 							d.bodyTop = true
+							d.bodyEditSeenFocus = false
 						}
 					})
 				}
@@ -1885,6 +1912,211 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					ui.Text(c, provenance(&d.snap)).FontSize(fxs(t)).TextColor(t.TextMuted).
 						MaxLines(1).Ellipsis("…").Tooltip(provenance(&d.snap)).Grow(1).TextAlign(ui.End)
 				})
+
+				currentTask := b.task(d.id)
+				if currentTask != nil {
+					ui.Column(c).FillWidth().Gap(t.Space(1)).Children(func() {
+						subs := currentTask.Relations.SubIssues
+						blocks := currentTask.Relations.Blocks
+						blockedBy := currentTask.Relations.BlockedBy
+						relCount := len(subs) + len(blocks) + len(blockedBy)
+						// Quiet fold: click the section heading (not a full-width heavy button).
+						headLabel := "关系"
+						if relCount > 0 {
+							headLabel = fmt.Sprintf("关系 · %d", relCount)
+						}
+						if d.relationExpanded {
+							headLabel += "  ∨"
+						} else {
+							headLabel += "  ›"
+						}
+						// Left-align like other section titles (Column Stretch was centering the label).
+						ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+							head := ui.ButtonBase(c.Key("rel-section-toggle")).
+								Padding(0, 0).Radius(0).BorderWidth(0).
+								FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted).
+								Label(headLabel).Tooltip("展开或收起关系")
+							head.Background(ui.Transparent)
+							head.Children(func() {
+								ui.Text(c, headLabel).FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
+							})
+							if head.Clicked() {
+								d.relationExpanded = !d.relationExpanded
+								if !d.relationExpanded {
+									d.relationPickKind = ""
+									d.relationNewTitle = ""
+								}
+							}
+						})
+						if !d.relationExpanded {
+							return
+						}
+
+						renderLinked := func(items []model.TaskRelationSummary, removeKind string, keyPrefix string) {
+							for _, relation := range items {
+								relation := relation
+								ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+									if ui.Button(c, keyPrefix+"open"+relation.ID).Label(fmt.Sprintf("#%d %s", relation.Number, relation.Title)).Clicked() {
+										if other := b.task(relation.ID); other != nil {
+											b.openDetail(*other)
+										}
+									}
+									version := currentTask.Version
+									taskID := d.id
+									relatedID := relation.ID
+									if removeKind == "parent" {
+										// removing a sub-issue: delete parent on the child
+										taskID = relation.ID
+										relatedID = d.id
+										version = 1
+										if child := b.task(relation.ID); child != nil {
+											version = child.Version
+										}
+									}
+									if ui.Button(c, keyPrefix+"rm"+relation.ID).Label("×").Clicked() {
+										b.changeTaskRelation(taskID, version, removeKind, relatedID, true)
+									}
+								})
+							}
+						}
+
+						renderPlus := func(kind, menuKey string) {
+							// ButtonBase + Menu: only "+" shows; menu pops on click (no standing chevron).
+							cands := b.relationCandidateTasks(*currentTask, kind)
+							plus := ui.ButtonBase(c.Key(menuKey)).
+								Padding(t.Space(0.5), t.Space(1)).Radius(t.Radius).
+								BorderWidth(0).FontSize(fsm(t)).TextColor(t.TextMuted).
+								Label("+").Tooltip("添加")
+							plus.Children(func() {
+								ui.Text(c, "+").FontSize(fsm(t)).TextColor(t.TextMuted)
+							})
+							plus.Menu(func(m *ui.Menu) {
+								if m.Item("新建…").Chosen() {
+									d.relationPickKind = "create-" + kind
+									d.relationNewTitle = ""
+								}
+								if len(cands) > 0 {
+									m.Separator()
+								}
+								for _, candidate := range cands {
+									candidate := candidate
+									label := relationTaskLabel(candidate)
+									if m.Item(label).Chosen() {
+										switch kind {
+										case "sub":
+											b.changeTaskRelation(candidate.ID, candidate.Version, "parent", d.id, false)
+										case "blocks":
+											b.changeTaskRelation(d.id, currentTask.Version, "blocks", candidate.ID, false)
+										case "blocker":
+											b.changeTaskRelation(d.id, currentTask.Version, "blocked_by", candidate.ID, false)
+										}
+										d.relationPickKind = ""
+									}
+								}
+								if len(cands) == 0 {
+									m.Item("没有可关联的已有任务").Disabled(true)
+								}
+							})
+							face, ink := ui.Transparent, t.TextMuted
+							switch {
+							case plus.Pressed():
+								face, ink = t.SurfacePressed, t.Text
+							case plus.Hovered():
+								face, ink = t.Text.Alpha(0.14), t.Text
+							}
+							plus.Background(face).TextColor(ink)
+						}
+
+						renderCreate := func(kind string) {
+							if d.relationPickKind != "create-"+kind {
+								return
+							}
+							ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+								ui.TextInput(c.Key("rel-new-"+kind), &d.relationNewTitle).
+									Placeholder("新卡片标题…").Label("新建关联卡片").Grow(1).
+									OnSubmit(func() { b.createRelatedTask(d.id, kind, d.relationNewTitle) })
+								if ui.Button(c, "确认新建"+kind).Label("创建").Clicked() {
+									b.createRelatedTask(d.id, kind, d.relationNewTitle)
+								}
+								if ui.Button(c, "取消新建"+kind).Label("取消").Clicked() {
+									d.relationPickKind = ""
+									d.relationNewTitle = ""
+								}
+							})
+						}
+
+						// 副任务 (children)
+						ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, "副任务").FontSize(fsm(t)).TextColor(t.TextMuted).Grow(1) // 副(assistant), not 负
+							renderPlus("sub", "rel-plus-sub")
+						})
+						renderLinked(subs, "parent", "sub-")
+						renderCreate("sub")
+
+						// 阻塞 (this blocks others) — voice「阻塞与」→ DSH「阻塞」
+						ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, "阻塞与").FontSize(fsm(t)).TextColor(t.TextMuted).Grow(1)
+							renderPlus("blocks", "rel-plus-blocks")
+						})
+						renderLinked(blocks, "blocks", "blocks-")
+						renderCreate("blocks")
+
+						// 阻塞于
+						ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, "阻塞于").FontSize(fsm(t)).TextColor(t.TextMuted).Grow(1)
+							renderPlus("blocker", "rel-plus-blocker")
+						})
+						renderLinked(blockedBy, "blocked_by", "blocker-")
+						renderCreate("blocker")
+					})
+				}
+
+				// Automatic handoff timeline: always show the section header (even when empty).
+				ui.Row(c).FillWidth().Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "自动承接").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
+					if sum := handoffSummaryLine(d.handoffLog.Summary); sum != "" {
+						ui.Text(c, sum).FontSize(fxs(t)).TextColor(t.TextMuted).
+							MaxLines(1).Ellipsis("…").Tooltip(sum).Grow(1)
+					} else {
+						ui.Spacer(c)
+					}
+					if d.handoffLogLoading {
+						loading.LinearDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入自动承接日志")
+					}
+					if len(d.handoffLog.Events) > 0 {
+						label := fmt.Sprintf("查看 %d 条记录", len(d.handoffLog.Events))
+						if d.handoffLogExpanded {
+							label = "收起记录"
+						}
+						toggle := ui.ButtonBase(c.Key("handoff-log-toggle")).
+							Padding(t.Space(0.5), t.Space(1)).Radius(t.Radius).
+							BorderWidth(0).FontSize(fxs(t)).TextColor(t.TextMuted).
+							Label(label).Tooltip(label)
+						face := ui.Transparent
+						switch {
+						case toggle.Pressed():
+							face = t.SurfacePressed
+						case toggle.Hovered():
+							face = t.SurfaceHover
+						}
+						toggle.Background(face)
+						toggle.Children(func() { ui.Text(c, label).FontSize(fxs(t)).TextColor(t.TextMuted) })
+						if toggle.Clicked() {
+							d.handoffLogExpanded = !d.handoffLogExpanded
+						}
+					}
+				})
+				if d.handoffLogFailed {
+					ui.Text(c, "自动承接日志暂时无法读取").FontSize(fsm(t)).TextColor(t.TextMuted)
+				} else if d.handoffLogExpanded && len(d.handoffLog.Events) > 0 {
+					ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
+						for _, ev := range d.handoffLog.Events {
+							line := handoffEventLine(ev)
+							ui.Text(c, line).FontSize(fxs(t)).TextColor(t.TextMuted).
+								MaxLines(1).Ellipsis("…").Tooltip(line)
+						}
+					})
+				}
 
 				// Comments: section label + Gap only (no hairline divider).
 				ui.Row(c).FillWidth().Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
@@ -1950,10 +2182,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 		composer.
 			Children(func() {
 				b.commentThumbStrip(c, t, d)
-				if p, ok := b.projectByID(d.snap.ProjectID); ok {
-					d.comment, d.commentFiles = adoptWorkspaceMentionTokens(d.comment, d.commentFiles)
-					b.workspaceMentionChips(c, t, &d.commentFiles, p.WorkspacePath, "comment-file-chips")
-				}
+				d.comment, d.commentFiles = adoptWorkspaceMentionTokens(d.comment, d.commentFiles)
 				// Give a one-line draft a taller row so AlignItems centers it
 				// vertically; multiline drafts grow the row with their own height.
 				ui.Row(c).FillWidth().Gap(t.Space(2)).MinHeight(t.Space(8)).
@@ -2044,6 +2273,9 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						key.SetText(d.comment)
 						return true
 					})
+					if p, ok := b.projectByID(d.snap.ProjectID); ok {
+						b.workspaceMentionChips(c, t, &d.commentFiles, p.WorkspacePath, "comment-file-chips")
+					}
 					if b.commenting {
 						loading.BouncingDots(c, loading.Options{Size: 12, Color: t.Accent}).Label("正在发送评论")
 					}
@@ -2071,6 +2303,41 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 		return
 	}
 	d.open = open
+}
+
+func handoffSummaryLine(sum executor.HandoffSummary) string {
+	var parts []string
+	if sum.Runtime != "" {
+		parts = append(parts, runtimeLabel(sum.Runtime))
+	}
+	if sum.Outcome != "" {
+		parts = append(parts, sum.Outcome)
+	} else if sum.LastLabel != "" {
+		parts = append(parts, sum.LastLabel)
+	}
+	if d := executor.FormatHandoffDuration(sum.DurationMs); d != "" {
+		parts = append(parts, "耗时 "+d)
+	}
+	if sum.Reason != "" {
+		parts = append(parts, sum.Reason)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func handoffEventLine(ev executor.HandoffEvent) string {
+	parts := []string{commentTimestamp(ev.Timestamp), executor.HandoffEventLabel(ev.Event)}
+	if ev.Runtime != "" {
+		parts = append(parts, runtimeLabel(ev.Runtime))
+	}
+	if ev.ExecutionState != "" {
+		parts = append(parts, ev.ExecutionState)
+	} else if ev.RunStatus != "" {
+		parts = append(parts, ev.RunStatus)
+	}
+	if ev.Reason != "" {
+		parts = append(parts, ev.Reason)
+	}
+	return strings.Join(parts, " · ")
 }
 
 // commentThreads renders each thread with its replies below their parent:
@@ -2165,9 +2432,14 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 					}
 				})
 			}
-			if cm.Author == b.agent && cm.Mention == "" && ui.Button(c.Key("continue-"+cm.ID), "让 AI 跟进").Label("跟进评论："+cm.ID).
-				Tooltip("把这条评论交回任务的原始 AI 会话").Disabled(b.commenting).Clicked() {
-				b.continueComment(d.id, cm.ID)
+			if cm.Author == b.agent && cm.Mention == "" {
+				// Hug content width: bare Button in a Stretch column fills the row.
+				ui.Row(c).Gap(t.Space(2)).Children(func() {
+					if ui.Button(c.Key("continue-"+cm.ID), "让 AI 跟进").Label("跟进评论：" + cm.ID).
+						Tooltip("把这条评论交回任务的原始 AI 会话").Disabled(b.commenting).Clicked() {
+						b.continueComment(d.id, cm.ID)
+					}
+				})
 			}
 		})
 		// Replies hang off their parent inside a rail, in store order, so the
@@ -2695,6 +2967,12 @@ func (b *board) formView(c *ui.Context, t *ui.Theme) {
 				})
 			})
 			if editing {
+				ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "验收完成时自动提交 Git").FontSize(t.FontSize).Grow(1)
+					_ = ui.Switch(c, &f.gitCommitOnDone).Label("验收完成时自动提交 Git").Disabled(f.creating)
+				})
+			}
+			if editing {
 				ui.Row(c).FillWidth().Justify(ui.Start).Children(func() {
 					if ui.Button(c, "删除项目").Label("删除项目").
 						TextColor(t.Danger).Disabled(f.creating).Clicked() {
@@ -2822,10 +3100,7 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 		if len(f.composeImages) > 0 || f.composeImage.uploading {
 			b.composeThumbStrip(c, t, f)
 		}
-		if p, ok := b.projectByID(f.projectID); ok {
-			f.name, f.fileMentions = adoptWorkspaceMentionTokens(f.name, f.fileMentions)
-			b.workspaceMentionChips(c, t, &f.fileMentions, p.WorkspacePath, "compose-file-chips")
-		}
+		f.name, f.fileMentions = adoptWorkspaceMentionTokens(f.name, f.fileMentions)
 		// The input pill owns its entrance motion so the upward travel is visible,
 		// independent of DialogBase's panel positioning.
 		ui.Row(c).Key("compose-input-pill").Transition(ui.ElementTransition{
@@ -2903,6 +3178,9 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 					})
 				b.taskFileMentionMenu(c, t, f, input)
 				b.composePaste(input, f)
+				if p, ok := b.projectByID(f.projectID); ok {
+					b.workspaceMentionChips(c, t, &f.fileMentions, p.WorkspacePath, "compose-file-chips")
+				}
 				// mygo's RGBA alpha is 0–1. A byte-scale 18 clamps to opaque
 				// black, which hides this dark ↑ on the white pill.
 				send := ui.Button(c, "").Label("创建任务").

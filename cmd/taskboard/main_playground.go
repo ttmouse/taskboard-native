@@ -21,6 +21,7 @@ func main() {
 	auto := flag.Bool("autoplay", false, "play the API scenario on launch")
 	compare := flag.Bool("compare", false, "play A, B and C with identical API timings")
 	single := flag.Bool("single", false, "show one card lifting, moving and settling via API")
+	reply := flag.Bool("reply", false, "open the static comment-reply sample page")
 	flag.Parse()
 	mygo.App.SetName("Taskboard Motion Playground")
 	dir, err := os.MkdirTemp("", "taskboard-motion-playground-")
@@ -41,6 +42,10 @@ func main() {
 	}
 	if *compare {
 		b.variant = variants[0]
+	}
+	if *reply {
+		b.autoStart, b.compare, b.singleAuto = false, false, false
+		b.replyDemo = true
 	}
 	b.phase = "等待播放 · 临时数据"
 	fmt.Printf("Playground API: %s\nScratch database: %s\n", srv.URL, srv.DBPath)

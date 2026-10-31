@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/egoist/mygo/ui"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -101,15 +102,86 @@ func workspaceMentionQuery(text string) (string, bool) {
 }
 
 func insertWorkspaceMention(text, rel string) string {
-	trimmed := strings.TrimRight(text, " \t\n")
-	if _, ok := workspaceMentionQuery(trimmed); ok {
-		trimmed = strings.TrimRight(trimmed[:strings.LastIndex(trimmed, "@")], " \t\n")
-	}
+	// Kept for tests and callers that still embed the token in plain text.
+	trimmed := clearWorkspaceMentionQuery(text)
 	token := "@{" + filepath.ToSlash(rel) + "}"
 	if trimmed == "" {
 		return token + " "
 	}
 	return trimmed + " " + token + " "
+}
+
+// clearWorkspaceMentionQuery drops a trailing @search token so the composer
+// can keep file picks on badge chips instead of duplicating the path in text.
+func clearWorkspaceMentionQuery(text string) string {
+	trimmed := strings.TrimRight(text, " \t\n")
+	if _, ok := workspaceMentionQuery(trimmed); ok {
+		trimmed = strings.TrimRight(trimmed[:strings.LastIndex(trimmed, "@")], " \t\n")
+	}
+	return trimmed
+}
+
+func appendWorkspaceMention(files []string, rel string) []string {
+	rel = filepath.ToSlash(rel)
+	for _, existing := range files {
+		if existing == rel {
+			return files
+		}
+	}
+	return append(files, rel)
+}
+
+// withWorkspaceMentions appends @{rel} tokens for send/create while the draft
+// input itself stays free of those tokens (chips carry the selection).
+func withWorkspaceMentions(text string, files []string) string {
+	text = strings.TrimSpace(text)
+	parts := make([]string, 0, len(files)+1)
+	if text != "" {
+		parts = append(parts, text)
+	}
+	for _, rel := range files {
+		token := "@{" + filepath.ToSlash(rel) + "}"
+		if text != "" && strings.Contains(text, token) {
+			continue
+		}
+		parts = append(parts, token)
+	}
+	return strings.Join(parts, " ")
+}
+
+// stripWorkspaceMentionTokens removes @{…} tokens from draft text so the
+// TextArea does not repeat paths already shown as chips.
+func stripWorkspaceMentionTokens(text string) string {
+	var out strings.Builder
+	for rest := text; ; {
+		start := strings.Index(rest, "@{")
+		if start < 0 {
+			out.WriteString(rest)
+			break
+		}
+		out.WriteString(rest[:start])
+		end := strings.IndexByte(rest[start+2:], '}')
+		if end < 0 {
+			out.WriteString(rest[start:])
+			break
+		}
+		end += start + 2
+		rest = rest[end+1:]
+	}
+	return strings.Join(strings.Fields(out.String()), " ")
+}
+
+// adoptWorkspaceMentionTokens moves any @{rel} still sitting in draft text
+// onto the chip list and clears them from the TextArea.
+func adoptWorkspaceMentionTokens(text string, files []string) (string, []string) {
+	paths := workspaceMentionPaths(text)
+	if len(paths) == 0 {
+		return text, files
+	}
+	for _, rel := range paths {
+		files = appendWorkspaceMention(files, rel)
+	}
+	return stripWorkspaceMentionTokens(text), files
 }
 
 // expandWorkspaceMentions converts selected relative tokens to ordinary
@@ -218,4 +290,20 @@ func displayWorkspaceMentions(text, root string) string {
 		rest = rest[end+1:]
 	}
 	return out.String()
+}
+
+// workspaceMentionInputWidth sizes a text field to its content so file chips
+// can sit beside it. Empty drafts keep a readable minimum width.
+func workspaceMentionInputWidth(c *ui.Context, t *ui.Theme, text string, fontSize float32) float32 {
+	const minW float32 = 120
+	pad := t.Space(4)
+	sample := text
+	if sample == "" {
+		sample = " "
+	}
+	w, _ := c.MeasureText(0, ui.Span{Text: sample, Size: fontSize})
+	if w+pad < minW {
+		return minW
+	}
+	return w + pad
 }

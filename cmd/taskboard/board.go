@@ -30,6 +30,9 @@ type api interface {
 	Projects() ([]model.Project, error)
 	Board(projectID string) (client.Board, error)
 	Task(id string) (model.Task, error)
+	AddRelation(id string, version int, kind, relatedID string) (model.RelationResult, error)
+	RemoveRelation(id string, version int, kind, relatedID string) (model.RelationResult, error)
+	HandoffLog(taskID string) (executor.HandoffLogView, error)
 	CreateTask(projectID, columnID, title, description, assignee string) (model.Task, error)
 	CreateTaskAndDispatch(projectID, columnID, title, description, assignee, runtime string) (model.Task, error)
 	Update(id string, version int, title, description, assignee *string) (model.Task, error)
@@ -95,9 +98,20 @@ type detail struct {
 	commentFocus        int  // frames left to focus the composer on open or hand focus back after picking
 	commentCaretStart   bool // the caret sat at the start when the field was built
 	comments            []model.Comment
+	relationExpanded    bool   // 关系模块；默认折叠
+	relationPickKind    string // "" | sub | blocks | blocker | create-sub | create-blocks | create-blocker
+	relationNewTitle    string
+	handoffLog          executor.HandoffLogView
+	handoffLogLoading   bool
+	handoffLogFailed    bool
+	handoffLogExpanded  bool
 	loading             bool // comments still arriving
 	bodyImage           imageEdit
 	commentImage        imageEdit
+	commentImages       []string
+	commentFiles        []string
+	commentThumbs       map[string]ui.ImageSource
+	commentThumbLoading map[string]bool
 	markdown            *markdown.Options
 	markdownImages      sync.Map // URL → *markdownImageLoad
 
@@ -105,6 +119,10 @@ type detail struct {
 	// (even after the pointer leaves); cleared on blur when not hovered.
 	editTitle bool
 	editBody  bool
+	// bodyEditSeenFocus becomes true once the body TextArea has taken
+	// focus this edit session, so the first frame after click (before
+	// focus lands) does not immediately fall back to Markdown.
+	bodyEditSeenFocus bool
 
 	// bodyTop scrolls the body to its first line once, when the dialog
 	// opens: a fresh TextArea puts the caret at the end of the text and
@@ -134,6 +152,7 @@ type form struct {
 	name             string
 	workspacePath    string // project form: local working directory
 	color            string // project form: accent color; "" → automatic slot
+	gitCommitOnDone  bool // project edit: 验收完成时自动 Git 提交
 	pickingWorkspace bool   // one native directory picker at a time
 	columnID         string // task form only: target column
 	projectID        string // task form only: which project receives the card
@@ -146,6 +165,7 @@ type form struct {
 	fileMentionIndex     int
 	fileMentionOpen      bool
 	fileMentionProjectID string
+	fileMentions         []string
 	composeImage         imageEdit
 	// thumbs caches decoded bitmaps for the small preview strip so each
 	// image is fetched once, not every frame.
@@ -252,7 +272,8 @@ type board struct {
 	searchSelection           int    // highlighted search hit; -1 means no keyboard selection
 	searchSelectionQuery      string // query the current keyboard selection belongs to
 	quickTitle                string // vertical-list top field; Enter creates in 待办
-	quickCreating             bool   // the quick-add request is awaiting the service
+	quickFileMentions         []string
+	quickCreating             bool // the quick-add request is awaiting the service
 	quickFileMentionOpen      bool
 	quickFileMentionIndex     int
 	quickFileMentionProjectID string
@@ -1182,22 +1203,34 @@ func (b *board) toast(title, desc string) {
 	})
 }
 
+// infoToast is a soft, non-error notice (stale-card nudge, …).
+func (b *board) infoToast(title, desc string) {
+	b.post(func() {
+		if b.ctx() == nil {
+			return
+		}
+		b.ctx().AddToast(ui.Toast{Title: title, Description: desc, Type: "info", Timeout: 6 * time.Second})
+	})
+}
+
 // ctx is the last frame's context, kept so background work can show a
 // toast without owning a view.
 func (b *board) ctx() *ui.Context { return b.frameCtx }
 
 func (b *board) openDetail(t model.Task) {
 	d := &detail{
-		open:         true,
-		id:           t.ID,
-		title:        t.Title,
-		body:         t.Description,
-		assignee:     t.Assignee,
-		column:       b.columnName(t.ColumnID),
-		loading:      true,
-		commentFocus: 1,
-		snap:         t,
-		bodyTop:      true,
+		open:              true,
+		id:                t.ID,
+		title:             t.Title,
+		body:              t.Description,
+		assignee:          t.Assignee,
+		column:            b.columnName(t.ColumnID),
+		loading:           true,
+		handoffLogLoading: true,
+		commentFocus:      1,
+		snap:              t,
+		bodyTop:           true,
+		relationExpanded:  false, // 关系默认折叠
 	}
 	b.detail = d
 	go func() {
@@ -1209,6 +1242,19 @@ func (b *board) openDetail(t model.Task) {
 			b.detail.loading = false
 			if err == nil {
 				b.detail.comments = cs
+			}
+		})
+	}()
+	go func() {
+		view, err := b.api.HandoffLog(t.ID)
+		b.post(func() {
+			if b.detail == nil || b.detail.id != t.ID {
+				return
+			}
+			b.detail.handoffLogLoading = false
+			b.detail.handoffLogFailed = err != nil
+			if err == nil {
+				b.detail.handoffLog = view
 			}
 		})
 	}()
@@ -1326,6 +1372,9 @@ func (b *board) moveTaskWithSuccess(id, toColumn, afterID string, atTop bool, on
 			if onSuccess != nil {
 				onSuccess()
 			}
+			if b.columnHasRole(toColumn, model.ColumnRoleDone) {
+				b.maybeGitCommitOnDone(cur)
+			}
 		})
 	}()
 }
@@ -1358,8 +1407,165 @@ func (b *board) archiveTask(id string) {
 	}()
 }
 
+
+func (b *board) changeTaskRelation(taskID string, version int, kind, relatedID string, remove bool) {
+	go func() {
+		var task, related model.Task
+		var err error
+		var result model.RelationResult
+		if remove {
+			result, err = b.api.RemoveRelation(taskID, version, kind, relatedID)
+		} else {
+			result, err = b.api.AddRelation(taskID, version, kind, relatedID)
+		}
+		task, related = result.Task, result.RelatedTask
+		b.post(func() {
+			if err != nil {
+				b.toast("关系更新失败", err.Error())
+				return
+			}
+			b.replace(task)
+			b.replace(related)
+		})
+	}()
+}
+
 // restore undoes an archive: the service clears the flag and puts the card
 // back at the bottom of its own column, and the pushed event redraws it.
+
+
+// createRelatedTask creates an intake card then links it under kind
+// (sub → parent of new card is current; blocks / blocker as relation API kinds).
+func (b *board) createRelatedTask(anchorID, kind, title string) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		b.toast("无法创建", "标题不能为空")
+		return
+	}
+	anchor := b.task(anchorID)
+	if anchor == nil {
+		return
+	}
+	intake := b.projectColumnIDByRole(anchor.ProjectID, model.ColumnRoleIntake)
+	if intake == "" {
+		b.toast("无法创建", "项目没有入口列")
+		return
+	}
+	if d := b.detail; d != nil && d.id == anchorID {
+		d.relationNewTitle = ""
+		d.relationPickKind = ""
+	}
+	go func() {
+		created, err := b.api.CreateTask(anchor.ProjectID, intake, title, "", "")
+		if err != nil {
+			b.post(func() { b.toast("创建失败", err.Error()) })
+			return
+		}
+		var result model.RelationResult
+		switch kind {
+		case "sub":
+			result, err = b.api.AddRelation(created.ID, created.Version, "parent", anchorID)
+		case "blocks":
+			result, err = b.api.AddRelation(anchorID, anchor.Version, "blocks", created.ID)
+		case "blocker":
+			result, err = b.api.AddRelation(anchorID, anchor.Version, "blocked_by", created.ID)
+		default:
+			b.post(func() {
+				b.upsert(created)
+				b.toast("已创建", fmt.Sprintf("#%d %s", created.Number, clip(created.Title, 30)))
+			})
+			return
+		}
+		b.post(func() {
+			if err != nil {
+				b.upsert(created)
+				b.toast("已创建，关联失败", err.Error())
+				return
+			}
+			b.replace(result.Task)
+			b.replace(result.RelatedTask)
+			b.toast("已创建并关联", fmt.Sprintf("#%d %s", created.Number, clip(created.Title, 30)))
+		})
+	}()
+}
+
+func (b *board) createSubtask(parentID, title string) {
+	b.createRelatedTask(parentID, "sub", title)
+}
+
+
+
+// relationCandidateTasks lists same-project non-archived cards for relation pickers,
+// excluding IDs in exclude and applying DSH-style cycle guards for parent/child.
+func (b *board) relationCandidateTasks(current model.Task, kind string) []model.Task {
+	exclude := map[string]bool{current.ID: true}
+	switch kind {
+	case "parent":
+		// cannot set a descendant as parent
+		queue := make([]string, 0, len(current.Relations.SubIssues))
+		for _, c := range current.Relations.SubIssues {
+			queue = append(queue, c.ID)
+		}
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			if exclude[id] {
+				continue
+			}
+			exclude[id] = true
+			if child := b.task(id); child != nil {
+				for _, gc := range child.Relations.SubIssues {
+					queue = append(queue, gc.ID)
+				}
+			}
+		}
+		if current.Relations.Parent != nil {
+			exclude[current.Relations.Parent.ID] = true
+		}
+	case "sub":
+		for _, c := range current.Relations.SubIssues {
+			exclude[c.ID] = true
+		}
+		// cannot attach an ancestor as child
+		p := current.Relations.Parent
+		for p != nil {
+			if exclude[p.ID] {
+				break
+			}
+			exclude[p.ID] = true
+			if parent := b.task(p.ID); parent != nil {
+				p = parent.Relations.Parent
+			} else {
+				break
+			}
+		}
+	case "blocks":
+		for _, c := range current.Relations.Blocks {
+			exclude[c.ID] = true
+		}
+	case "blocker":
+		for _, c := range current.Relations.BlockedBy {
+			exclude[c.ID] = true
+		}
+	}
+	out := make([]model.Task, 0)
+	for _, candidate := range b.tasks {
+		if candidate.ProjectID != current.ProjectID || candidate.Archived || exclude[candidate.ID] {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func relationTaskLabel(t model.Task) string {
+	return fmt.Sprintf("#%d %s", t.Number, clip(t.Title, 36))
+}
+
+func relationSummaryLabel(s model.TaskRelationSummary) string {
+	return fmt.Sprintf("#%d %s", s.Number, clip(s.Title, 36))
+}
+
 func (b *board) restore(t model.Task) {
 	go func() {
 		if _, err := b.api.Restore(t.ID, 0); err != nil {
@@ -1503,7 +1709,10 @@ func (b *board) submitComment(followup bool) {
 	if d == nil || b.commenting || d.commentImage.busy() {
 		return
 	}
-	text := strings.TrimSpace(d.comment)
+	draft := d.comment
+	files := append([]string(nil), d.commentFiles...)
+	images := append([]string(nil), d.commentImages...)
+	text := commentWithImages(withWorkspaceMentions(draft, files), images)
 	if text == "" {
 		return
 	}
@@ -1514,6 +1723,7 @@ func (b *board) submitComment(followup bool) {
 	parentID, parentAuthor := d.commentParentID, d.commentParentAuthor
 	autoFollowup := followup || mention != "" || taskHasReturnedSession(d.snap)
 	d.comment = ""
+	d.commentFiles = nil
 	d.commentMention = ""
 	d.commentParentID, d.commentParentAuthor = "", ""
 	d.mentionOpen = false
@@ -1524,7 +1734,8 @@ func (b *board) submitComment(followup bool) {
 			b.commenting = false
 			if err != nil {
 				if b.detail == d && d.comment == "" {
-					d.comment = text
+					d.comment = draft
+					d.commentFiles = files
 					d.commentMention = mention
 					d.commentParentID, d.commentParentAuthor = parentID, parentAuthor
 				}
@@ -1532,6 +1743,8 @@ func (b *board) submitComment(followup bool) {
 				return
 			}
 			if b.detail == d {
+				d.commentImages = nil
+				d.commentFiles = nil
 				// Preserve the normal close behavior for any title or body edits
 				// made before the comment was submitted.
 				b.saveDetail()
@@ -1609,12 +1822,14 @@ func (b *board) deleteProject(p model.Project) {
 }
 
 func (b *board) openProjectEdit(p model.Project) {
+	gitOn := b.prefs.ProjectGitCommitOnDone != nil && b.prefs.ProjectGitCommitOnDone[p.ID]
 	b.form = &form{
 		open:             true,
 		isTask:           false,
 		name:             p.Name,
 		workspacePath:    p.WorkspacePath,
 		color:            p.Color,
+		gitCommitOnDone:  gitOn,
 		editingProjectID: p.ID,
 	}
 }
@@ -1660,9 +1875,30 @@ func (b *board) saveProjectEdit() {
 				f.creating = false
 				f.open = false
 			}
+			b.applyProjectGitCommitOnDone(p.ID, f.gitCommitOnDone)
 			b.toast("已保存", "项目「"+clip(p.Name, 24)+"」已更新")
 		})
 	}()
+}
+
+// applyProjectGitCommitOnDone writes or clears the per-project
+// 「验收完成时自动 Git 提交」flag in uiPrefs.
+func (b *board) applyProjectGitCommitOnDone(projectID string, on bool) {
+	if projectID == "" {
+		return
+	}
+	if on {
+		if b.prefs.ProjectGitCommitOnDone == nil {
+			b.prefs.ProjectGitCommitOnDone = map[string]bool{}
+		}
+		b.prefs.ProjectGitCommitOnDone[projectID] = true
+	} else if b.prefs.ProjectGitCommitOnDone != nil {
+		delete(b.prefs.ProjectGitCommitOnDone, projectID)
+		if len(b.prefs.ProjectGitCommitOnDone) == 0 {
+			b.prefs.ProjectGitCommitOnDone = nil
+		}
+	}
+	_ = saveUIPrefs(b.prefs)
 }
 
 func (b *board) createProject(stayOpen bool) {
