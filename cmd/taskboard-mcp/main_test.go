@@ -245,7 +245,11 @@ func TestMCPEndToEnd(t *testing.T) {
 			t.Fatalf("tool %s schema = %v", name, tool["inputSchema"])
 		}
 	}
-	want := []string{"list_projects", "create_project", "list_tasks", "get_task", "create_task", "update_task", "move_task", "add_comment", "list_comments"}
+	want := []string{
+		"list_projects", "create_project", "list_tasks", "get_task", "create_task",
+		"update_task", "move_task", "add_comment", "list_comments",
+		"archive_task", "add_relation", "remove_relation", "release_execution", "followup_comment",
+	}
 	if len(tools) != len(want) {
 		t.Fatalf("tools = %v, want %d", names, len(want))
 	}
@@ -526,3 +530,108 @@ func TestMCPToolSchemaAndHTTPForwarding(t *testing.T) {
 }
 
 func timeoutAfter() <-chan time.Time { return time.After(20 * time.Second) }
+
+func TestMCPRejectUnknownArgsAndClearFields(t *testing.T) {
+	var gotBodies []map[string]any
+	var gotMethods []string
+	var gotPaths []string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethods = append(gotMethods, r.Method)
+		gotPaths = append(gotPaths, r.URL.Path)
+		body := map[string]any{}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotBodies = append(gotBodies, body)
+		}
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/tasks/task-1":
+			_, _ = w.Write([]byte(`{"id":"task-1","version":2,"assignee":"","description":""}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/tasks/task-1/comments":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"c-2","text":"reply","parentCommentId":"c-1"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/tasks/task-1/archive":
+			_, _ = w.Write([]byte(`{"id":"task-1","archived":true,"version":3}`))
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/relations/"):
+			_, _ = w.Write([]byte(`{"task":{"id":"task-1","version":4},"relatedTask":{"id":"task-2","version":1}}`))
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/relations/"):
+			_, _ = w.Write([]byte(`{"task":{"id":"task-1","version":5},"relatedTask":{"id":"task-2","version":1}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/tasks/task-1/execution/release":
+			_, _ = w.Write([]byte(`{"id":"task-1","version":1}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/continue"):
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"taskId":"task-1","commentId":"c-1"}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	s := &server{agent: "mcp-test", base: "http://taskboard.test", http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Result(), nil
+	})}}
+
+	if _, err := s.callTool("update_task", json.RawMessage(`{"id":"task-1","version":1,"nope":true}`)); err == nil || !strings.Contains(err.Error(), "unknown argument") {
+		t.Fatalf("unknown arg = %v", err)
+	}
+	if _, err := s.callTool("list_projects", json.RawMessage(`{"extra":1}`)); err == nil || !strings.Contains(err.Error(), "unknown argument") {
+		t.Fatalf("list_projects unknown = %v", err)
+	}
+
+	if _, err := s.callTool("update_task", json.RawMessage(`{"id":"task-1","version":1,"assignee":"","description":""}`)); err != nil {
+		t.Fatalf("clear fields: %v", err)
+	}
+	if len(gotBodies) == 0 || gotBodies[0]["assignee"] != "" || gotBodies[0]["description"] != "" {
+		t.Fatalf("clear body = %#v", gotBodies)
+	}
+
+	if _, err := s.callTool("add_comment", json.RawMessage(`{"taskId":"task-1","text":"reply","parentCommentId":"c-1"}`)); err != nil {
+		t.Fatalf("parent comment: %v", err)
+	}
+	if gotBodies[len(gotBodies)-1]["parentCommentId"] != "c-1" {
+		t.Fatalf("parent body = %#v", gotBodies[len(gotBodies)-1])
+	}
+
+	if _, err := s.callTool("archive_task", json.RawMessage(`{"id":"task-1","version":2}`)); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if _, err := s.callTool("add_relation", json.RawMessage(`{"taskId":"task-1","version":3,"type":"blocks","relatedId":"task-2"}`)); err != nil {
+		t.Fatalf("add_relation: %v", err)
+	}
+	if _, err := s.callTool("remove_relation", json.RawMessage(`{"taskId":"task-1","version":4,"type":"blocks","relatedId":"task-2"}`)); err != nil {
+		t.Fatalf("remove_relation: %v", err)
+	}
+	if gotMethods[len(gotMethods)-1] != http.MethodDelete {
+		t.Fatalf("remove method = %v", gotMethods)
+	}
+	if _, err := s.callTool("release_execution", json.RawMessage(`{"taskId":"task-1"}`)); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := s.callTool("followup_comment", json.RawMessage(`{"taskId":"task-1","commentId":"c-1"}`)); err != nil {
+		t.Fatalf("followup: %v", err)
+	}
+
+	defs := toolDefinitions()
+	names := map[string]bool{}
+	for _, d := range defs {
+		names[d["name"].(string)] = true
+		schema := d["inputSchema"].(map[string]any)
+		if schema["additionalProperties"] != false {
+			t.Errorf("%s additionalProperties = %v", d["name"], schema["additionalProperties"])
+		}
+	}
+	for _, name := range []string{"archive_task", "add_relation", "remove_relation", "release_execution", "followup_comment"} {
+		if !names[name] {
+			t.Errorf("missing tool %s", name)
+		}
+	}
+	props := map[string]any{}
+	for _, d := range defs {
+		if d["name"].(string) == "add_comment" {
+			props = d["inputSchema"].(map[string]any)["properties"].(map[string]any)
+		}
+	}
+	if _, ok := props["parentCommentId"]; !ok {
+		t.Fatal("add_comment schema missing parentCommentId")
+	}
+}

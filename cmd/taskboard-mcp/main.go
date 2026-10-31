@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -141,7 +142,9 @@ func (s *server) dispatch(req request) (any, *rpcError) {
 			},
 			"instructions": "本机看板：用 list_projects 找到项目，用 list_tasks 按 projectId 查看卡片，" +
 				"可用 list_tasks(summary=true) 先读卡片摘要，再用 get_task(id) 读取正文和评论。" +
-				"create_project / create_task / update_task / move_task / add_comment 可写入；卡片更新和移动需要当前 version。",
+				"create_project / create_task / update_task / move_task / add_comment / archive_task / " +
+				"add_relation / remove_relation / release_execution / followup_comment 可写入；" +
+				"卡片更新、移动、归档与关系变更需要当前 version；未知参数会被拒绝。",
 		}, nil
 	case "ping":
 		return map[string]any{}, nil
@@ -250,13 +253,13 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "update_task",
-			"description": "修改卡片字段（乐观并发：必须带当前 version，冲突时返回任务详情）。",
+			"description": "修改卡片字段（乐观并发：必须带当前 version，冲突时返回任务详情）。description/assignee 传空串可清空；title 不可空。",
 			"inputSchema": object(map[string]any{
 				"id":          str("卡片 id，必填"),
 				"version":     num("卡片当前 version，必填"),
-				"title":       str("新标题"),
-				"description": str("新正文"),
-				"assignee":    str("新负责人"),
+				"title":       str("新标题；不可为空串"),
+				"description": str("新正文；空串清空"),
+				"assignee":    str("新负责人；空串清空"),
 			}, "id", "version"),
 		},
 		{
@@ -272,11 +275,12 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "add_comment",
-			"description": "给卡片追加一条评论。mention 指定由哪个执行渠道跟进这条评论（dsh|codex|pi|claude），留空表示不指定。",
+			"description": "给卡片追加一条评论。mention 指定由哪个执行渠道跟进这条评论（dsh|codex|pi|claude），留空表示不指定。parentCommentId 回复同一卡片上的某条评论。",
 			"inputSchema": object(map[string]any{
-				"taskId":  str("卡片 id，必填"),
-				"text":    str("评论正文，必填"),
-				"mention": str("可选：@ 给一个执行渠道，派发器会把这条评论交给它跟进"),
+				"taskId":          str("卡片 id，必填"),
+				"text":            str("评论正文，必填"),
+				"mention":         str("可选：@ 给一个执行渠道，派发器会把这条评论交给它跟进"),
+				"parentCommentId": str("可选：回复的父评论 id，必须属于同一卡片"),
 			}, "taskId", "text"),
 		},
 		{
@@ -285,6 +289,49 @@ func toolDefinitions() []map[string]any {
 			"inputSchema": object(map[string]any{
 				"taskId": str("卡片 id，必填"),
 			}, "taskId"),
+		},
+		{
+			"name":        "archive_task",
+			"description": "归档卡片（软删除，乐观并发：必须带当前 version）。",
+			"inputSchema": object(map[string]any{
+				"id":      str("卡片 id，必填"),
+				"version": num("卡片当前 version，必填"),
+			}, "id", "version"),
+		},
+		{
+			"name":        "add_relation",
+			"description": "给卡片添加关系：parent（relatedId 为父卡）、blocks、blocked_by、related。需当前 version。",
+			"inputSchema": object(map[string]any{
+				"taskId":    str("卡片 id，必填"),
+				"version":   num("卡片当前 version，必填"),
+				"type":      str("关系类型：parent|blocks|blocked_by|related，必填"),
+				"relatedId": str("关联卡片 id，必填"),
+			}, "taskId", "version", "type", "relatedId"),
+		},
+		{
+			"name":        "remove_relation",
+			"description": "移除卡片关系。类型同 add_relation，需当前 version。",
+			"inputSchema": object(map[string]any{
+				"taskId":    str("卡片 id，必填"),
+				"version":   num("卡片当前 version，必填"),
+				"type":      str("关系类型：parent|blocks|blocked_by|related，必填"),
+				"relatedId": str("关联卡片 id，必填"),
+			}, "taskId", "version", "type", "relatedId"),
+		},
+		{
+			"name":        "release_execution",
+			"description": "把卡片执行记录收敛为 released，释放写锁，以便重新派发或评论跟进。",
+			"inputSchema": object(map[string]any{
+				"taskId": str("卡片 id，必填"),
+			}, "taskId"),
+		},
+		{
+			"name":        "followup_comment",
+			"description": "把已保存评论交回原会话跟进（对应 HTTP /continue）。",
+			"inputSchema": object(map[string]any{
+				"taskId":    str("卡片 id，必填"),
+				"commentId": str("评论 id，必填"),
+			}, "taskId", "commentId"),
 		},
 	}
 }
@@ -299,6 +346,9 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 	}
 	if args == nil {
 		args = map[string]json.RawMessage{}
+	}
+	if err := rejectUnknownArgs(name, args); err != nil {
+		return "", err
 	}
 	switch name {
 	case "list_projects":
@@ -408,12 +458,18 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		body := map[string]any{"version": version}
+		// Keys present (even as "") are forwarded so description/assignee can
+		// be cleared; omitted keys leave the field unchanged. Empty title is
+		// rejected by the service.
 		for _, field := range []string{"title", "description", "assignee"} {
-			if v, err := optionalString(args, field); err != nil {
-				return "", err
-			} else if v != "" {
-				body[field] = v
+			if !hasArgument(args, field) {
+				continue
 			}
+			v, err := optionalString(args, field)
+			if err != nil {
+				return "", err
+			}
+			body[field] = v
 		}
 		return s.send(http.MethodPatch, "/api/tasks/"+url.PathEscape(id), body, http.StatusOK)
 	case "move_task":
@@ -459,8 +515,15 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		body := map[string]any{"text": text}
-		if mention, _ := optionalString(args, "mention"); mention != "" {
+		if mention, err := optionalString(args, "mention"); err != nil {
+			return "", err
+		} else if mention != "" {
 			body["mention"] = mention
+		}
+		if parentID, err := optionalString(args, "parentCommentId"); err != nil {
+			return "", err
+		} else if parentID != "" {
+			body["parentCommentId"] = parentID
 		}
 		return s.send(http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/comments", body, http.StatusCreated)
 	case "list_comments":
@@ -469,6 +532,62 @@ func (s *server) callTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		return s.get("/api/tasks/" + url.PathEscape(taskID) + "/comments")
+	case "archive_task":
+		id, err := requiredString(args, "id")
+		if err != nil {
+			return "", err
+		}
+		version, err := requiredInt(args, "version")
+		if err != nil {
+			return "", err
+		}
+		return s.send(http.MethodPost, "/api/tasks/"+url.PathEscape(id)+"/archive", map[string]any{"version": version}, http.StatusOK)
+	case "add_relation", "remove_relation":
+		taskID, err := requiredString(args, "taskId")
+		if err != nil {
+			return "", err
+		}
+		version, err := requiredInt(args, "version")
+		if err != nil {
+			return "", err
+		}
+		relType, err := requiredString(args, "type")
+		if err != nil {
+			return "", err
+		}
+		relatedID, err := requiredString(args, "relatedId")
+		if err != nil {
+			return "", err
+		}
+		switch relType {
+		case "parent", "blocks", "blocked_by", "related":
+			// ok
+		default:
+			return "", fmt.Errorf("type must be parent, blocks, blocked_by, or related")
+		}
+		method := http.MethodPost
+		if name == "remove_relation" {
+			method = http.MethodDelete
+		}
+		path := "/api/tasks/" + url.PathEscape(taskID) + "/relations/" + url.PathEscape(relType) + "/" + url.PathEscape(relatedID)
+		return s.send(method, path, map[string]any{"version": version}, http.StatusOK)
+	case "release_execution":
+		taskID, err := requiredString(args, "taskId")
+		if err != nil {
+			return "", err
+		}
+		return s.do(http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/execution/release", nil, http.StatusOK)
+	case "followup_comment":
+		taskID, err := requiredString(args, "taskId")
+		if err != nil {
+			return "", err
+		}
+		commentID, err := requiredString(args, "commentId")
+		if err != nil {
+			return "", err
+		}
+		path := "/api/tasks/" + url.PathEscape(taskID) + "/comments/" + url.PathEscape(commentID) + "/continue"
+		return s.do(http.MethodPost, path, nil, http.StatusAccepted)
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
 	}
@@ -546,9 +665,9 @@ func (s *server) taskImageBlocks(taskJSON string) []map[string]any {
 				continue
 			}
 			blocks = append(blocks, map[string]any{
-				"type":      "image",
-				"data":      base64.StdEncoding.EncodeToString(data),
-				"mimeType":  mime,
+				"type":     "image",
+				"data":     base64.StdEncoding.EncodeToString(data),
+				"mimeType": mime,
 			})
 		}
 	}
@@ -661,6 +780,47 @@ func (s *server) resolveColumn(projectID, idOrName string) (string, error) {
 }
 
 // --- argument decoding ---
+
+// toolAllowedArgs lists every known argument key per tool. callTool rejects
+// any other key so hosts that skip schema validation still get a hard error.
+var toolAllowedArgs = map[string][]string{
+	"list_projects":     {},
+	"create_project":    {"name", "workspacePath"},
+	"list_tasks":        {"projectId", "includeArchived", "columnId", "assignee", "limit", "offset", "summary"},
+	"get_task":          {"id"},
+	"create_task":       {"projectId", "title", "columnId", "description", "assignee", "dispatchRuntime"},
+	"update_task":       {"id", "version", "title", "description", "assignee"},
+	"move_task":         {"id", "version", "columnId", "afterId", "atTop"},
+	"add_comment":       {"taskId", "text", "mention", "parentCommentId"},
+	"list_comments":     {"taskId"},
+	"archive_task":      {"id", "version"},
+	"add_relation":      {"taskId", "version", "type", "relatedId"},
+	"remove_relation":   {"taskId", "version", "type", "relatedId"},
+	"release_execution": {"taskId"},
+	"followup_comment":  {"taskId", "commentId"},
+}
+
+func rejectUnknownArgs(name string, args map[string]json.RawMessage) error {
+	allowed, ok := toolAllowedArgs[name]
+	if !ok {
+		return nil // unknown tool handled by the switch
+	}
+	known := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		known[key] = struct{}{}
+	}
+	var unknown []string
+	for key := range args {
+		if _, ok := known[key]; !ok {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("unknown argument(s): %s", strings.Join(unknown, ", "))
+}
 
 func requiredString(args map[string]json.RawMessage, key string) (string, error) {
 	v, err := optionalString(args, key)

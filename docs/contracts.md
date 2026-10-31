@@ -110,13 +110,14 @@ tb projects [--json]
 tb project add <name> [--path ABSOLUTE_DIRECTORY] [--json]
 tb list [--project ID] [--column NAME|ID] [--assignee WHO] [--limit N --offset N] [--summary] [--json]
 tb show <taskID> [--json]
-tb add <title> [--project ID] [--column NAME|ID] [--body TEXT]
-tb move <taskID> <column NAME|ID>
+tb add <title> [--project ID] [--column NAME|ID] [--body TEXT] [--assignee WHO] [--dispatch dsh|codex|pi|claude]
+tb move <taskID> <column NAME|ID> [--top] [--after CARD_ID]
 tb column <columnID> <role> [--json]   # role: intake|doing|review|done，空字符串清空
 tb comment <taskID> <body> [--mention dsh|codex|pi|claude]
 tb followup <taskID> <commentID>
 tb execution release <taskID>   # 把执行记录收敛为 released（释放写锁）
 tb archive <taskID>
+tb relation add|remove <taskID> <parent|blocks|blocked_by|related> <relatedID>
 tb serve [--addr ...]        # 前台跑服务（--detach 后台）
 ```
 
@@ -127,8 +128,8 @@ tb serve [--addr ...]        # 前台跑服务（--detach 后台）
 ## MCP（cmd/taskboard-mcp，stdio，换行分隔 JSON-RPC 2.0）
 
 - `initialize` → `protocolVersion: "2025-06-18"`、`serverInfo{name:"taskboard-native"}`、tools 能力。
-- `tools/list`：`list_projects`、`create_project`（name，workspacePath 可选）、`list_tasks`（projectId 必填，支持 columnId/assignee/limit/offset/summary）、`get_task`（id，正文及评论）、`create_task`（可选 `dispatchRuntime`：省略只建卡，带上则同一调用建卡并派发该渠道）、`update_task`、`move_task`、`add_comment`（可选 `mention`）、`list_comments`。
-- `tools/call` → 调 HTTP API，`content:[{type:"text", text:<JSON>}]`。
+- `tools/list`：`list_projects`、`create_project`（name，workspacePath 可选）、`list_tasks`（projectId 必填，支持 columnId/assignee/limit/offset/summary/includeArchived）、`get_task`（id，正文及评论）、`create_task`（可选 `dispatchRuntime`：省略只建卡，带上则同一调用建卡并派发该渠道）、`update_task`（可选 title/description/assignee；参数键出现且值为空串时清空 `description`/`assignee`，`title` 空串由服务拒绝）、`move_task`、`add_comment`（可选 `mention`、`parentCommentId`）、`list_comments`、`archive_task`（id+version）、`add_relation` / `remove_relation`（taskId+version+type+relatedId；type 为 parent|blocks|blocked_by|related）、`release_execution`（taskId）、`followup_comment`（taskId+commentId → `/continue`）。
+- `tools/call`：未知参数键一律拒绝（错误返回，禁止静默忽略）；调 HTTP API，`content:[{type:"text", text:<JSON>}]`。
 - 身份：`TASKBOARD_AGENT`，默认 `mcp`。
 
 ## 原生 UI（cmd/taskboard）
