@@ -438,6 +438,8 @@ type board struct {
 	colScrolls map[string]*colScroll
 
 	frameCtx *ui.Context
+	// toastLog records emitToast calls for tests (nil in production).
+	toastLog []toastEntry
 	curTheme *ui.Theme // the theme the current frame builds with
 
 	drafts map[string]string // retained for tests; column quick-add UI removed
@@ -1345,25 +1347,37 @@ func (b *board) touchDetail(t model.Task) {
 	b.detail.pushed = nil
 }
 
-// --- actions ---
-
-// toast reports something the window could not do.
-func (b *board) toast(title, desc string) {
-	b.post(func() {
-		if b.ctx() == nil {
-			return
-		}
-		b.ctx().AddToast(ui.Toast{Title: title, Description: desc, Type: "error", Timeout: 6 * time.Second})
-	})
+// toastEntry is one emitToast call, kept for tests.
+type toastEntry struct {
+	Kind, Title, Desc string
 }
 
-// infoToast is a soft, non-error notice (stale-card nudge, …).
+// --- actions ---
+
+// toast reports a failure the window could not complete.
+func (b *board) toast(title, desc string) {
+	b.emitToast("error", title, desc)
+}
+
+// infoToast is a soft, non-error notice (skip / neutral nudge, …).
 func (b *board) infoToast(title, desc string) {
+	b.emitToast("info", title, desc)
+}
+
+// okToast is a success notice (created / dispatched / saved / …).
+func (b *board) okToast(title, desc string) {
+	b.emitToast("success", title, desc)
+}
+
+func (b *board) emitToast(kind, title, desc string) {
+	if b.toastLog != nil {
+		b.toastLog = append(b.toastLog, toastEntry{Kind: kind, Title: title, Desc: desc})
+	}
 	b.post(func() {
 		if b.ctx() == nil {
 			return
 		}
-		b.ctx().AddToast(ui.Toast{Title: title, Description: desc, Type: "info", Timeout: 6 * time.Second})
+		b.ctx().AddToast(ui.Toast{Title: title, Description: desc, Type: kind, Timeout: 6 * time.Second})
 	})
 }
 
@@ -1627,7 +1641,7 @@ func (b *board) createRelatedTask(anchorID, kind, title string) {
 		default:
 			b.post(func() {
 				b.upsert(created)
-				b.toast("已创建", fmt.Sprintf("#%d %s", created.Number, clip(created.Title, 30)))
+				b.okToast("已创建", fmt.Sprintf("#%d %s", created.Number, clip(created.Title, 30)))
 			})
 			return
 		}
@@ -1639,7 +1653,7 @@ func (b *board) createRelatedTask(anchorID, kind, title string) {
 			}
 			b.replace(result.Task)
 			b.replace(result.RelatedTask)
-			b.toast("已创建并关联", fmt.Sprintf("#%d %s", created.Number, clip(created.Title, 30)))
+			b.okToast("已创建并关联", fmt.Sprintf("#%d %s", created.Number, clip(created.Title, 30)))
 		})
 	}()
 }
@@ -1770,7 +1784,7 @@ func (b *board) dispatchTask(id, runtime string) {
 				b.toast("派发失败", err.Error())
 				return
 			}
-			b.toast("已派发 "+label+" 执行", clip(t.Title, 24))
+			b.okToast("已派发 "+label+" 执行", clip(t.Title, 24))
 		})
 	}()
 }
@@ -2084,7 +2098,7 @@ func (b *board) saveProjectEdit() {
 				f.open = false
 			}
 			b.applyProjectGitCommitOnDone(p.ID, f.gitCommitOnDone)
-			b.toast("已保存", "项目「"+clip(p.Name, 24)+"」已更新")
+			b.okToast("已保存", "项目「"+clip(p.Name, 24)+"」已更新")
 		})
 	}()
 }

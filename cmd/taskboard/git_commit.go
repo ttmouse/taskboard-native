@@ -22,7 +22,7 @@ func (b *board) maybeGitCommitOnDone(task model.Task) {
 		}
 	}
 	if workspace == "" {
-		b.toast("Git 提交跳过", "项目未设置工作目录")
+		b.infoToast("Git 提交跳过", "项目未设置工作目录")
 		return
 	}
 	msg := fmt.Sprintf("#%d %s", task.Number, strings.TrimSpace(task.Title))
@@ -38,16 +38,19 @@ func (b *board) maybeGitCommitOnDone(task model.Task) {
 				return
 			}
 			if sha == "" {
-				b.toast("已完成", "工作区无已跟踪改动，未创建提交")
+				b.infoToast("已完成", "工作区无已跟踪改动，未创建提交")
 				return
 			}
 			short := sha
 			if len(short) > 7 {
 				short = short[:7]
 			}
-			b.toast("已提交 Git", short)
+			b.okToast("已提交 Git", short)
 			go func() {
-				_, _ = b.api.AddComment(taskID, "验收完成自动提交 "+sha)
+				_, err := b.api.AddComment(taskID, "验收完成自动提交 "+sha)
+				if err != nil {
+					b.toast("已提交 Git，评论写入失败", err.Error())
+				}
 			}()
 		})
 	}()

@@ -386,7 +386,7 @@ func (b *board) startProjectRun(runtime string) {
 			} else {
 				delete(b.projectRunRuntime, projectID)
 			}
-			b.toast("自动承接已开启", label+" 会持续处理，自动把结束的卡移入等你，一次一张")
+			b.okToast("自动承接已开启", label+" 会持续处理，自动把结束的卡移入等你，一次一张")
 		})
 	}()
 }
@@ -403,7 +403,7 @@ func (b *board) stopProjectRun() {
 			if b.projectRunRuntime != nil {
 				delete(b.projectRunRuntime, projectID)
 			}
-			b.toast("自动承接已关闭", "当前这张卡会继续")
+			b.okToast("自动承接已关闭", "当前这张卡会继续")
 		})
 	}()
 }
@@ -1559,7 +1559,7 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		if m.Item("复制 ID").Chosen() {
 			num := store.FormatTaskNumber(task.Number)
 			mygo.Clipboard.WriteText(num)
-			b.toast("已复制 ID", num)
+			b.okToast("已复制 ID", num)
 		}
 		m.Separator()
 		if m.Item("归档").Chosen() {
@@ -1800,7 +1800,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					BorderWidth(0).Radius(t.Space(2)).
 					Background(t.SurfaceHover.Alpha(0.5)).TextColor(t.TextMuted).Clicked() {
 					mygo.Clipboard.WriteText(num)
-					b.toast("已复制 ID", num)
+					b.okToast("已复制 ID", num)
 				}
 			}
 			ui.Spacer(c)

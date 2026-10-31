@@ -24,6 +24,7 @@ type fakeBoard struct {
 	fail                error         // returned by every read when set
 	createFail          error         // returned by CreateTask when set
 	projectFail         error         // returned by project create/update when set
+	commentFail         error         // returned by AddComment* when set
 	subs                []func(model.Event)
 	now                 time.Time
 	dispatches          [][2]string // recorded Dispatch(taskID, runtime) calls
@@ -363,6 +364,9 @@ func (f *fakeBoard) AddCommentTo(taskID, text, mention string) (model.Comment, e
 
 func (f *fakeBoard) AddCommentWithParent(taskID, text, mention, parentCommentID string) (model.Comment, error) {
 	f.wait()
+	if f.commentFail != nil {
+		return model.Comment{}, f.commentFail
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i := range f.tasks {
