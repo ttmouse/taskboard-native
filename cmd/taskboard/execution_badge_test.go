@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"taskboard-native/internal/executor"
@@ -111,4 +112,41 @@ func TestReturnedExecutionBadgeOnlyInReviewColumn(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHerdrExecutionDetailMentionsWriteLock(t *testing.T) {
+	got := herdrExecutionDetail("disconnected", "连接异常")
+	for _, want := range []string{"连接异常", "写锁", "不可重派", "2 分钟"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("disconnected detail %q missing %q", got, want)
+		}
+	}
+	released := herdrExecutionDetail("released", "已释放")
+	for _, want := range []string{"已释放写锁", "重新派发"} {
+		if !strings.Contains(released, want) {
+			t.Fatalf("released detail %q missing %q", released, want)
+		}
+	}
+	if running := herdrExecutionDetail("running", "运行中"); running != "Herdr 执行状态：运行中" {
+		t.Fatalf("running detail = %q", running)
+	}
+}
+
+// Badge a11y / Tooltip surface the write-lock copy, not only the short capsule.
+func TestDisconnectedBadgeTooltipMentionsWriteLock(t *testing.T) {
+	isolatePrefs(t)
+	fake := seedBoard()
+	for i := range fake.tasks {
+		if fake.tasks[i].ID != "t-1" {
+			continue
+		}
+		fake.tasks[i].Execution = &model.Execution{
+			TaskID: fake.tasks[i].ID, SessionID: "herdr:gone", Runtime: executor.RuntimePi, Status: "disconnected",
+		}
+	}
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	waitFor(t, tt, "连接异常写锁说明", func() bool {
+		return tt.HasText("写锁仍占用") || tt.HasText("暂不可重派")
+	})
 }

@@ -665,8 +665,9 @@ func finishedCardReason(execution model.Execution) string {
 		return "自动承接：会话已返回，卡片自动移入「等你」；是否完成由人工确认。"
 	case "released":
 		return "自动承接：原会话已不可达并释放写锁，卡片自动移入「等你」等待人工处理。"
-	case "disconnected":
-		return "自动承接：原会话已中断且无法恢复，卡片自动移入「等你」等待人工处理。"
+	// disconnected is still Active (not Ended), so finishProjectCard never
+	// reaches this helper with that status; fall through to the default so
+	// maintainers are not told the card was auto-moved while the lock held.
 	default:
 		return "自动承接：执行失败（" + execution.Status + "），卡片自动移入「等你」等待人工处理。"
 	}

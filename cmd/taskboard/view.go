@@ -1393,6 +1393,7 @@ func herdrExecutionLabel(status string, t *ui.Theme) (string, ui.Color) {
 	case "failed":
 		return "执行失败", t.Danger
 	case "disconnected", "unknown":
+		// Short capsule stays 「连接异常」; Tooltip / a11y use herdrExecutionDetail.
 		return "连接异常", t.Warning
 	case "detached":
 		return "已分离", t.TextMuted
@@ -1400,6 +1401,23 @@ func herdrExecutionLabel(status string, t *ui.Theme) (string, ui.Color) {
 		return "已释放", t.TextMuted
 	default:
 		return "", t.TextMuted
+	}
+}
+
+// herdrExecutionDetail is the long-form Tooltip / accessibility text for a
+// Herdr execution badge. Capsules keep the short label; disconnected must
+// spell out that the write lock is still held so people do not re-dispatch.
+func herdrExecutionDetail(status, label string) string {
+	switch status {
+	case "disconnected", "unknown":
+		return "Herdr 执行状态：连接异常（写锁仍占用，暂不可重派；约 2 分钟不可达后释放）"
+	case "released":
+		return "Herdr 执行状态：已释放写锁，可重新派发或评论跟进"
+	default:
+		if label == "" {
+			return ""
+		}
+		return "Herdr 执行状态：" + label
 	}
 }
 
@@ -1561,9 +1579,10 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		label, color := herdrExecutionLabel(status, t)
 		icon := herdrExecutionIcon(status)
 		if showReturned && label != "" && icon != nil {
+			detail := herdrExecutionDetail(status, label)
 			ui.Icon(c, icon).Size(14, 14).TextColor(color).
-				Label("Herdr 执行状态：" + label).
-				Tooltip("Herdr 执行状态：" + label)
+				Label(detail).
+				Tooltip(detail)
 		}
 	}
 	drawCardFooterControls := func() {
