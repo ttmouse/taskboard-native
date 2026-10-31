@@ -214,7 +214,7 @@ func TestTaskListFiltersPaginationAndSummary(t *testing.T) {
 	if status != http.StatusOK || len(summaries) != 2 {
 		t.Fatalf("summary list = %d %s", status, raw)
 	}
-	wantKeys := map[string]bool{"id": true, "projectId": true, "columnId": true, "title": true, "version": true, "updatedAt": true, "updatedBy": true, "assignee": true}
+	wantKeys := map[string]bool{"id": true, "number": true, "projectId": true, "columnId": true, "title": true, "version": true, "updatedAt": true, "updatedBy": true, "assignee": true}
 	for _, summary := range summaries {
 		if len(summary) != len(wantKeys) {
 			t.Fatalf("summary contains unexpected fields: %s", raw)

@@ -12,6 +12,7 @@ import (
 	"taskboard-native/internal/client"
 	"taskboard-native/internal/executor"
 	"taskboard-native/internal/model"
+	"taskboard-native/internal/store"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/plugins/glass"
@@ -128,6 +129,11 @@ func (b *board) view(c *ui.Context) {
 	// sheet's own segmented control is the way to switch from inside one.
 	c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyL, b.cycleAppearance)
 	content := func() {
+		// The Playground can take over the pane with the static reply sample;
+		// production always returns false and renders as usual.
+		if b.replyDemoPage(c, t) {
+			return
+		}
 		if b.detail != nil {
 			// Task details replace the board inside its pane. The project rail
 			// remains available on the left, while the detail uses the full
@@ -1184,10 +1190,10 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 			scroll.Margin(0, -gutter, 0, 0)
 		}
 		scroll.Children(func() {
-			// The list's bottom padding is air below the last card, not a
-			// frame: keep it as small as the top so a short column does not
-			// read as extra blank space under the cards.
-			list := ui.Column(c).FillWidth().Gap(t.Space(2)).Padding(0, gutter, 0, 0).
+			// Bottom inset is intentional scroll padding: when the user
+			// reaches the last card, the column still has air under it so
+			// the card is not flush against the window edge.
+			list := ui.Column(c).FillWidth().Gap(t.Space(2)).Padding(0, gutter, t.Space(6), 0).
 				FocusGroup(ui.Vertical).Label(col.Name + "列任务")
 			list.Children(func() {
 				b.columnCards(c, t, col, tasks, panel, list, string(dragID), over)
@@ -1254,6 +1260,9 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 	ui.Row(c).FillWidth().
 		Padding(t.Space(2), padR+t.Space(1), t.Space(2), padL+t.Space(1)).
 		Children(func() {
+			if p, ok := b.projectByID(b.cur); ok {
+				b.workspaceMentionChips(c, t, &b.quickFileMentions, p.WorkspacePath, "quick-add-file-chips")
+			}
 			input := ui.TextInput(c.Key("quick-add"), &b.quickTitle).
 				FillWidth().
 				Placeholder("添加任务，回车创建").
@@ -1285,7 +1294,8 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 								if index < 0 || index >= len(files) {
 									index = 0
 								}
-								b.quickTitle = insertWorkspaceMention(k.Text(), files[index].Path)
+								b.quickTitle = k.Text()
+								pickWorkspaceMention(&b.quickTitle, &b.quickFileMentions, files[index].Path)
 								k.SetText(b.quickTitle)
 								b.quickFileMentionOpen = false
 							}
@@ -1300,14 +1310,16 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 						return false
 					}
 					title := strings.TrimSpace(k.Text())
-					if title == "" {
+					if title == "" && len(b.quickFileMentions) == 0 {
 						return true
 					}
+					title = withWorkspaceMentions(title, b.quickFileMentions)
 					b.quickCreating = true
 					if !b.createTaskAndDispatch(b.cur, b.defaultTaskColumnID(), title, "", "", func(created bool) {
 						b.quickCreating = false
-						if created && b.quickTitle == title {
+						if created {
 							b.quickTitle = ""
+							b.quickFileMentions = nil
 						}
 					}) {
 						b.quickCreating = false
@@ -1388,6 +1400,31 @@ func herdrExecutionLabel(status string, t *ui.Theme) (string, ui.Color) {
 	default:
 		return "", t.TextMuted
 	}
+}
+
+func herdrConversationCreated(execution *model.Execution) bool {
+	if execution == nil {
+		return false
+	}
+	sessionID := strings.TrimSpace(execution.SessionID)
+	return strings.HasPrefix(sessionID, "herdr:") && sessionID != "herdr:" &&
+		execution.Status != "submitting" && execution.Detail != executor.HerdrInitialTurnPendingDetail
+}
+
+// commentFromExecutionAgent is true when the comment author is a known
+// dispatch channel (Codex / Claude / Pi / DSH). Those replies get a
+// ConversationLink-style Herdr bubble at the bottom, matching DSH.
+func commentFromExecutionAgent(author string) bool {
+	author = strings.TrimSpace(author)
+	if author == "" {
+		return false
+	}
+	for _, channel := range executor.Runtimes() {
+		if author == channel.Label || strings.EqualFold(author, channel.ID) {
+			return true
+		}
+	}
+	return false
 }
 
 func herdrExecutionIcon(status string) *ui.SVG {
@@ -1486,7 +1523,8 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 				}
 			}
 		})
-		if task.Execution != nil && task.Execution.Channel() == executor.RuntimeCodex && strings.TrimSpace(task.Execution.SessionID) != "" {
+		if task.Execution != nil && task.Execution.Channel() == executor.RuntimeCodex && strings.TrimSpace(task.Execution.SessionID) != "" &&
+			(!strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") || herdrConversationCreated(task.Execution)) {
 			active := task.Execution.Active() && !task.Execution.Stalled()
 			openLabel := "在 Ghostty 打开 Codex 对话"
 			if strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") {
@@ -1500,8 +1538,9 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 			}
 		}
 		if m.Item("复制 ID").Chosen() {
-			mygo.Clipboard.WriteText(task.ID)
-			b.toast("已复制 ID", task.ID)
+			num := store.FormatTaskNumber(task.Number)
+			mygo.Clipboard.WriteText(num)
+			b.toast("已复制 ID", num)
 		}
 		m.Separator()
 		if m.Item("归档").Chosen() {
@@ -1512,22 +1551,23 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 	approve := false
 	openExecution := false
 	inReview := b.columnHasRole(task.ColumnID, model.ColumnRoleReview)
-	drawCardFooterControls := func() {
-		if task.Execution != nil && strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") {
-			status := task.Execution.Status
-			showReturned := (status != "returned" && status != "succeeded") || inReview
-			label, color := herdrExecutionLabel(status, t)
-			icon := herdrExecutionIcon(status)
-			if showReturned && label != "" && icon != nil {
-				ui.Icon(c, icon).Size(14, 14).TextColor(color).
-					Label("Herdr 执行状态：" + label).
-					Tooltip("Herdr 执行状态：" + label)
-			}
+	drawExecutionStatus := func() {
+		if task.Execution == nil || !strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") {
+			return
 		}
+		status := task.Execution.Status
+		showReturned := (status != "returned" && status != "succeeded") || inReview
+		label, color := herdrExecutionLabel(status, t)
+		icon := herdrExecutionIcon(status)
+		if showReturned && label != "" && icon != nil {
+			ui.Icon(c, icon).Size(14, 14).TextColor(color).
+				Label("Herdr 执行状态：" + label).
+				Tooltip("Herdr 执行状态：" + label)
+		}
+	}
+	drawCardFooterControls := func() {
 		ui.Spacer(c)
-		if task.Execution != nil && task.Execution.Channel() == executor.RuntimeCodex &&
-			strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") &&
-			strings.TrimSpace(task.Execution.SessionID) != "herdr:" {
+		if herdrConversationCreated(task.Execution) {
 			button := ui.ButtonBase(c.Key(task.ID+"-herdr-open")).
 				Size(t.Space(6), t.Space(6)).Padding(0).Gap(0).Radius(t.Radius + 2).
 				BorderWidth(0).Center().
@@ -1629,7 +1669,11 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 						}
 
 					}
-					ui.Row(c).Height(20).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+					// Footer actions use 24px square buttons. Matching the row to
+					// that control height keeps full cards as tall as title-only
+					// cards when a review or execution footer is the only extra row.
+					ui.Row(c).Height(t.Space(6)).Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
+						drawExecutionStatus()
 						if task.Assignee != "" {
 							ui.Avatar(c, task.Assignee, nil).Size(18, 18)
 						}
@@ -1651,7 +1695,10 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 		if titleOnly {
 			hasFooter := inReview || (task.Execution != nil && strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:"))
 			if hasFooter {
-				ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(drawCardFooterControls)
+				ui.Row(c).FillWidth().Height(t.Space(6)).Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+					drawExecutionStatus()
+					drawCardFooterControls()
+				})
 			}
 		}
 	})
@@ -1722,6 +1769,17 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 	pane.Children(func() {
 		ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "任务详情").FontSize(fmd(t)).FontWeight(600)
+			if num := store.FormatTaskNumber(d.snap.Number); num != "" {
+				ui.Text(c, "#"+num).FontSize(fsm(t)).TextColor(t.TextMuted).
+					Label("任务号 "+num).Tooltip("任务号 "+num)
+				if ui.Button(c.Key("detail-copy-id"), "复制").Label("复制 ID "+num).
+					FontSize(fxs(t)).Padding(t.Space(0.5), t.Space(1.5)).
+					BorderWidth(0).Radius(t.Space(2)).
+					Background(t.SurfaceHover.Alpha(0.5)).TextColor(t.TextMuted).Clicked() {
+					mygo.Clipboard.WriteText(num)
+					b.toast("已复制 ID", num)
+				}
+			}
 			ui.Spacer(c)
 			if b.saving && b.savingID == d.id {
 				loading.LinearDots(c, loading.Options{Size: 14, Color: t.TextMuted}).Label("正在保存任务")
@@ -1878,15 +1936,23 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 				d.mentionSearch = search
 			}
 		}
-		// The outer surface supplies equal insets; the input adds none.
-		composer := ui.Box(c).FillWidth().Padding(0, t.Space(2.5)).Gap(t.Space(2)).
+		// Compact one-line composer uses horizontal insets only. When pasted
+		// image thumbs appear above the field, use equal insets so the strip
+		// is not flush against the rounded box edge.
+		padY, padX := float32(0), t.Space(2.5)
+		if len(d.commentImages) > 0 || d.commentImage.uploading {
+			padY = t.Space(2.5)
+		}
+		composer := ui.Box(c).FillWidth().Padding(padY, padX).Gap(t.Space(1.5)).
 			Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4)).
 			Label("评论输入容器")
 		b.mentionMenu(c, t, d, composer)
 		composer.
 			Children(func() {
+				b.commentThumbStrip(c, t, d)
 				if p, ok := b.projectByID(d.snap.ProjectID); ok {
-					b.workspaceMentionChips(c, t, &d.comment, p.WorkspacePath, "comment-file-chips")
+					d.comment, d.commentFiles = adoptWorkspaceMentionTokens(d.comment, d.commentFiles)
+					b.workspaceMentionChips(c, t, &d.commentFiles, p.WorkspacePath, "comment-file-chips")
 				}
 				// Give a one-line draft a taller row so AlignItems centers it
 				// vertically; multiline drafts grow the row with their own height.
@@ -1933,7 +1999,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						input.Focus()
 						d.commentFocus--
 					}
-					b.imageInput(input, d, &d.comment, &d.commentImage, mygo.Clipboard.ReadImage)
+					b.commentImageInput(input, d, mygo.Clipboard.ReadImage)
 					input.OnTextKey(func(key ui.TextKey) bool {
 						if d.mentionOpen && key.Mods == 0 {
 							query, hasFileQuery := commentMentionSearch(d)
@@ -1985,11 +2051,6 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						b.sendComment()
 					}
 				})
-				if d.commentImage.uploading || localImageMarkdown.MatchString(d.comment) {
-					ui.Scroll(c).FillWidth().MaxHeight(t.Space(40)).Children(func() {
-						b.imagePreview(c.Key("comment-preview"), &d.comment, &d.commentImage, "评论")
-					})
-				}
 			})
 	})
 	if pane.OverlayShortcut(0, ui.KeyEscape) {
@@ -2012,25 +2073,16 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 	d.open = open
 }
 
-// searchView uses one surface for the input and matching tasks.
-// Esc / backdrop / 关闭 clears the query and closes.
+// commentThreads renders each thread with its replies below their parent:
+// threads newest first, replies chronological, so a conversation reads
+// downward. A reply sits inside its parent's rail instead of being pushed
+// right by indentation alone, and quotes the block it answers.
 func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
-	children := make(map[string][]model.Comment)
-	byID := make(map[string]model.Comment, len(d.comments))
-	var roots []model.Comment
-	for _, cm := range d.comments {
-		byID[cm.ID] = cm
-		if cm.ParentCommentID == "" {
-			roots = append(roots, cm)
-		} else {
-			children[cm.ParentCommentID] = append(children[cm.ParentCommentID], cm)
-		}
-	}
-	var render func(model.Comment, int)
-	render = func(cm model.Comment, depth int) {
-		indent := min(depth, 5) * 3
+	roots, children, byID := commentTree(d.comments)
+	var draw func(model.Comment, int)
+	draw = func(cm model.Comment, depth int) {
 		ui.Box(c.Key("c-"+cm.ID)).FillWidth().
-			Padding(t.Space(2.5), t.Space(3)+t.Space(float32(indent))).Gap(t.Space(1.5)).
+			Padding(t.Space(2.5), t.Space(3)).Gap(t.Space(1.5)).
 			Radius(t.Radius + 2).BorderWidth(0).
 			Background(t.SurfaceHover.Alpha(0.55)).Children(func() {
 			ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
@@ -2076,23 +2128,7 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 			})
 			if cm.ParentCommentID != "" {
 				parent, ok := byID[cm.ParentCommentID]
-				ui.Column(c.Key("reply-context-"+cm.ID)).FillWidth().Gap(t.Space(0.5)).
-					Padding(t.Space(1.5), t.Space(2)).Radius(t.Radius).
-					Background(t.Surface).Children(func() {
-					if !ok {
-						ui.Text(c, "回复的评论已不可用").FontSize(fxs(t)).TextColor(t.TextMuted)
-						return
-					}
-					ui.Text(c, "回复给 "+parent.Author).FontSize(fxs(t)).
-						FontWeight(600).TextColor(t.TextMuted).
-						Label("回复给 " + parent.Author)
-					preview := strings.Join(strings.Fields(parent.Text), " ")
-					if preview == "" {
-						preview = "（空评论）"
-					}
-					ui.Text(c, preview).FontSize(fxs(t)).TextColor(t.TextMuted).
-						MaxLines(2).Ellipsis("…").Tooltip(parent.Text)
-				})
+				commentQuote(c, t, "reply-context-"+cm.ID, parent.Author, parent.Text, ok)
 			}
 			if d.commentEditID == cm.ID {
 				ui.TextArea(c, &d.commentEditText).Label("编辑评论内容").FillWidth().MinHeight(t.Space(12))
@@ -2107,18 +2143,59 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 			} else {
 				b.detailMarkdown(c, commentMarkdown(cm.Text))
 			}
+			// Per-reply ConversationLink (DSH pattern): Herdr bubble under
+			// AI replies, not in the detail title bar.
+			if task := b.task(d.id); task != nil && commentFromExecutionAgent(cm.Author) && herdrConversationCreated(task.Execution) {
+				ui.Row(c).FillWidth().Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
+					button := ui.ButtonBase(c.Key("comment-herdr-open-"+cm.ID)).
+						Size(t.Space(6), t.Space(6)).Padding(0).Gap(0).Radius(t.Radius + 2).
+						BorderWidth(0).Center().
+						Label("在 Herdr 中打开此回复的对话").Tooltip("在 Herdr 中打开此回复的对话")
+					face := ui.Transparent
+					if button.Pressed() {
+						face = t.SurfacePressed
+					} else if button.Hovered() {
+						face = t.Text.Alpha(0.10)
+					}
+					button.Background(face).Children(func() {
+						ui.Icon(c, herdrConversation).Size(16, 16)
+					})
+					if button.Clicked() {
+						b.openTaskExecution(task)
+					}
+				})
+			}
 			if cm.Author == b.agent && cm.Mention == "" && ui.Button(c.Key("continue-"+cm.ID), "让 AI 跟进").Label("跟进评论："+cm.ID).
 				Tooltip("把这条评论交回任务的原始 AI 会话").Disabled(b.commenting).Clicked() {
 				b.continueComment(d.id, cm.ID)
 			}
 		})
+		// Replies hang off their parent inside a rail, in store order, so the
+		// thread reads top-down instead of jumping between reversed runs.
+		// Past two levels the rail narrows the card to unreadable width, so
+		// deeper replies keep the quote but drop the extra nesting.
 		replies := children[cm.ID]
-		for i := len(replies) - 1; i >= 0; i-- {
-			render(replies[i], depth+1)
+		if len(replies) == 0 {
+			return
 		}
+		if depth >= 2 {
+			for _, reply := range replies {
+				draw(reply, depth+1)
+			}
+			return
+		}
+		ui.Row(c.Key("thread-" + cm.ID)).FillWidth().Gap(t.Space(2)).Children(func() {
+			ui.Column(c).Width(2).FillHeight().Radius(1).MarginStart(t.Space(2.5)).
+				Background(t.Border)
+			ui.Column(c).Grow(1).Gap(t.Space(2)).Children(func() {
+				for _, reply := range replies {
+					draw(reply, depth+1)
+				}
+			})
+		})
 	}
 	for i := len(roots) - 1; i >= 0; i-- {
-		render(roots[i], 0)
+		draw(roots[i], 0)
 	}
 }
 
@@ -2683,11 +2760,13 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 	}
 	startCreate := func(title, runtime string, stay bool) {
 		f.creating = true
+		title = withWorkspaceMentions(title, f.fileMentions)
 		desc := buildComposeDescription(f.composeImages)
 		if !b.createTaskAndDispatch(f.projectID, f.columnID, title, desc, runtime, func(created bool) {
 			f.creating = false
 			if created && b.form == f {
 				f.name = ""
+				f.fileMentions = nil
 				f.composeImages = nil
 				f.composeImage.pending = nil
 				if !stay {
@@ -2744,7 +2823,8 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 			b.composeThumbStrip(c, t, f)
 		}
 		if p, ok := b.projectByID(f.projectID); ok {
-			b.workspaceMentionChips(c, t, &f.name, p.WorkspacePath, "compose-file-chips")
+			f.name, f.fileMentions = adoptWorkspaceMentionTokens(f.name, f.fileMentions)
+			b.workspaceMentionChips(c, t, &f.fileMentions, p.WorkspacePath, "compose-file-chips")
 		}
 		// The input pill owns its entrance motion so the upward travel is visible,
 		// independent of DialogBase's panel positioning.
@@ -2789,7 +2869,8 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 									if index < 0 || index >= len(files) {
 										index = 0
 									}
-									f.name = insertWorkspaceMention(k.Text(), files[index].Path)
+									f.name = k.Text()
+									pickWorkspaceMention(&f.name, &f.fileMentions, files[index].Path)
 									k.SetText(f.name)
 									f.fileMentionOpen = false
 								}
@@ -2803,7 +2884,7 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 							return true
 						}
 						title := strings.TrimSpace(k.Text())
-						if title == "" {
+						if title == "" && len(f.fileMentions) == 0 {
 							b.toast("无法创建", "任务标题不能为空。")
 							return true
 						}
@@ -2836,7 +2917,7 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 					})
 				if send.Clicked() {
 					title := strings.TrimSpace(f.name)
-					if title == "" {
+					if title == "" && len(f.fileMentions) == 0 {
 						b.toast("无法创建", "任务标题不能为空。")
 					} else {
 						startCreate(title, "", false)

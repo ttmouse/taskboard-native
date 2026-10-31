@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"strconv"
+	"strings"
 
 	"taskboard-native/internal/model"
 )
@@ -9,7 +11,7 @@ import (
 // Board is one project's full column-and-card snapshot.
 type Board = model.ProjectBoard
 
-const taskColumns = `tasks.id, tasks.project_id, tasks.column_id, tasks.title, tasks.body, tasks.assignee, tasks.position, tasks.version, tasks.archived, tasks.last_agent, tasks.created_at, tasks.updated_at,
+const taskColumns = `tasks.id, tasks.number, tasks.project_id, tasks.column_id, tasks.title, tasks.body, tasks.assignee, tasks.position, tasks.version, tasks.archived, tasks.last_agent, tasks.created_at, tasks.updated_at,
   COALESCE((SELECT body FROM comments WHERE task_id = tasks.id
     AND (body LIKE 'codex 执行完成（%' OR body LIKE 'dsh 执行完成（%' OR body LIKE 'pi 执行完成（%')
     AND instr(body, '）。输出：' || char(10) || char(10)) > 0
@@ -19,24 +21,25 @@ const taskColumns = `tasks.id, tasks.project_id, tasks.column_id, tasks.title, t
 func scanTask(vals []any) model.Task {
 	t := model.Task{
 		ID:          str(vals[0]),
-		ProjectID:   str(vals[1]),
-		ColumnID:    str(vals[2]),
-		Title:       str(vals[3]),
-		Description: str(vals[4]),
-		Assignee:    str(vals[5]),
-		Position:    num(vals[6]),
-		Version:     int(integer(vals[7])),
-		Archived:    integer(vals[8]) != 0,
-		UpdatedBy:   str(vals[9]),
-		CreatedAt:   parseTime(str(vals[10])),
-		UpdatedAt:   parseTime(str(vals[11])),
+		Number:      int(integer(vals[1])),
+		ProjectID:   str(vals[2]),
+		ColumnID:    str(vals[3]),
+		Title:       str(vals[4]),
+		Description: str(vals[5]),
+		Assignee:    str(vals[6]),
+		Position:    num(vals[7]),
+		Version:     int(integer(vals[8])),
+		Archived:    integer(vals[9]) != 0,
+		UpdatedBy:   str(vals[10]),
+		CreatedAt:   parseTime(str(vals[11])),
+		UpdatedAt:   parseTime(str(vals[12])),
 	}
-	t.CompletedBy = model.CompletingAgent(model.Comment{Text: str(vals[12])})
-	if str(vals[13]) != "" {
+	t.CompletedBy = model.CompletingAgent(model.Comment{Text: str(vals[13])})
+	if str(vals[14]) != "" {
 		t.Execution = &model.Execution{
-			TaskID: str(vals[13]), SessionID: str(vals[14]), Status: str(vals[15]),
-			Detail: str(vals[16]), Runtime: str(vals[17]), FollowupID: str(vals[18]),
-			PreviousTurnID: str(vals[19]),
+			TaskID: str(vals[14]), SessionID: str(vals[15]), Status: str(vals[16]),
+			Detail: str(vals[17]), Runtime: str(vals[18]), FollowupID: str(vals[19]),
+			PreviousTurnID: str(vals[20]),
 		}
 	}
 	return t
@@ -235,7 +238,7 @@ func (s *Store) Task(id string) (model.Task, error) {
 	if err != nil {
 		return model.Task{}, err
 	}
-	comments, err := s.commentsLocked(ctx, id)
+	comments, err := s.commentsLocked(ctx, t.ID)
 	if err != nil {
 		return model.Task{}, err
 	}
@@ -246,7 +249,11 @@ func (s *Store) Task(id string) (model.Task, error) {
 }
 
 func (s *Store) taskLocked(ctx context.Context, id string) (model.Task, error) {
-	rows, err := s.db.Query(ctx, `SELECT `+taskColumns+` FROM tasks LEFT JOIN executions e ON e.task_id = tasks.id WHERE tasks.id = ?`, id)
+	resolved, err := s.resolveTaskIDLocked(ctx, id)
+	if err != nil {
+		return model.Task{}, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT `+taskColumns+` FROM tasks LEFT JOIN executions e ON e.task_id = tasks.id WHERE tasks.id = ?`, resolved)
 	if err != nil {
 		return model.Task{}, err
 	}
@@ -254,6 +261,86 @@ func (s *Store) taskLocked(ctx context.Context, id string) (model.Task, error) {
 		return model.Task{}, ErrNotFound
 	}
 	return scanTask(rows.Values[0]), nil
+}
+
+// resolveTaskIDLocked accepts a human-facing decimal task number, an exact
+// task id (any length), or a unique hex prefix of at least HexPrefixMinLen
+// characters.
+func (s *Store) resolveTaskIDLocked(ctx context.Context, id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", ErrNotFound
+	}
+	// Exact primary-key hit first so fixture/short ids and full UUIDs both work.
+	exact, err := s.db.Query(ctx, `SELECT id FROM tasks WHERE id = ?`, id)
+	if err != nil {
+		return "", err
+	}
+	if len(exact.Values) == 1 {
+		return str(exact.Values[0][0]), nil
+	}
+	if isAllDigits(id) {
+		n, err := strconv.Atoi(id)
+		if err != nil || n <= 0 {
+			return "", ErrNotFound
+		}
+		rows, err := s.db.Query(ctx, `SELECT id FROM tasks WHERE number = ?`, n)
+		if err != nil {
+			return "", err
+		}
+		if len(rows.Values) == 1 {
+			return str(rows.Values[0][0]), nil
+		}
+		if len(rows.Values) > 1 {
+			return "", invalid("task number %q matches %d tasks", id, len(rows.Values))
+		}
+		if len(id) < HexPrefixMinLen {
+			return "", ErrNotFound
+		}
+	}
+	if len(id) < HexPrefixMinLen {
+		return "", ErrNotFound
+	}
+	rows, err := s.db.Query(ctx, `SELECT id FROM tasks WHERE id LIKE ? ESCAPE '\' AND archived = 0`, likePrefix(id))
+	if err != nil {
+		return "", err
+	}
+	switch len(rows.Values) {
+	case 0:
+		// Also try including archived, so short copy still opens old cards.
+		rows, err = s.db.Query(ctx, `SELECT id FROM tasks WHERE id LIKE ? ESCAPE '\'`, likePrefix(id))
+		if err != nil {
+			return "", err
+		}
+		if len(rows.Values) == 0 {
+			return "", ErrNotFound
+		}
+		if len(rows.Values) > 1 {
+			return "", invalid("task id %q matches %d tasks; paste more characters", id, len(rows.Values))
+		}
+		return str(rows.Values[0][0]), nil
+	case 1:
+		return str(rows.Values[0][0]), nil
+	default:
+		return "", invalid("task id %q matches %d tasks; paste more characters", id, len(rows.Values))
+	}
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func likePrefix(id string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(id) + `%`
 }
 
 // Comments lists a task's comments oldest first.

@@ -96,8 +96,13 @@ func (s *Store) CreateTask(projectID, columnID, title, description, assignee, by
 		return model.Task{}, err
 	}
 	now := nowUTC()
+	number, err := s.nextTaskNumberLocked(ctx)
+	if err != nil {
+		return model.Task{}, err
+	}
 	t := model.Task{
 		ID:          newID(),
+		Number:      number,
 		ProjectID:   projectID,
 		ColumnID:    columnID,
 		Title:       title,
@@ -110,9 +115,9 @@ func (s *Store) CreateTask(projectID, columnID, title, description, assignee, by
 		UpdatedAt:   now,
 	}
 	stmts := []sqlite.Statement{{
-		SQL: `INSERT INTO tasks (id, project_id, column_id, title, body, assignee, position, version, archived, last_agent, created_at, updated_at)
-		      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)`,
-		Args: []any{t.ID, t.ProjectID, t.ColumnID, t.Title, t.Description, t.Assignee, t.Position, by, timestamp(now), timestamp(now)},
+		SQL: `INSERT INTO tasks (id, number, project_id, column_id, title, body, assignee, position, version, archived, last_agent, created_at, updated_at)
+		      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)`,
+		Args: []any{t.ID, t.Number, t.ProjectID, t.ColumnID, t.Title, t.Description, t.Assignee, t.Position, by, timestamp(now), timestamp(now)},
 	}}
 	stmts = append(stmts, renumber(order, "")...)
 	if _, err := s.db.Transaction(ctx, stmts); err != nil {
@@ -289,6 +294,7 @@ func (s *Store) AddCommentWithParent(taskID, text, by, mention, parentCommentID 
 	if err != nil {
 		return model.Comment{}, err
 	}
+	taskID = t.ID
 	if parentCommentID != "" {
 		comments, err := s.commentsLocked(ctx, taskID)
 		if err != nil {
@@ -329,6 +335,7 @@ func (s *Store) UpdateComment(taskID, commentID, text, by string) (model.Comment
 	if err != nil {
 		return model.Comment{}, err
 	}
+	taskID = task.ID
 	comments, err := s.commentsLocked(ctx, taskID)
 	if err != nil {
 		return model.Comment{}, err
@@ -360,6 +367,7 @@ func (s *Store) DeleteComment(taskID, commentID, by string) error {
 	if err != nil {
 		return err
 	}
+	taskID = task.ID
 	comments, err := s.commentsLocked(ctx, taskID)
 	if err != nil {
 		return err

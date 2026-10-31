@@ -113,6 +113,7 @@ func (p Project) HasColumn(id string) bool {
 
 type Task struct {
 	ID          string     `json:"id"`
+	Number      int        `json:"number"`
 	ProjectID   string     `json:"projectId"`
 	ColumnID    string     `json:"columnId"`
 	Title       string     `json:"title"`

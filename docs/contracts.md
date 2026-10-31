@@ -15,14 +15,14 @@
 ```
 projects(id TEXT PK, name TEXT, workspace_path TEXT DEFAULT '', position INT, created_at TEXT, updated_at TEXT)
 columns(id TEXT PK, project_id TEXT, name TEXT, position INT, role TEXT NOT NULL DEFAULT '')
-tasks(id TEXT PK, project_id TEXT, column_id TEXT, title TEXT, body TEXT,
+tasks(id TEXT PK, number INT UNIQUE, project_id TEXT, column_id TEXT, title TEXT, body TEXT,
       position INT, version INT, archived INT, last_agent TEXT,
       created_at TEXT, updated_at TEXT)
 comments(id TEXT PK, task_id TEXT, author TEXT, body TEXT, mention TEXT, parent_comment_id TEXT DEFAULT '', created_at TEXT)
 project_runs(project_id TEXT PK, runtime TEXT, status TEXT, task_ids TEXT, cursor INT, current_task_id TEXT, detail TEXT, updated_at TEXT)
 ```
 
-首次打开空库不创建项目或演示卡。用户创建项目时生成默认列 `待办/进行中/等你/完成`（各自带角色 intake/doing/review/done）。升级时，只有角色为 `review` 且仍使用旧默认名 `评审` 的列会自动改名为 `等你`；自定义列名保留。旧库首次角色回填仍以旧名 `评审` 识别 review 列。已有数据库中的项目和卡片会保留。时间 RFC3339 UTC；ID 为 16 字节随机 hex。
+首次打开空库不创建项目或演示卡。用户创建项目时生成默认列 `待办/进行中/等你/完成`（各自带角色 intake/doing/review/done）。升级时，只有角色为 `review` 且仍使用旧默认名 `评审` 的列会自动改名为 `等你`；自定义列名保留。旧库首次角色回填仍以旧名 `评审` 识别 review 列。已有数据库中的项目和卡片会保留。时间 RFC3339 UTC；ID 为 16 字节随机 hex（主键）。`number` 为全局递增人类可读任务号（自 1001 起，口头/复制/CLI 用），旧库打开时按 created_at/rowid 回填；查找同时接受 number、完整 id 与唯一 hex 前缀。
 
 列角色：`role` 取值 `intake`（入口）|`doing`（进行中）|`review`（评审）|`done`（完成）|`""`（无语义），同一项目内同一角色最多一个列。旧库首次打开时补 `role` 列并按列名精确回填（`待办`→intake、`进行中`→doing、`评审`→review、`完成`→done，其余留空）；回填只填空值、不覆盖已显式设置的角色，重复打开结果一致。客户端与服务解析某角色时先认 `role`，项目内没有该角色才退回旧的中文列名，因此旧库、改过列名的项目行为不变。
 
@@ -41,24 +41,29 @@ project_runs(project_id TEXT PK, runtime TEXT, status TEXT, task_ids TEXT, curso
 | PATCH | `/api/projects/{id}/columns/{columnID}` | `{"role":"intake|doing|review|done|""}` → 200 `Column`，事件 `project.changed`；`role` 必填且须在枚举内，否则 400；项目或列不存在、列不属于该项目 404；同项目内该角色已被另一个列占用 409 `role_conflict`（不静默抢占）；把列重设成自己已有的值或空字符串（清空）允许 |
 | GET | `/api/tasks?projectId=` | `[Task]`，projectId 必填；每张任务含可选 `execution` 会话记录；可选 columnId、assignee、limit、offset、summary |
 | GET | `/api/tasks/{id}` | `Task`（含正文与全部评论） |
-| POST | `/api/tasks` | `NewTask`（可选 `dispatchRuntime`）→ 201 `Task`，事件 `task.created`；带 `dispatchRuntime` 时同一请求建卡并派发该渠道（先校验渠道与项目 workspacePath，无效 400 不建卡；建卡后派发启动失败回写失败评论） |
+| POST | `/api/tasks` | `NewTask`（可选 `dispatchRuntime`）→ 201 `Task`，事件 `task.created`；带 `dispatchRuntime` 时同一请求建卡并派发该渠道（先校验渠道与项目 workspacePath，无效 400 不建卡；渠道确认接收后卡片移入 `doing`，启动失败回写失败评论并保留原列） |
 | PATCH | `/api/tasks/{id}` | `TaskPatch`（version 必填）→ 200 `Task`；移动列时事件 `task.moved`（带 from/to），否则 `task.updated` |
 | POST | `/api/tasks/{id}/archive` | `{"version":N}` → 200 `Task`，事件 `task.archived` |
 | GET | `/api/tasks/{id}/comments` | `[Comment]` |
 | POST | `/api/tasks/{id}/comments` | `NewComment`（`text`，可选 `mention`：`dsh`\|`codex`\|`pi`\|`claude`、`parentCommentId`）→ 201 `Comment`，事件 `comment.added`；`parentCommentId` 必须属于同一任务，允许回复任意层级评论；`mention` 未知渠道返回 400。在评审列添加带 `mention` 的评论时，评论保存后将卡片移回入口列（若项目定义了入口列），并发出 `task.moved`；普通评论不触发此回退。 |
+| POST | `/api/tasks/{id}/comments/{commentId}/continue` | 空请求体 → 202 `{"taskId","commentId"}`；成功保留唯一跟进执行记录后，立即把未归档卡片移入 `doing` 并发出 `task.moved`，再异步发送评论到原会话或按 `mention` 切换渠道；发送结果不确定时 execution 保持锁定，卡片留在 `doing` 供处理。 |
 | PATCH | `/api/tasks/{id}/comments/{commentId}` | `{"text":"..."}` → 200 `Comment`，事件 `comment.updated`；仅评论作者可编辑，否则 403；空文本返回 400。编辑只更新看板内容，不会重新投递评论。 |
 | DELETE | `/api/tasks/{id}/comments/{commentId}` | → 204，事件 `comment.deleted`（含被删除评论 ID）；仅评论作者可删除，否则 403。直接回复在被删除的评论会提升为该任务的一级评论并发出 `comment.updated`，其后代层级保留。 |
 | POST | `/api/tasks/{id}/execution/release` | 空请求体 → 200 `Task`，事件 `task.updated`；把该卡执行记录收敛为 `released`（写锁释放），`X-Agent` 记入 detail。无执行记录 404 `no_execution`；状态仍是 `submitting`/`running`/`waiting_approval` 时 409 `execution_active`（先在原渠道停掉该会话，避免并行写者） |
-| POST | `/api/tasks/{id}/dispatch` | `{"runtime":"dsh"|"codex"|"pi"}` → 202 `{"taskId","runtime"}`；异步派发所选渠道（cwd=项目 workspacePath）；DSH 接已启动的桌面 Host，Codex/Pi/Claude 由 Herdr App 在匹配项目工作目录的既有 space 中新增可见 tab/agent terminal，执行 Agent 按技能认领并回写评论/状态；程序只跟踪连接和会话 |
+| POST | `/api/tasks/{id}/dispatch` | `{"runtime":"dsh"|"codex"|"pi"}` → 202 `{"taskId","runtime"}`；异步派发所选渠道（cwd=项目 workspacePath）；渠道确认接收后服务将未归档卡片移入项目 `doing` 角色列（已在该列则不改版本/位置），执行 Agent 按技能回写结果评论并移入 `review`；派发失败或接收未确认时不因派发本身移列。DSH 接已启动的桌面 Host，Codex/Pi/Claude 由 Herdr App 在匹配项目工作目录的既有 space 中新增可见 tab/agent terminal |
 | POST | `/api/projects/{id}/run` | `{"runtime":"dsh"|"codex"|"pi"|"claude"}` → 202 `ProjectRun`；开始一轮项目承接 |
 | GET | `/api/projects/{id}/run` | 该项目最新一轮 `ProjectRun`；没有则 404 |
 | POST | `/api/projects/{id}/run/stop` | 空请求体 → 200 `ProjectRun`；停止后续派发，不取消已经在跑的那一张卡 |
 | 打开 Codex 会话 | 原生 UI 本地动作，不新增 HTTP 字段；有 session ID 的 Codex execution 在卡片右键菜单显示入口，Herdr Codex 卡片另显示可直接定位原 terminal 的对话图标（活动期间也可点，因为只聚焦原 terminal，不恢复或创建会话）；右下角 Herdr 状态图标在会话非活动时也可点击直达对应 terminal；旧 CLI session 使用记录的 session ID 与项目工作目录启动 Ghostty 中的 `codex resume <sessionID>`，活动期间置灰以避免并行恢复 |
-| GET | `/api/events?projectId=` | SSE：每次连接先发 `board.snapshot`（含一致快照、序号及任务的可选 `execution` 会话记录），再发新于快照的 `event: <type>` + `data: <Event JSON>`；每 15s `: ping`。执行会话状态变化通过完整任务快照的 `task.updated` 推送，task version 不变；卡片列不因此自动改变。断线恢复依靠重连快照，不依赖事件历史重放 |
+| GET | `/api/events?projectId=` | SSE：每次连接先发 `board.snapshot`（含一致快照、序号及任务的可选 `execution` 会话记录），再发新于快照的 `event: <type>` + `data: <Event JSON>`；每 15s `: ping`。执行会话状态变化通过完整任务快照的 `task.updated` 推送，task version 不变；执行状态变化本身不改卡片列，渠道接收派发后另发 `task.moved`。断线恢复依靠重连快照，不依赖事件历史重放 |
 
 错误：`400` 参数缺失；`404` 不存在；`409` `Conflicterror:"version_conflict", task}`（列角色冲突为 `{"error":"role_conflict"}`）。版本冲突时客户端拉一次详情再对齐。
 
-Dispatch 语义（2026-10-30）：`runtime` API 值兼容 `dsh`、`codex`、`pi`、`claude`。Codex/Pi/Claude 先按 space `folder` 与项目 `workspacePath` 精确匹配；没有精确目录匹配时，仅当同名 space 的 `folder` 是项目 `workspacePath` 的父目录，才按项目名回退；存在多个候选时优先唯一活动项，仍有歧义则明确失败。没有符合条件的 space 时，用 `space.new` 创建正式项目 space（名称为项目名、目录为 `workspacePath`），随后在该 space 通过 `tab.new` 创建可见任务 tab/agent terminal；不会为每张卡创建 space，也不会创建临时测试 space。`executions.session_id` 保存 Herdr terminal address。Herdr 启动的执行进程获得 `TASKBOARD_DISPATCH_TASK_ID`，供执行 Agent 判断匹配的活动 execution 是否属于当前会话，避免把自己的写锁误判为其他 Agent；缺少或不匹配时仍按并发规则停止。Herdr Core (`hc`) 跟踪状态、发送同一会话的评论跟进；`working`/`blocked` 立即反映为运行中/等待处理，`idle` 需连续稳定 6 秒后才判为 turn 结束，避免短暂空档释放执行锁；进程结束、`done` 或稳定 `idle` 只表示 turn 结束，不改变任务列。Herdr App 不可用、无法确认创建的项目 space 或无法确认新建 terminal 时，派发明确失败，禁止回退到独立 CLI 或另建会话。DSH 暂保留原桌面桥接与配置。Herdr 控制的 Codex/Pi/Claude 使用 Herdr 已配置的 agent/model；Taskboard 不改写 Herdr 或 CLI 的全局模型配置。旧 CLI session ID 不作为 Herdr terminal address 使用，旧会话继续按兼容路径跟进。`runtime` 的对外字段与菜单选项保持不变。
+任务主键仍是 16 字节随机 hex（32 位）。每张卡另有全局递增的十进制任务号，从 1001 开始；原生详情页显示并可复制该任务号，右键菜单的「复制任务号」也复制任务号。任务详情、评论及评论编辑/删除等按任务 ID 定位的接口接受十进制任务号和原 32 位主键；为兼容此前复制的短码，也接受至少 6 位且唯一的 hex 前缀。旧数据库按创建时间顺序补发任务号，已有完整 32 位引用继续有效；无匹配返回 404，多重匹配的 hex 前缀返回 400。
+
+Dispatch 语义（2026-10-31）：`runtime` API 值兼容 `dsh`、`codex`、`pi`、`claude`。渠道确认新会话已接收后，服务把未归档卡片移入项目 `doing` 角色列；卡片已在目标列时保持版本与位置不变，接收失败或结果不确定时保留原列。评论跟进在 `/continue` 成功登记唯一执行记录后立即移入 `doing`，不等待远端 send 完成；异步发送结果不确定时 execution 继续占锁，卡片仍留在 `doing` 供处理。执行会话后续的状态变化本身不改卡片列；执行 Agent 写回结果后负责移入 `review`，人工确认后才进入 `done`。Codex/Pi/Claude 先按 space `folder` 与项目 `workspacePath` 精确匹配；没有精确目录匹配时，仅当同名 space 的 `folder` 是项目 `workspacePath` 的父目录，才按项目名回退；存在多个候选时优先唯一活动项，仍有歧义则明确失败。没有符合条件的 space 时，用 `space.new` 创建正式项目 space（名称为项目名、目录为 `workspacePath`），随后在该 space 通过 `tab.new` 创建可见任务 tab/agent terminal；不会为每张卡创建 space，也不会创建临时测试 space。`executions.session_id` 保存 Herdr terminal address。Herdr 启动的执行进程获得 `TASKBOARD_DISPATCH_TASK_ID`，供执行 Agent 判断匹配的活动 execution 是否属于当前会话，避免把自己的写锁误判为其他 Agent；缺少或不匹配时仍按并发规则停止。Herdr Core (`hc`) 跟踪状态、发送同一会话的评论跟进；`working`/`blocked` 立即反映为运行中/等待处理，`idle` 需连续稳定 6 秒后才判为 turn 结束，避免短暂空档释放执行锁；进程结束、`done` 或稳定 `idle` 只表示 turn 结束，不改变任务列。Herdr App 不可用、无法确认创建的项目 space 或无法确认新建 terminal 时，派发明确失败，禁止回退到独立 CLI 或另建会话。DSH 暂保留原桌面桥接与配置。Herdr 控制的 Codex/Pi/Claude 使用 Herdr 已配置的 agent/model；Taskboard 不改写 Herdr 或 CLI 的全局模型配置。旧 CLI session ID 不作为 Herdr terminal address 使用，旧会话继续按兼容路径跟进。`runtime` 的对外字段与菜单选项保持不变。
+
+自动执行模式（2026-10-31）：派发时只基于卡片标题和正文进行内置类型判定，不增加用户可见或可配置的流水线选项；出现实现、新增、开发、构建、接入、集成、接口、模块或流水线等明确代码生成意图时归为 `code_generation`，否则归为 `simple_change`。静态映射为 `code_generation → Codex 实现 + Claude Code 评审`、`simple_change → 单代理`。在现有 `runtime=codex` 的 Herdr 派发中，代码生成卡提示 Codex 实现 Agent 用 `hc run` 创建 Claude Code 评审子终端，等待评审并整合修复后再按任务技能回写；不改 HTTP 字段、UI 选择项或执行记录结构。标题/正文不明确时按简单改动单代理处理。明确选择其他 runtime 的请求继续沿用所选渠道单代理执行。
 
 可在数据库旁的 `<数据库文件名>.runtimes.json` 设置看板独立连接，例如 `{"codex":{"baseUrl":"http://127.0.0.1:3425/v1","model":"codex/gpt-6-luna","reasoningEffort":"medium"}}`。仅 Codex 在配置该连接时按次使用 `--ignore-user-config` 和独立 Responses provider 参数；沿用 CLI 登录文件但不加载其全局模型/代理配置，工作区规则仍由 CLI 正常加载。本机的该配置通过已有 Magpie 网关调用 Codex 模型；它仍使用 Codex 原生执行器。配置文件不存在或未设置该连接时保持原有 CLI 行为；配置错误明确回写失败。文件在每次派发时读取，新配置不影响已经运行的任务。
 

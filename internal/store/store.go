@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS "columns" (
 CREATE INDEX IF NOT EXISTS columns_project ON "columns"(project_id, position);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
+  number INTEGER NOT NULL DEFAULT 0,
   project_id TEXT NOT NULL,
   column_id TEXT NOT NULL,
   title TEXT NOT NULL,
@@ -277,7 +279,92 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("store: project color migration: %w", err)
 		}
 	}
+	if err := s.migrateTaskNumbers(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+// TaskNumberStart is the first human-facing task number assigned on a
+// fresh or upgraded database. Numbers are global, sequential, and typically
+// four digits so they are easy to say aloud.
+const TaskNumberStart = 1001
+
+// HexPrefixMinLen is the minimum length accepted for a unique hex-id prefix
+// lookup (backward compatibility with older short-id copies).
+const HexPrefixMinLen = 6
+
+// FormatTaskNumber returns the human-facing display form of a task number
+// (unpadded decimal, e.g. "1083"). Zero or negative values yield "".
+func FormatTaskNumber(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
+
+// migrateTaskNumbers adds the global sequential display number column,
+// backfills existing rows ordered by created_at/rowid starting at
+// TaskNumberStart, and enforces uniqueness.
+func (s *Store) migrateTaskNumbers(ctx context.Context) error {
+	cols, err := s.db.Query(ctx, `PRAGMA table_info(tasks)`)
+	if err != nil {
+		return fmt.Errorf("store: task schema: %w", err)
+	}
+	hasNumber := false
+	for _, column := range cols.Values {
+		if str(column[1]) == "number" {
+			hasNumber = true
+			break
+		}
+	}
+	if !hasNumber {
+		if _, err := s.db.Execute(ctx, `ALTER TABLE tasks ADD COLUMN number INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store: task number migration: %w", err)
+		}
+	}
+	pending, err := s.db.Query(ctx, `SELECT id FROM tasks WHERE number = 0 ORDER BY created_at, rowid`)
+	if err != nil {
+		return fmt.Errorf("store: task number backfill select: %w", err)
+	}
+	if len(pending.Values) > 0 {
+		maxRows, err := s.db.Query(ctx, `SELECT COALESCE(MAX(number), 0) FROM tasks`)
+		if err != nil {
+			return fmt.Errorf("store: task number max: %w", err)
+		}
+		next := int(integer(maxRows.Values[0][0])) + 1
+		if next < TaskNumberStart {
+			next = TaskNumberStart
+		}
+		var stmts []sqlite.Statement
+		for _, row := range pending.Values {
+			stmts = append(stmts, sqlite.Statement{
+				SQL:  `UPDATE tasks SET number = ? WHERE id = ?`,
+				Args: []any{next, str(row[0])},
+			})
+			next++
+		}
+		if _, err := s.db.Transaction(ctx, stmts); err != nil {
+			return fmt.Errorf("store: task number backfill: %w", err)
+		}
+	}
+	if _, err := s.db.Execute(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS tasks_number ON tasks(number)`); err != nil {
+		return fmt.Errorf("store: task number index: %w", err)
+	}
+	return nil
+}
+
+// nextTaskNumberLocked returns max(number)+1, never below TaskNumberStart.
+func (s *Store) nextTaskNumberLocked(ctx context.Context) (int, error) {
+	rows, err := s.db.Query(ctx, `SELECT COALESCE(MAX(number), 0) FROM tasks`)
+	if err != nil {
+		return 0, err
+	}
+	next := int(integer(rows.Values[0][0])) + 1
+	if next < TaskNumberStart {
+		next = TaskNumberStart
+	}
+	return next, nil
 }
 
 // newID returns a 16-byte random hex id.

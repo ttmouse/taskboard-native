@@ -129,7 +129,7 @@ func StartOptions(opts Options) (*Server, error) {
 		store:    st,
 		hub:      h,
 		slow:     slow,
-		dispatch: executor.NewDispatcher(st, dbPath+".runtimes.json", "http://"+net.JoinHostPort(boardHost, boardPort)),
+		dispatch: executor.NewDispatcher(st, dbPath+".runtimes.json", "http://"+net.JoinHostPort(boardHost, boardPort), dbPath+".auto-handoff.jsonl"),
 		closed:   make(chan struct{}),
 		listener: ln,
 	}
@@ -597,6 +597,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 		for _, task := range tasks {
 			out = append(out, taskSummary{
 				ID:        task.ID,
+				Number:    task.Number,
 				ProjectID: task.ProjectID,
 				ColumnID:  task.ColumnID,
 				Title:     task.Title,
@@ -625,6 +626,7 @@ func optionalQueryValue(r *http.Request, key string) (string, bool, error) {
 
 type taskSummary struct {
 	ID        string    `json:"id"`
+	Number    int       `json:"number"`
 	ProjectID string    `json:"projectId"`
 	ColumnID  string    `json:"columnId"`
 	Title     string    `json:"title"`

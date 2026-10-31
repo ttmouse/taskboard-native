@@ -305,7 +305,7 @@ func cmdShow(args []string) int {
 }
 
 func printTask(w io.Writer, task model.Task) {
-	fmt.Fprintf(w, "ID:\t%s\nTitle:\t%s\nProject:\t%s\nColumn:\t%s\n", task.ID, task.Title, task.ProjectID, task.ColumnID)
+	fmt.Fprintf(w, "ID:\t%s\nNumber:\t%d\nTitle:\t%s\nProject:\t%s\nColumn:\t%s\n", task.ID, task.Number, task.Title, task.ProjectID, task.ColumnID)
 	if task.Assignee != "" {
 		fmt.Fprintf(w, "Assignee:\t%s\n", task.Assignee)
 	}
