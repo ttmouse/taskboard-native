@@ -1,7 +1,0 @@
-./compile.go
-./metal.go
-./offscreen.go
-./pipelines.go
-./precompile.go
-./present.go
-./shaderlib.go

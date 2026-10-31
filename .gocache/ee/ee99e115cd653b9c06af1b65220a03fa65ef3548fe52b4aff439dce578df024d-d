@@ -1,7 +1,0 @@
-./corners.go
-./cull.go
-./damage.go
-./gpu.go
-./stats.go
-./sum.go
-./transform.go

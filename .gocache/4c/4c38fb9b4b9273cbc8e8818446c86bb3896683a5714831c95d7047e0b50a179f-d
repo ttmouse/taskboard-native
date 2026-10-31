@@ -1,6 +1,0 @@
-./audio.go
-./mixer.go
-./output.go
-./output_darwin.go
-./source.go
-./wav.go
