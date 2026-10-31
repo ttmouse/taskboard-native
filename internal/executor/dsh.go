@@ -86,6 +86,10 @@ func NewDispatcher(st *store.Store, configPaths ...string) *Dispatcher {
 	}
 	if err := d.recoverReturnedHerdrExecutions(); err != nil {
 		d.recoveryErr = err
+		return d
+	}
+	if err := d.recoverProjectRuns(); err != nil {
+		d.recoveryErr = err
 	}
 	return d
 }
@@ -165,6 +169,17 @@ func (d *Dispatcher) recoverProjectRunAfterReturnedHerdr(completed model.Executi
 	}
 	run.Status, run.Detail = "running", "已恢复 Herdr 自动承接"
 	if hasDoing && task.ColumnID == doing.ID && !task.Archived {
+		// Legacy failed runs recorded "执行结束但仍在进行中": under the current
+		// queue-clearing semantics the finished card is pushed to the review
+		// column and the run continues with the next card.
+		if d.advanceFinishedCard(project, task, completed, "自动承接恢复") {
+			run.CurrentTaskID, run.Detail = "", ""
+			if err := d.store.SaveProjectRun(run); err != nil {
+				return err
+			}
+			d.continueProjectRun(project, "自动承接恢复")
+			return nil
+		}
 		run.Detail = "等待卡片 " + task.ID + " 离开进行中后继续自动承接"
 		return d.store.SaveProjectRun(run)
 	}
@@ -183,7 +198,13 @@ func (d *Dispatcher) recoverProjectRunAfterReturnedHerdr(completed model.Executi
 		run.CurrentTaskID = ""
 		run.Detail = "等待下一张卡片"
 	}
-	return d.store.SaveProjectRun(run)
+	if err := d.store.SaveProjectRun(run); err != nil {
+		return err
+	}
+	if run.CurrentTaskID == "" {
+		d.continueProjectRun(project, "自动承接恢复")
+	}
+	return nil
 }
 
 func (d *Dispatcher) resumeHerdrTracking(run model.Execution) {
@@ -359,6 +380,9 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 		}
 		d.setFollowup(followupID, "sent")
 		d.comment(task.ID, actor, fmt.Sprintf("已交给 Herdr %s（项目 space 中的任务 tab 已打开；发起人 %s；%s）。", runtime, by, time.Since(start).Round(time.Second)))
+		if followupID != "" {
+			d.syncRunningTaskColumn(task.ID, actor)
+		}
 		d.trackHerdr(ctx, run)
 		return
 	}
@@ -387,12 +411,22 @@ func (d *Dispatcher) executeCLI(ctx context.Context, cmd *exec.Cmd, task model.T
 	runtime := run.Channel()
 	// execCommand already supplies the launcher's PATH. Add board routing and
 	// attribution per process so isolated boards cannot write to the default one.
-	cmd.Env = append(cmd.Environ(), "TASKBOARD_ADDR="+strings.TrimPrefix(d.boardURL, "http://"), "TB_AGENT="+actor)
+	cmd.Env = append(cmd.Environ(), "TASKBOARD_ADDR="+strings.TrimPrefix(d.boardURL, "http://"), "TB_AGENT="+actor, "TASKBOARD_DISPATCH_TASK_ID="+run.TaskID)
 	var stdout, stderr bytes.Buffer
 	observer := &sessionObserver{d: d, run: run}
 	cmd.Stdout = io.MultiWriter(&stdout, observer)
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		run.Status, run.Detail = "running", ""
+		if err := d.store.SaveExecution(*run); err != nil {
+			d.comment(task.ID, actor, "命令已启动，但执行状态写回失败："+err.Error())
+		}
+		if run.FollowupID != "" {
+			d.syncRunningTaskColumn(task.ID, actor)
+		}
+		runErr = cmd.Wait()
+	}
 	defer d.finishProjectCard(task.ID)
 	if observer.err != nil {
 		runErr = observer.err

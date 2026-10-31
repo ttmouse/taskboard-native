@@ -185,7 +185,7 @@ func (d *Dispatcher) Continue(taskID, commentID, by string) error {
 			return
 		}
 		if _, ok := herdrAddress(run.SessionID); ok {
-			d.sendHerdrFollowup(ctx, taskID, definition.Label, by, run, text)
+			d.sendHerdrFollowup(ctx, taskID, definition.Label, run, text)
 			return
 		}
 		d.comment(taskID, definition.Label, "正在原会话跟进评论 "+commentID+"（发起人 "+by+"）。")

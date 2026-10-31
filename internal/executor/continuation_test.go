@@ -21,6 +21,40 @@ func awaitNoExecution(t *testing.T, d *Dispatcher) {
 	})
 }
 
+func TestHerdrFollowupDoesNotAddRedundantSuccessComment(t *testing.T) {
+	st := newTestStore(t)
+	p, task := projectWithWorkspace(t, st)
+	_, _ = installFakeHerdr(t, p.WorkspacePath, "idle")
+	if err := st.SaveExecution(model.Execution{TaskID: task.ID, Runtime: RuntimeCodex, SessionID: "herdr:test-terminal-1", Status: "returned"}); err != nil {
+		t.Fatal(err)
+	}
+	cm, err := st.AddComment(task.ID, "继续处理这条要求", "豆爸")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDispatcher(st)
+	defer d.Close()
+	if err := d.Continue(task.ID, cm.ID, "豆爸"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "Herdr follow-up delivery", func() (bool, string) {
+		status, err := st.FollowupStatus(task.ID, cm.ID)
+		return err == nil && status == "sent", status
+	})
+	d.Close()
+
+	comments, err := st.Comments(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 1 || comments[0].ID != cm.ID {
+		t.Fatalf("successful Herdr follow-up added a redundant comment: %#v", comments)
+	}
+	if status, _ := st.FollowupStatus(task.ID, cm.ID); status != "sent" {
+		t.Fatalf("follow-up status = %q, want sent", status)
+	}
+}
+
 func TestCLICommentResumesExactSessionAndDeduplicatesAfterRestart(t *testing.T) {
 	for _, runtime := range []string{RuntimeCodex, RuntimePi, RuntimeClaude} {
 		t.Run(runtime, func(t *testing.T) {
@@ -45,6 +79,14 @@ printf 'returned\n'`)
 			original, _ := st.Execution(task.ID)
 			if original == nil || original.SessionID != "herdr:test-terminal-1" || original.Channel() != runtime {
 				t.Fatalf("lost identity: %+v", original)
+			}
+			awaiting, _ := st.Task(task.ID)
+			review, ok := p.ColumnByRole(model.ColumnRoleReview)
+			if !ok {
+				t.Fatal("review column missing")
+			}
+			if _, err := st.MoveTask(awaiting.ID, awaiting.Version, review.ID, "", "user"); err != nil {
+				t.Fatal(err)
 			}
 			cm, err := st.AddComment(task.ID, "只跟进本条新要求", "user")
 			if err != nil {
@@ -77,8 +119,9 @@ printf 'returned\n'`)
 				t.Fatalf("followup status = %q", status)
 			}
 			cur, _ := st.Task(task.ID)
-			if cur.ColumnID != task.ColumnID || cur.Version != task.Version {
-				t.Fatal("dispatcher changed workflow")
+			doing, _ := p.ColumnByRole(model.ColumnRoleDoing)
+			if cur.ColumnID != doing.ID {
+				t.Fatalf("active follow-up column = %q, want doing %q", cur.ColumnID, doing.ID)
 			}
 		})
 	}
@@ -88,10 +131,19 @@ func TestContinueRejectsMissingSessionCommentAndBusy(t *testing.T) {
 	st := newTestStore(t)
 	d := NewDispatcher(st)
 	defer func() { d.Close() }()
-	_, task := projectWithWorkspace(t, st)
+	p, task := projectWithWorkspace(t, st)
+	review, _ := p.ColumnByRole(model.ColumnRoleReview)
+	awaiting, err := st.MoveTask(task.ID, task.Version, review.ID, "", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cm, _ := st.AddComment(task.ID, "follow", "user")
 	if err := d.Continue(task.ID, cm.ID, "user"); err == nil {
 		t.Fatal("created replacement session")
+	}
+	cur, _ := st.Task(task.ID)
+	if cur.ColumnID != review.ID || cur.Version != awaiting.Version {
+		t.Fatalf("rejected follow-up moved card: %+v", cur)
 	}
 	if err := d.Continue(task.ID, "other-task-comment", "user"); err == nil {
 		t.Fatal("accepted foreign comment")

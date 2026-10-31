@@ -215,7 +215,7 @@ func herdrCreate(ctx context.Context, task model.Task, projectName, dir, runtime
 	if err != nil {
 		return "", err
 	}
-	argv := []string{"env", "TASKBOARD_ADDR=" + strings.TrimPrefix(boardURL, "http://"), "TB_AGENT=" + actor, runtime}
+	argv := []string{"env", "TASKBOARD_ADDR=" + strings.TrimPrefix(boardURL, "http://"), "TB_AGENT=" + actor, "TASKBOARD_DISPATCH_TASK_ID=" + task.ID, runtime}
 	switch runtime {
 	case RuntimeCodex:
 		argv = append(argv, "--no-daemon", "-c", "sandbox_workspace_write.network_access=true")
@@ -287,6 +287,7 @@ func herdrCoreCommand(ctx context.Context, args ...string) (*exec.Cmd, error) {
 var (
 	herdrProbeInterval    = 2 * time.Second
 	herdrUnreachableGrace = 2 * time.Minute
+	herdrIdleGrace        = 6 * time.Second
 	// herdrFlapProbes is how many consecutive failed probes (about 6s at the
 	// default interval) it takes before the badge says 连接异常. A single miss
 	// is a routing blip, not evidence that the session is gone.
@@ -297,6 +298,7 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 	ticker := time.NewTicker(herdrProbeInterval)
 	defer ticker.Stop()
 	var unreachableSince time.Time
+	var idleSince time.Time
 	misses := 0
 	for {
 		address, ok := herdrAddress(run.SessionID)
@@ -307,6 +309,7 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 		}
 		status, err := herdrGet(ctx, address)
 		if err != nil {
+			idleSince = time.Time{}
 			if ctx.Err() != nil {
 				// Service shutdown: the contract keeps the original terminal and
 				// resumes tracking next start, so nothing converges here.
@@ -338,22 +341,38 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 		misses = 0
 		switch herdrState(status) {
 		case "working":
+			idleSince = time.Time{}
 			run.Status, run.Detail = "running", ""
 		case "blocked":
+			idleSince = time.Time{}
 			run.Status, run.Detail = "waiting_approval", "Herdr agent 等待人工处理"
-		case "done", "idle":
+			d.parkProjectCardForApproval(run.TaskID)
+		case "done":
+			idleSince = time.Time{}
+			run.Status, run.Detail = "returned", "Herdr agent turn 已结束；任务状态由执行 Agent 回写"
+			_ = d.store.SaveExecution(*run)
+			return
+		case "idle":
 			// A newly created Herdr terminal reports idle before the agent's
 			// first turn starts. That is not evidence of completion; keep the
 			// reservation live until a turn was observed or an exit was reported.
 			if status.Turn == 0 && status.ExitCode == nil {
+				idleSince = time.Time{}
 				run.Status, run.Detail = "running", "Herdr terminal 已创建，等待初始 turn 开始"
 				_ = d.store.SaveExecution(*run)
 				break
 			}
-			run.Status, run.Detail = "returned", "Herdr agent turn 已结束；任务状态由执行 Agent 回写"
-			_ = d.store.SaveExecution(*run)
-			return
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+			}
+			if time.Since(idleSince) >= herdrIdleGrace {
+				run.Status, run.Detail = "returned", "Herdr agent turn 已结束；任务状态由执行 Agent 回写"
+				_ = d.store.SaveExecution(*run)
+				return
+			}
+			run.Status, run.Detail = "running", "Herdr turn 暂时 idle，等待状态稳定"
 		default:
+			idleSince = time.Time{}
 			if status.ExitCode != nil {
 				run.Status = "returned"
 				run.Detail = "Herdr terminal 已结束；任务状态由执行 Agent 回写"
@@ -374,9 +393,8 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 	}
 }
 
-func (d *Dispatcher) sendHerdrFollowup(ctx context.Context, taskID, actor, by string, run *model.Execution, text string) {
+func (d *Dispatcher) sendHerdrFollowup(ctx context.Context, taskID, actor string, run *model.Execution, text string) {
 	address, _ := herdrAddress(run.SessionID)
-	d.comment(taskID, actor, "正在 Herdr 原会话跟进（发起人 "+by+"）。")
 	if err := herdrSend(ctx, address, text); err != nil {
 		run.Status, run.Detail = "unknown", "hc send 未确认送达；保留原 terminal，禁止自动重投："+err.Error()
 		_ = d.store.SaveExecution(*run)
@@ -386,6 +404,7 @@ func (d *Dispatcher) sendHerdrFollowup(ctx context.Context, taskID, actor, by st
 	}
 	run.Status, run.Detail = "running", "评论已发送到原 Herdr terminal"
 	_ = d.store.SaveExecution(*run)
+	d.syncRunningTaskColumn(taskID, actor)
 	d.setFollowup(run.FollowupID, "sent")
 	d.trackHerdr(ctx, run)
 }

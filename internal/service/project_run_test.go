@@ -3,6 +3,7 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 	"taskboard-native/internal/model"
 )
 
-func TestProjectRunDispatchesTheNextCardAfterTheCurrentOneLeavesDoing(t *testing.T) {
+func TestProjectRunClearsDoingAndIntakeQueuesAutomatically(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nprintf 'RUN_OK\\n'\n"), 0755); err != nil {
 		t.Fatal(err)
@@ -36,51 +37,93 @@ func TestProjectRunDispatchesTheNextCardAfterTheCurrentOneLeavesDoing(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := c.StartProjectRun(p.ID, executor.RuntimeCodex)
-	if err != nil {
+	if _, err := c.StartProjectRun(p.ID, executor.RuntimeCodex); err != nil {
 		t.Fatal(err)
 	}
-	if len(run.TaskIDs) != 2 || run.TaskIDs[0] != first.ID || run.TaskIDs[1] != second.ID {
-		t.Fatalf("list=%v", run.TaskIDs)
-	}
+	// The stalled doing card is dispatched first; when its session returns the
+	// service moves it to 等你 by itself and writes the move note.
 	waitFor(t, func() bool {
 		current, err := c.Task(first.ID)
-		return err == nil && len(current.Comments) > 0
+		return err == nil && current.ColumnID == review.ID
 	})
-	again, err := c.Task(second.ID)
-	if err != nil || len(again.Comments) != 0 {
-		t.Fatal("second card started before the first one finished")
-	}
-	current, err := c.Task(first.ID)
+	noted, err := c.Task(first.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Move(current.ID, current.Version, review.ID, "", false); err != nil {
-		t.Fatal(err)
+	autoMove := false
+	for _, cm := range noted.Comments {
+		if cm.Author == "自动承接" && strings.Contains(cm.Text, "自动移入「等你」") {
+			autoMove = true
+		}
 	}
+	if !autoMove {
+		t.Fatalf("comments = %#v; want a 自动承接 move note on the finished card", noted.Comments)
+	}
+	// The next card starts on its own and lands in 等你 too.
 	waitFor(t, func() bool {
 		current, err := c.Task(second.ID)
-		return err == nil && len(current.Comments) > 0
+		return err == nil && current.ColumnID == review.ID
 	})
-	left, err := c.Task(second.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.Move(left.ID, left.Version, review.ID, "", false); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, func() bool {
+	waitRunEmpty := func() bool {
 		run, err := c.ProjectRun(p.ID)
 		return err == nil && run.Running() && run.CurrentTaskID == ""
-	})
+	}
+	waitFor(t, waitRunEmpty)
+	// A card created while the switch is on is picked up and cleared as well.
 	third, err := c.CreateTask(p.ID, intake.ID, "开关开启后新建", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
 		current, err := c.Task(third.ID)
-		return err == nil && len(current.Comments) > 0
+		return err == nil && current.ColumnID == review.ID
 	})
+	waitFor(t, waitRunEmpty)
+}
+
+func TestProjectRunClaimsActiveIntakeExecutionWithoutRedispatch(t *testing.T) {
+	workspace := t.TempDir()
+	srv := start(t)
+	c := client.New(&client.Discover{Addr: srv.Addr}, "project-run")
+	p, err := c.CreateProjectWithPath("已有会话项目", workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intake, _ := p.ColumnByRole(model.ColumnRoleIntake)
+	doing, _ := p.ColumnByRole(model.ColumnRoleDoing)
+	task, err := c.CreateTask(p.ID, intake.ID, "待办中的活跃会话", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := model.Execution{
+		TaskID: task.ID, Runtime: executor.RuntimeCodex,
+		SessionID: "herdr:existing", Status: "running",
+	}
+	if err := srv.store.SaveExecution(existing); err != nil {
+		t.Fatal(err)
+	}
+
+	projectRun, err := c.StartProjectRun(p.ID, executor.RuntimeCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projectRun.CurrentTaskID != task.ID || projectRun.Detail == "" {
+		t.Fatalf("project run = %#v; want to track the existing execution", projectRun)
+	}
+	claimed, err := c.Task(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ColumnID != doing.ID {
+		t.Fatalf("active intake card stayed in %q, want doing %q", claimed.ColumnID, doing.ID)
+	}
+	current, err := srv.store.Execution(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.SessionID != existing.SessionID {
+		t.Fatalf("project run replaced active session %q with %q", existing.SessionID, current.SessionID)
+	}
 }
 
 func TestProjectRunCanBeEnabledWhileACardIsStillRunning(t *testing.T) {

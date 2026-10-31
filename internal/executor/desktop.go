@@ -309,6 +309,7 @@ func (d *Dispatcher) runDesktop(ctx context.Context, task model.Task, dir, text,
 			return
 		}
 		if followupID != "" {
+			d.syncRunningTaskColumn(task.ID, actor)
 			d.comment(task.ID, actor, fmt.Sprintf("已按评论 @%s 改由 DSH 桌面端新建会话处理（工作目录 %s）。会话 ID：%s", actor, dir, accepted.ExternalSessionID))
 		} else {
 			d.comment(task.ID, actor, fmt.Sprintf("已交给 DSH 桌面端（工作目录 %s；发起人 %s）。请在项目工作目录下查看本次任务“%s”的会话。会话 ID：%s", dir, by, task.Title, accepted.ExternalSessionID))

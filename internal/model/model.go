@@ -206,6 +206,10 @@ func (e Execution) Active() bool {
 	return true
 }
 
+// Ended reports a converged session: whatever the outcome, the turn is over
+// and the record no longer holds the card's write lock.
+func (e Execution) Ended() bool { return endedStatuses[e.Status] }
+
 // Releasable reports whether a human may converge this record to detached. A
 // run that may still be writing has to be stopped in its own channel first;
 // releasing it here would let a new dispatch start a second writer on the same

@@ -13,9 +13,9 @@ import (
 // production values when the test ends.
 func shortenHerdrGrace(t *testing.T, probe, grace time.Duration) {
 	t.Helper()
-	herdrProbeInterval, herdrUnreachableGrace = probe, grace
+	herdrProbeInterval, herdrUnreachableGrace, herdrIdleGrace = probe, grace, grace
 	t.Cleanup(func() {
-		herdrProbeInterval, herdrUnreachableGrace = 2*time.Second, 2*time.Minute
+		herdrProbeInterval, herdrUnreachableGrace, herdrIdleGrace = 2*time.Second, 2*time.Minute, 6*time.Second
 	})
 }
 

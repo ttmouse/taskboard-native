@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -101,7 +102,7 @@ func TestHerdrCreateAddsTabToProjectSpace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"do\ntab.new", "--space\nproject-space", "--folder\n/work/project", "TASKBOARD_ADDR=127.0.0.1:47826", "TB_AGENT=Codex", "sandbox_workspace_write.network_access=true", "task prompt"} {
+	for _, want := range []string{"do\ntab.new", "--space\nproject-space", "--folder\n/work/project", "TASKBOARD_ADDR=127.0.0.1:47826", "TB_AGENT=Codex", "TASKBOARD_DISPATCH_TASK_ID=task-1", "sandbox_workspace_write.network_access=true", "task prompt"} {
 		if !strings.Contains(string(args), want) {
 			t.Errorf("Herdr args missing %q: %s", want, args)
 		}
@@ -246,6 +247,50 @@ func TestTrackHerdrDoesNotTreatInitialIdleAsReturned(t *testing.T) {
 	}
 }
 
+func TestTrackHerdrWaitsForStableIdleBetweenTurns(t *testing.T) {
+	shortenHerdrGrace(t, 100*time.Millisecond, 250*time.Millisecond)
+	binDir := t.TempDir()
+	counter := filepath.Join(t.TempDir(), "hc-count")
+	script := "#!/bin/sh\nn=0\n[ -f \"$COUNTER\" ] && n=$(cat \"$COUNTER\")\nn=$((n+1))\nprintf '%s' \"$n\" > \"$COUNTER\"\ncase \"$n\" in\n1) state=working; turn=1 ;;\n2) state=idle; turn=1 ;;\n3) state=working; turn=2 ;;\n*) state=idle; turn=2 ;;\nesac\nprintf '{\"status\":{\"state\":\"%s\"},\"turn\":%s}' \"$state\" \"$turn\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "hc"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("COUNTER", counter)
+	st := newTestStore(t)
+	_, task := projectWithWorkspace(t, st)
+	run := &model.Execution{TaskID: task.ID, Runtime: RuntimeCodex, SessionID: "herdr:t-idle-flap", Status: "running"}
+	if err := st.SaveExecution(*run); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{store: st}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.trackHerdr(ctx, run)
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+
+	waitFor(t, "transient idle probe", func() (bool, string) {
+		count, _ := os.ReadFile(counter)
+		return string(count) == "2", string(count)
+	})
+	if persisted, _ := st.Execution(task.ID); persisted == nil || persisted.Status == "returned" {
+		t.Fatalf("one idle probe released the execution lock: %+v", persisted)
+	}
+	waitFor(t, "Herdr stable idle returned", func() (bool, string) {
+		persisted, _ := st.Execution(task.ID)
+		return persisted != nil && persisted.Status == "returned", fmt.Sprint(persisted)
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Herdr tracker did not stop after stable idle")
+	}
+}
+
 func TestNewDispatcherRecoversReturnedHerdrSessionStillWorking(t *testing.T) {
 	binDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(binDir, "hc"), []byte("#!/bin/sh\nprintf '%s' '{\"status\":{\"state\":\"working\"},\"turn\":1}'\n"), 0o755); err != nil {
@@ -351,7 +396,15 @@ func TestNewDispatcherRestoresAutoRunWhenReturnedCardStillDoing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !run.Running() || run.CurrentTaskID != task.ID || !strings.Contains(run.Detail, "等待卡片") {
-		t.Fatalf("ProjectRun() = %#v; expected restart to restore enabled state and wait on the existing card", run)
+	moved, err := st.Task(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review, ok := project.ColumnByRole(model.ColumnRoleReview)
+	if !ok {
+		t.Fatal("project has no review column")
+	}
+	if !run.Running() || run.CurrentTaskID != "" || moved.ColumnID != review.ID {
+		t.Fatalf("ProjectRun() = %#v, card in %q; expected restart to restore the switch, push the returned card to review and move on", run, moved.ColumnID)
 	}
 }

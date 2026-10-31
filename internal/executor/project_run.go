@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -74,12 +75,12 @@ func (d *Dispatcher) StartProjectRun(projectID, runtime, by string) (model.Proje
 	} else if err != nil && err != store.ErrNotFound {
 		return model.ProjectRun{}, err
 	}
-	ids, blocked, err := d.projectRunList(project)
+	stalledDoing, ready, blocked, err := d.projectRunList(project)
 	if err != nil {
 		return model.ProjectRun{}, err
 	}
 
-	run := model.ProjectRun{ProjectID: projectID, Runtime: runtime, Status: "running", TaskIDs: ids}
+	run := model.ProjectRun{ProjectID: projectID, Runtime: runtime, Status: "running"}
 	if blocked != "" {
 		run.CurrentTaskID = blocked
 		run.Detail = "等待卡片 " + blocked + " 的现有执行结束"
@@ -87,8 +88,25 @@ func (d *Dispatcher) StartProjectRun(projectID, runtime, by string) (model.Proje
 	if err := d.store.SaveProjectRun(run); err != nil {
 		return model.ProjectRun{}, err
 	}
-	if blocked != "" || len(ids) == 0 {
+	if blocked != "" {
+		if _, _, err := d.claimProjectCard(blocked, by); err != nil {
+			run.Status, run.Detail = "failed", err.Error()
+			_ = d.store.SaveProjectRun(run)
+			return run, err
+		}
+		return d.store.ProjectRun(projectID)
+	}
+	// Finished or broken 进行中 cards are pushed to 等你, never re-run; only
+	// work that never started is dispatched fresh.
+	ready = append(d.pushStalledDoingCards(project, stalledDoing, by), ready...)
+	run.TaskIDs = ready
+	if len(ready) == 0 {
+		run.Detail = "等待下一张卡片"
+		_ = d.store.SaveProjectRun(run)
 		return run, nil
+	}
+	if err := d.store.SaveProjectRun(run); err != nil {
+		return model.ProjectRun{}, err
 	}
 	if err := d.dispatchProjectCard(run, by); err != nil {
 		run.Status = "failed"
@@ -141,7 +159,14 @@ func (d *Dispatcher) NoteProjectRun(task model.Task) {
 	}
 	if run.CurrentTaskID == task.ID {
 		if task.Archived {
-			d.failProjectRun(run, "卡片 "+task.ID+" 已归档，自动承接已关闭")
+			// Archiving is a deliberate human decision: the card left the
+			// queue, so keep the switch on and continue with the next card.
+			run.CurrentTaskID = ""
+			run.Detail = "卡片 " + task.ID + " 已归档，继续自动承接"
+			if err := d.store.SaveProjectRun(run); err != nil {
+				return
+			}
+			d.continueProjectRun(project, "自动承接")
 			return
 		}
 		if task.ColumnID == doing.ID {
@@ -152,39 +177,83 @@ func (d *Dispatcher) NoteProjectRun(task model.Task) {
 			return
 		}
 	}
-	if err := d.dispatchNextReady(project, "自动承接"); err != nil {
-		current, readErr := d.store.ProjectRun(project.ID)
-		if readErr == nil {
+	d.continueProjectRun(project, "自动承接")
+}
+
+// continueProjectRun dispatches the next ready card after the current one
+// left the queue. A dispatch error fails the run with the reason.
+func (d *Dispatcher) continueProjectRun(project model.Project, by string) {
+	if err := d.dispatchNextReady(project, by); err != nil {
+		if current, readErr := d.store.ProjectRun(project.ID); readErr == nil {
 			d.failProjectRun(current, err.Error())
 		}
 	}
 }
 
-func (d *Dispatcher) projectRunList(project model.Project) ([]string, string, error) {
+// projectRunList splits the switch's work queue: stalledDoing holds 进行中
+// cards whose execution record is already finished or unrecoverable (the
+// caller pushes them to 等你 instead of re-running them), ready holds cards
+// that were never started or wait in 待办 (dispatched fresh, doing before
+// intake), and blocked reports a card whose session is still alive.
+func (d *Dispatcher) projectRunList(project model.Project) (stalledDoing, ready []string, blocked string, err error) {
 	doing, hasDoing := project.ColumnByRole(model.ColumnRoleDoing)
 	intake, hasIntake := project.ColumnByRole(model.ColumnRoleIntake)
 	tasks, err := d.store.TasksByProject(project.ID, false)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
-	var stalled, ready []string
 	for _, task := range tasks {
 		if hasDoing && task.ColumnID == doing.ID {
 			execution, err := d.store.Execution(task.ID)
 			if err != nil {
-				return nil, "", err
+				return nil, nil, "", err
 			}
-			if execution != nil && execution.Active() && !execution.Stalled() {
-				return nil, task.ID, nil
+			if execution == nil {
+				// A claim without a record: the work never started, so a
+				// fresh dispatch is the push this card needs.
+				ready = append(ready, task.ID)
+				continue
 			}
-			stalled = append(stalled, task.ID)
+			if execution.Active() && !execution.Stalled() {
+				return nil, nil, task.ID, nil
+			}
+			stalledDoing = append(stalledDoing, task.ID)
 			continue
 		}
 		if hasIntake && task.ColumnID == intake.ID {
+			execution, err := d.store.Execution(task.ID)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			if execution != nil && execution.Active() && !execution.Stalled() {
+				return nil, nil, task.ID, nil
+			}
 			ready = append(ready, task.ID)
 		}
 	}
-	return append(stalled, ready...), "", nil
+	return stalledDoing, ready, "", nil
+}
+
+// pushStalledDoingCards moves finished-or-broken 进行中 cards to the review
+// column. Cards that cannot be pushed (no review column, lost a version race)
+// fall back to a plain re-dispatch so the queue still moves.
+func (d *Dispatcher) pushStalledDoingCards(project model.Project, ids []string, by string) []string {
+	var fallback []string
+	for _, id := range ids {
+		task, err := d.store.Task(id)
+		if err != nil {
+			continue
+		}
+		execution, err := d.store.Execution(id)
+		if err != nil || execution == nil {
+			continue
+		}
+		if d.advanceFinishedCard(project, task, *execution, by) {
+			continue
+		}
+		fallback = append(fallback, id)
+	}
+	return fallback
 }
 
 func (d *Dispatcher) dispatchProjectCard(run model.ProjectRun, by string) error {
@@ -199,7 +268,185 @@ func (d *Dispatcher) dispatchProjectCard(run model.ProjectRun, by string) error 
 	if err := d.store.SaveProjectRun(run); err != nil {
 		return err
 	}
-	return d.Dispatch(id, run.Runtime, by)
+	claimed, version, err := d.claimProjectCard(id, by)
+	if err != nil {
+		return err
+	}
+	if err := d.Dispatch(id, run.Runtime, by); err != nil {
+		if errors.Is(err, ErrInProgress) {
+			latest, readErr := d.store.ProjectRun(run.ProjectID)
+			if readErr != nil {
+				return readErr
+			}
+			latest.Detail = "等待卡片 " + id + " 的现有执行结束"
+			return d.store.SaveProjectRun(latest)
+		}
+		if latest, readErr := d.store.ProjectRun(run.ProjectID); readErr == nil {
+			latest.Status, latest.Detail = "failed", err.Error()
+			_ = d.store.SaveProjectRun(latest)
+		}
+		if claimed {
+			d.releaseProjectCard(id, version, by)
+		}
+		return err
+	}
+	return nil
+}
+
+// claimProjectCard moves an intake card into doing before automatic dispatch.
+// Existing doing cards already represent a claim and are left in place.
+func (d *Dispatcher) claimProjectCard(taskID, by string) (bool, int, error) {
+	task, err := d.store.Task(taskID)
+	if err != nil {
+		return false, 0, err
+	}
+	if task.Archived {
+		return false, 0, fmt.Errorf("卡片 %s 已归档，自动承接未派发", taskID)
+	}
+	project, err := d.store.Project(task.ProjectID)
+	if err != nil {
+		return false, 0, err
+	}
+	doing, ok := project.ColumnByRole(model.ColumnRoleDoing)
+	if !ok {
+		return false, 0, errors.New("项目没有进行中列")
+	}
+	if task.ColumnID == doing.ID {
+		return false, task.Version, nil
+	}
+	intake, ok := project.ColumnByRole(model.ColumnRoleIntake)
+	if !ok || task.ColumnID != intake.ID {
+		return false, 0, fmt.Errorf("卡片 %s 已离开待办列，自动承接未派发", taskID)
+	}
+	claimed, err := d.store.MoveTask(task.ID, task.Version, doing.ID, "", by)
+	if err != nil {
+		return false, 0, err
+	}
+	return true, claimed.Version, nil
+}
+
+// releaseProjectCard restores a claim only when the card is still at the
+// version created by our move. A concurrent user edit or move wins.
+func (d *Dispatcher) releaseProjectCard(taskID string, claimedVersion int, by string) {
+	task, err := d.store.Task(taskID)
+	if err != nil || task.Archived || task.Version != claimedVersion {
+		return
+	}
+	project, err := d.store.Project(task.ProjectID)
+	if err != nil {
+		return
+	}
+	doing, hasDoing := project.ColumnByRole(model.ColumnRoleDoing)
+	intake, hasIntake := project.ColumnByRole(model.ColumnRoleIntake)
+	if hasDoing && hasIntake && task.ColumnID == doing.ID {
+		_, _ = d.store.MoveTask(task.ID, task.Version, intake.ID, "", by)
+	}
+}
+
+// recoverProjectRuns reconciles durable project handoffs after service startup.
+// A current card still in intake is claimed without opening another session
+// when an execution record already exists.
+func (d *Dispatcher) recoverProjectRuns() error {
+	projects, err := d.store.Projects()
+	if err != nil {
+		return err
+	}
+	for _, project := range projects {
+		run, err := d.store.ProjectRun(project.ID)
+		if err == store.ErrNotFound {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !run.Running() {
+			continue
+		}
+		if run.CurrentTaskID == "" {
+			d.continueProjectRun(project, "自动承接恢复")
+			continue
+		}
+
+		task, err := d.store.Task(run.CurrentTaskID)
+		if err != nil {
+			d.failProjectRun(run, "自动承接恢复失败：当前卡片不存在")
+			continue
+		}
+		if task.Archived {
+			// 归档即离队：继续派发下一张，开关保持开启。
+			run.CurrentTaskID, run.Detail = "", "卡片 "+task.ID+" 已归档，继续自动承接"
+			if err := d.store.SaveProjectRun(run); err != nil {
+				return err
+			}
+			d.continueProjectRun(project, "自动承接恢复")
+			continue
+		}
+		doing, hasDoing := project.ColumnByRole(model.ColumnRoleDoing)
+		intake, hasIntake := project.ColumnByRole(model.ColumnRoleIntake)
+		if hasDoing && task.ColumnID == doing.ID || hasIntake && task.ColumnID == intake.ID {
+			wasDoing := hasDoing && task.ColumnID == doing.ID
+			execution, err := d.store.Execution(task.ID)
+			if err != nil {
+				return err
+			}
+			if execution != nil && execution.Active() && !execution.Stalled() {
+				// The session is still alive: resume tracking it and claim an
+				// intake card so the board shows where the work happens.
+				if _, _, err := d.claimProjectCard(task.ID, "自动承接恢复"); err != nil {
+					d.failProjectRun(run, err.Error())
+				}
+				continue
+			}
+			if execution != nil {
+				// The session is over (or a CLI process died with the last
+				// service): the card must not block the queue. One that was
+				// already worked moves to the review column; an intake card
+				// is dispatched again like any other queued card.
+				if wasDoing && d.advanceFinishedCard(project, task, *execution, "自动承接恢复") {
+					run.CurrentTaskID, run.Detail = "", ""
+					if err := d.store.SaveProjectRun(run); err != nil {
+						return err
+					}
+					d.continueProjectRun(project, "自动承接恢复")
+					continue
+				}
+				if wasDoing {
+					run.Detail = "等待卡片 " + task.ID + " 离开进行中后继续自动承接"
+					if err := d.store.SaveProjectRun(run); err != nil {
+						return err
+					}
+					continue
+				}
+				run.CurrentTaskID, run.Detail = "", ""
+				if err := d.store.SaveProjectRun(run); err != nil {
+					return err
+				}
+				d.continueProjectRun(project, "自动承接恢复")
+				continue
+			}
+			// No execution record: claim and start a fresh session.
+			claimed, version, err := d.claimProjectCard(task.ID, "自动承接恢复")
+			if err != nil {
+				d.failProjectRun(run, err.Error())
+				continue
+			}
+			if err := d.Dispatch(task.ID, run.Runtime, "自动承接恢复"); err != nil {
+				if claimed {
+					d.releaseProjectCard(task.ID, version, "自动承接恢复")
+				}
+				d.failProjectRun(run, err.Error())
+			}
+			continue
+		}
+
+		// The current card already left 进行中 before the service stopped.
+		run.CurrentTaskID, run.Detail = "", ""
+		if err := d.store.SaveProjectRun(run); err != nil {
+			return err
+		}
+		d.continueProjectRun(project, "自动承接恢复")
+	}
+	return nil
 }
 
 func (d *Dispatcher) dispatchNextReady(project model.Project, by string) error {
@@ -207,19 +454,24 @@ func (d *Dispatcher) dispatchNextReady(project model.Project, by string) error {
 	if err != nil || !run.Running() || run.CurrentTaskID != "" {
 		return err
 	}
-	ids, blocked, err := d.projectRunList(project)
+	stalledDoing, ready, blocked, err := d.projectRunList(project)
 	if err != nil {
 		return err
 	}
 	if blocked != "" {
 		run.CurrentTaskID = blocked
 		run.Detail = "等待卡片 " + blocked + " 的现有执行结束"
-		return d.store.SaveProjectRun(run)
+		if err := d.store.SaveProjectRun(run); err != nil {
+			return err
+		}
+		_, _, err = d.claimProjectCard(blocked, by)
+		return err
 	}
-	run.TaskIDs = ids
+	ready = append(d.pushStalledDoingCards(project, stalledDoing, by), ready...)
+	run.TaskIDs = ready
 	run.Cursor = 0
 	run.Detail = ""
-	if len(ids) == 0 {
+	if len(ready) == 0 {
 		run.Detail = "等待下一张卡片"
 		return d.store.SaveProjectRun(run)
 	}
@@ -229,9 +481,10 @@ func (d *Dispatcher) dispatchNextReady(project model.Project, by string) error {
 	return d.dispatchProjectCard(run, by)
 }
 
-// finishProjectCard runs after a project-run dispatch returns. If the Agent
-// turn returned normally but left the card in 进行中, keep the switch enabled
-// and wait for a human to move the card; never start another session for it.
+// finishProjectCard runs after a project-run dispatch returns. The switch
+// stays enabled: a converged session (returned, failed, released) has its
+// card pushed to 等你 by the service and the next card starts right away.
+// Completion stays with the human — the card is never moved to 完成.
 func (d *Dispatcher) finishProjectCard(taskID string) {
 	d.projectRunMu.Lock()
 	defer d.projectRunMu.Unlock()
@@ -239,8 +492,9 @@ func (d *Dispatcher) finishProjectCard(taskID string) {
 	// enabled so the next dispatcher can resume tracking the existing session
 	// and continue the project after the app restarts.
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.closed {
+	closed := d.closed
+	d.mu.Unlock()
+	if closed {
 		return
 	}
 	task, err := d.store.Task(taskID)
@@ -256,14 +510,97 @@ func (d *Dispatcher) finishProjectCard(taskID string) {
 		return
 	}
 	doing, ok := project.ColumnByRole(model.ColumnRoleDoing)
-	if ok && task.ColumnID == doing.ID {
-		execution, err := d.store.Execution(task.ID)
-		if err == nil && execution != nil && execution.Status == "returned" {
-			run.Detail = "等待卡片 " + task.ID + " 离开进行中后继续自动承接"
+	if !ok || task.ColumnID != doing.ID {
+		return
+	}
+	execution, err := d.store.Execution(task.ID)
+	if err != nil || execution == nil || !execution.Ended() {
+		d.failProjectRun(run, "卡片 "+task.ID+" 执行失败且仍在进行中，承接停止")
+		return
+	}
+	if d.advanceFinishedCard(project, task, *execution, "自动承接") {
+		run.CurrentTaskID, run.Detail = "", ""
+		if err := d.store.SaveProjectRun(run); err != nil {
+			return
+		}
+		d.continueProjectRun(project, "自动承接")
+		return
+	}
+	// No review column, or the move lost a race with a human edit: wait for a
+	// human instead of silently blocking the queue.
+	run.Detail = "等待卡片 " + task.ID + " 离开进行中后继续自动承接"
+	_ = d.store.SaveProjectRun(run)
+}
+
+// parkProjectCardForApproval moves a Herdr task that needs a human decision
+// out of the active queue, then lets the project run inspect the next card.
+// Its execution record remains active so no second writer can be dispatched
+// for this task while approval is pending.
+func (d *Dispatcher) parkProjectCardForApproval(taskID string) {
+	d.projectRunMu.Lock()
+	defer d.projectRunMu.Unlock()
+	task, err := d.store.Task(taskID)
+	if err != nil || task.Archived {
+		return
+	}
+	run, err := d.store.ProjectRun(task.ProjectID)
+	if err != nil || !run.Running() || run.CurrentTaskID != task.ID {
+		return
+	}
+	project, err := d.store.Project(task.ProjectID)
+	if err != nil {
+		return
+	}
+	if doing, ok := project.ColumnByRole(model.ColumnRoleDoing); ok && task.ColumnID == doing.ID {
+		review, hasReview := project.ColumnByRole(model.ColumnRoleReview)
+		if !hasReview {
+			run.Detail = "卡片 " + task.ID + " 等待人工审批，但项目没有用户等待列"
 			_ = d.store.SaveProjectRun(run)
 			return
 		}
-		d.failProjectRun(run, "卡片 "+task.ID+" 执行失败且仍在进行中，承接停止")
+		if _, err := d.store.MoveTask(task.ID, task.Version, review.ID, "", "自动承接"); err != nil {
+			run.Detail = "卡片 " + task.ID + " 等待人工审批，移入「等你」失败：" + err.Error()
+			_ = d.store.SaveProjectRun(run)
+			return
+		}
+		_ = d.comment(task.ID, "自动承接", "自动承接：当前会话等待人工审批，卡片移入「等你」；请完成审批或在评论中继续跟进。自动承接将继续检查后续卡片。")
+	}
+	run.CurrentTaskID, run.Detail = "", ""
+	if err := d.store.SaveProjectRun(run); err != nil {
+		return
+	}
+	d.continueProjectRun(project, "自动承接")
+}
+
+// advanceFinishedCard pushes a finished card out of 进行中 into the project's
+// review column and writes a short service comment explaining the move. The
+// card is never moved to the done column: finishing work is still confirmed
+// by a human. It reports whether the card actually moved.
+func (d *Dispatcher) advanceFinishedCard(project model.Project, task model.Task, execution model.Execution, by string) bool {
+	if task.Archived {
+		return false
+	}
+	review, ok := project.ColumnByRole(model.ColumnRoleReview)
+	if !ok || task.ColumnID == review.ID {
+		return false
+	}
+	if _, err := d.store.MoveTask(task.ID, task.Version, review.ID, "", by); err != nil {
+		return false
+	}
+	_ = d.comment(task.ID, by, finishedCardReason(execution))
+	return true
+}
+
+func finishedCardReason(execution model.Execution) string {
+	switch execution.Status {
+	case "returned", "succeeded":
+		return "自动承接：会话已返回，卡片自动移入「等你」；是否完成由人工确认。"
+	case "released":
+		return "自动承接：原会话已不可达并释放写锁，卡片自动移入「等你」等待人工处理。"
+	case "disconnected":
+		return "自动承接：原会话已中断且无法恢复，卡片自动移入「等你」等待人工处理。"
+	default:
+		return "自动承接：执行失败（" + execution.Status + "），卡片自动移入「等你」等待人工处理。"
 	}
 }
 
