@@ -1,7 +1,7 @@
 {
   "name": "Taskboard",
   "identifier": "dev.douba.taskboard",
-  "version": "0.1.65",
+  "version": "0.1.81",
   "buildCommand": "python3 scripts/generate_version.py",
   "main": "./cmd/taskboard",
   "out": "build"
