@@ -124,6 +124,29 @@ type detail struct {
 	// focus lands) does not immediately fall back to Markdown.
 	bodyEditSeenFocus bool
 
+	// editTable is true while one Markdown block (table or inter-table
+	// plain segment) is open as source; tableStart/tableEnd index that
+	// range in body, tableEdit holds the draft. Named for the table case
+	// that motivated Typora-style editing; plain segments reuse it.
+	editTable          bool
+	tableStart         int
+	tableEnd           int
+	tableEdit          string
+	tableEditSeenFocus bool
+	// tableTop places the caret at the head once when the block editor opens
+	// (fresh TextArea defaults to the end, which hides long pipe tables).
+	tableTop bool
+
+	// commentBlock* mirrors body block-edit for one comment's table (or
+	// plain segment between tables). Write-back updates the comment via API.
+	commentBlockID        string
+	commentBlockBase      string // full comment text while a block is open
+	commentBlockStart     int
+	commentBlockEnd       int
+	commentBlockEdit      string
+	commentBlockSeenFocus bool
+	commentBlockTop       bool
+
 	// bodyTop scrolls the body to its first line once, when the dialog
 	// opens: a fresh TextArea puts the caret at the end of the text and
 	// reveals it, which for a long description leaves the head hidden.
@@ -138,7 +161,138 @@ type detail struct {
 
 // dirty reports whether the dialog holds edits the user has not saved.
 func (d *detail) dirty() bool {
-	return d.bodyImage.busy() || strings.TrimSpace(d.title) != d.snap.Title || d.body != d.snap.Description
+	return d.bodyImage.busy() || strings.TrimSpace(d.title) != d.snap.Title || d.liveBody() != d.snap.Description
+}
+
+// liveBody is the description including an in-progress table-block draft.
+func (d *detail) liveBody() string {
+	if d == nil {
+		return ""
+	}
+	if d.editTable {
+		return spliceBodyRange(d.body, d.tableStart, d.tableEnd, d.tableEdit)
+	}
+	return d.body
+}
+
+// commitTableEdit writes the table-block draft back into body and leaves
+// block-edit mode.
+func (d *detail) commitTableEdit() {
+	if d == nil || !d.editTable {
+		return
+	}
+	d.body = spliceBodyRange(d.body, d.tableStart, d.tableEnd, d.tableEdit)
+	d.editTable = false
+	d.tableEditSeenFocus = false
+	d.tableTop = false
+	d.tableStart, d.tableEnd = 0, 0
+	d.tableEdit = ""
+}
+
+// beginTableEdit opens source editing for body[start:end], committing any
+// prior table draft first and shifting offsets when that draft changed length.
+func (d *detail) beginTableEdit(start, end int) {
+	if d == nil {
+		return
+	}
+	d.editBody = false
+	d.bodyEditSeenFocus = false
+	if d.editTable {
+		oldStart, oldEnd := d.tableStart, d.tableEnd
+		oldLen := oldEnd - oldStart
+		newLen := len(d.tableEdit)
+		d.body = spliceBodyRange(d.body, oldStart, oldEnd, d.tableEdit)
+		d.editTable = false
+		d.tableEditSeenFocus = false
+		delta := newLen - oldLen
+		if start >= oldEnd {
+			start += delta
+			end += delta
+		} else if end <= oldStart {
+			// earlier table: offsets unchanged
+		} else {
+			// overlapped the table just committed; edit the spliced range
+			start, end = oldStart, oldStart+newLen
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(d.body) {
+		end = len(d.body)
+	}
+	if start > end {
+		start = end
+	}
+	d.editTable = true
+	d.tableStart = start
+	d.tableEnd = end
+	d.tableEdit = d.body[start:end]
+	d.tableEditSeenFocus = false
+	d.tableTop = true
+}
+
+// beginCommentBlockEdit opens source editing for comment text[start:end].
+func (d *detail) beginCommentBlockEdit(id, text string, start, end int) {
+	if d == nil || id == "" {
+		return
+	}
+	d.commentEditID, d.commentEditText = "", ""
+	if d.commentBlockID != "" && d.commentBlockID != id {
+		d.clearCommentBlockEdit()
+	}
+	base := text
+	if d.commentBlockID == id {
+		oldStart, oldEnd := d.commentBlockStart, d.commentBlockEnd
+		oldLen := oldEnd - oldStart
+		newLen := len(d.commentBlockEdit)
+		base = spliceBodyRange(d.commentBlockBase, oldStart, oldEnd, d.commentBlockEdit)
+		delta := newLen - oldLen
+		if start >= oldEnd {
+			start += delta
+			end += delta
+		} else if end <= oldStart {
+			// earlier range
+		} else {
+			start, end = oldStart, oldStart+newLen
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(base) {
+		end = len(base)
+	}
+	if start > end {
+		start = end
+	}
+	d.commentBlockID = id
+	d.commentBlockBase = base
+	d.commentBlockStart = start
+	d.commentBlockEnd = end
+	d.commentBlockEdit = base[start:end]
+	d.commentBlockSeenFocus = false
+	d.commentBlockTop = true
+}
+
+func (d *detail) clearCommentBlockEdit() {
+	if d == nil {
+		return
+	}
+	d.commentBlockID = ""
+	d.commentBlockBase = ""
+	d.commentBlockStart, d.commentBlockEnd = 0, 0
+	d.commentBlockEdit = ""
+	d.commentBlockSeenFocus = false
+	d.commentBlockTop = false
+}
+
+// liveCommentText returns comment text with an in-progress block draft spliced in.
+func (d *detail) liveCommentText(id, base string) string {
+	if d == nil || d.commentBlockID != id {
+		return base
+	}
+	return spliceBodyRange(d.commentBlockBase, d.commentBlockStart, d.commentBlockEnd, d.commentBlockEdit)
 }
 
 // stale reports whether an agent pushed a newer version while the dialog
@@ -1276,6 +1430,7 @@ func (b *board) saveDetail() {
 		b.toast("无法保存", "标题不能为空。")
 		return
 	}
+	d.commitTableEdit()
 	body := d.body
 	cur := *t
 	if !d.dirty() && title == cur.Title && body == cur.Description {
@@ -1628,8 +1783,61 @@ func (b *board) beginCommentEdit(cm model.Comment) {
 	if b.detail == nil || cm.Author != b.agent || b.commenting {
 		return
 	}
+	b.detail.clearCommentBlockEdit()
 	b.detail.commentEditID = cm.ID
 	b.detail.commentEditText = cm.Text
+}
+
+// commitCommentBlockEdit splices the in-place comment block draft and saves.
+func (b *board) commitCommentBlockEdit() {
+	d := b.detail
+	if d == nil || d.commentBlockID == "" || b.commenting {
+		return
+	}
+	base := d.commentBlockBase
+	text := strings.TrimSpace(d.liveCommentText(d.commentBlockID, base))
+	id, taskID := d.commentBlockID, d.id
+	orig := ""
+	for _, cm := range d.comments {
+		if cm.ID == id {
+			orig = cm.Text
+			break
+		}
+	}
+	d.clearCommentBlockEdit()
+	if text == "" {
+		b.toast("无法保存评论", "评论内容不能为空")
+		return
+	}
+	if text == strings.TrimSpace(orig) {
+		return
+	}
+	// Optimistic local update so switching blocks sees the new text immediately.
+	for i := range d.comments {
+		if d.comments[i].ID == id {
+			d.comments[i].Text = text
+			break
+		}
+	}
+	b.commenting = true
+	go func() {
+		cm, err := b.api.UpdateComment(taskID, id, text)
+		b.post(func() {
+			b.commenting = false
+			if err != nil {
+				b.toast("编辑评论失败", err.Error())
+				return
+			}
+			if b.detail == d {
+				d.comments = applyCommentMutation(d.comments, model.EventCommentUpdated, cm)
+			}
+			for i := range b.tasks {
+				if b.tasks[i].ID == taskID {
+					b.tasks[i].Comments = applyCommentMutation(b.tasks[i].Comments, model.EventCommentUpdated, cm)
+				}
+			}
+		})
+	}()
 }
 
 func (b *board) beginCommentReply(cm model.Comment) {

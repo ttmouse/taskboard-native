@@ -1864,22 +1864,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					b.imageInput(bodyInput, d, &d.body, &d.bodyImage, mygo.Clipboard.ReadImage)
 					b.imageRemoveControls(c, &d.body, &d.bodyImage, "正文")
 				} else {
-					body := ui.Box(c.Key("detail-body")).FillWidth().MinHeight(t.Space(8))
-					body.Children(func() {
-						if strings.TrimSpace(d.body) == "" {
-							ui.Text(c, "添加任务描述，可粘贴图片…").FontSize(fsm(t)).TextColor(t.TextMuted)
-						} else {
-							b.detailMarkdown(c, d.body)
-						}
-						edit := ui.ButtonBase(c.Key("detail-body-edit")).Absolute().Fill().
-							Padding(0).BorderWidth(0).Background(ui.Transparent).
-							Focusable().Cursor(ui.CursorPointer).Label("编辑任务正文")
-						if edit.Clicked() {
-							d.editBody = true
-							d.bodyTop = true
-							d.bodyEditSeenFocus = false
-						}
-					})
+					b.detailBodyView(c, d)
 				}
 
 				ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(t.Space(3)).Children(func() {
@@ -2286,7 +2271,17 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 			})
 	})
 	if pane.OverlayShortcut(0, ui.KeyEscape) {
-		open = false
+		// Prefer leaving an in-place body/table/comment editor over dismissing the sheet.
+		if d.editTable {
+			d.commitTableEdit()
+		} else if d.commentBlockID != "" {
+			b.commitCommentBlockEdit()
+		} else if d.editBody {
+			d.editBody = false
+			d.bodyEditSeenFocus = false
+		} else {
+			open = false
+		}
 	}
 	if b.detail != d {
 		return // Saving can dismiss this detail while its view is being built.
@@ -2405,10 +2400,10 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 					}
 					if ui.Button(c.Key("cancel-comment-"+cm.ID), "取消").Disabled(b.commenting).Clicked() {
 						d.commentEditID, d.commentEditText = "", ""
-					}
+				}
 				})
 			} else {
-				b.detailMarkdown(c, commentMarkdown(cm.Text))
+				b.commentBodyView(c, d, cm)
 			}
 			// Per-reply ConversationLink (DSH pattern): Herdr bubble under
 			// AI replies, not in the detail title bar.
