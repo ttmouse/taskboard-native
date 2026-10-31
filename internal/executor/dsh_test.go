@@ -150,8 +150,9 @@ func TestDispatchRunsFakeCLIWithoutClaimingOrWritingOutcome(t *testing.T) {
 		return err == nil && run != nil && run.Status == "returned", fmt.Sprint(run, err)
 	})
 	cur, _ := st.Task(task.ID)
-	if cur.ColumnID != task.ColumnID || cur.Version != task.Version {
-		t.Fatalf("dispatcher changed task: %+v", cur)
+	doing, _ := p.ColumnByRole("doing")
+	if cur.ColumnID != doing.ID || cur.Version != task.Version+1 {
+		t.Fatalf("accepted dispatch did not move task into doing: %+v", cur)
 	}
 	if run, _ := st.Execution(task.ID); run.SessionID != "herdr:test-terminal-1" {
 		t.Fatalf("execution did not retain Herdr terminal: %+v", run)

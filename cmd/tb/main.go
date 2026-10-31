@@ -79,6 +79,8 @@ func run(args []string) int {
 		return cmdFollowup(rest)
 	case "archive":
 		return cmdArchive(rest)
+	case "relation":
+		return cmdRelation(rest)
 	case "execution":
 		return cmdExecution(rest)
 	case "serve":
@@ -107,6 +109,7 @@ func usage() {
   tb followup <taskID> <commentID>
   tb execution release <taskID>     # 执行记录收敛为 released（释放写锁）
   tb archive <taskID>
+  tb relation add|remove <taskID> <parent|blocks|blocked_by|related> <relatedID>
   tb serve   [--addr ADDR] [--db PATH] [--detach]
 
 Environment: TASKBOARD_ADDR, TASKBOARD_DB, TB_AGENT.
@@ -577,6 +580,46 @@ func cmdComment(args []string) int {
 	return exitOK
 }
 
+
+
+func cmdRelation(args []string) int {
+	fs := flag.NewFlagSet("relation", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	addr := fs.String("addr", "", "service address")
+	agent := fs.String("agent", "", "agent identity")
+	if err := fs.Parse(reorderArgs(args)); err != nil {
+		fmt.Fprintf(os.Stderr, "tb relation: %v\n", err)
+		return exitUsage
+	}
+	if fs.NArg() != 4 {
+		fmt.Fprintln(os.Stderr, "tb relation: usage: tb relation add|remove <taskID> <parent|blocks|blocked_by|related> <relatedID>")
+		return exitUsage
+	}
+	op, taskID, kind, relatedID := fs.Arg(0), fs.Arg(1), fs.Arg(2), fs.Arg(3)
+	switch op {
+	case "add", "remove":
+	default:
+		fmt.Fprintln(os.Stderr, "tb relation: usage: tb relation add|remove <taskID> <parent|blocks|blocked_by|related> <relatedID>")
+		return exitUsage
+	}
+	switch kind {
+	case "parent", "blocks", "blocked_by", "related":
+	default:
+		fmt.Fprintln(os.Stderr, "tb relation: type must be parent, blocks, blocked_by, or related")
+		return exitUsage
+	}
+	c, err := ensureClient(*addr, *agent)
+	if err != nil {
+		return fail(err)
+	}
+	res, err := c.changeRelation(op == "remove", taskID, kind, relatedID)
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Printf("%s\tv%d\t%s\t%s\n", res.Task.ID, res.Task.Version, op, kind)
+	return exitOK
+}
+
 func cmdArchive(args []string) int {
 	fs := flag.NewFlagSet("archive", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -971,6 +1014,22 @@ func (c *client) setColumnRole(projectID, columnID, role string) (json.RawMessag
 	var out json.RawMessage
 	path := "/api/projects/" + url.PathEscape(projectID) + "/columns/" + url.PathEscape(columnID)
 	return out, c.send(http.MethodPatch, path, body, &out, http.StatusOK)
+}
+
+
+
+func (c *client) changeRelation(remove bool, taskID, kind, relatedID string) (model.RelationResult, error) {
+	current, err := c.task(taskID)
+	if err != nil {
+		return model.RelationResult{}, err
+	}
+	method := http.MethodPost
+	if remove {
+		method = http.MethodDelete
+	}
+	var out model.RelationResult
+	path := "/api/tasks/" + taskID + "/relations/" + kind + "/" + relatedID
+	return out, c.send(method, path, map[string]any{"version": current.Version}, &out, http.StatusOK)
 }
 
 func (c *client) archiveTask(taskID string) (model.Task, error) {

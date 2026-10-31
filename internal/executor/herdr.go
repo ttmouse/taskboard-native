@@ -111,6 +111,11 @@ func herdrTerminalAddress(raw []byte) (string, error) {
 
 const herdrSessionPrefix = "herdr:"
 
+// HerdrInitialTurnPendingDetail marks the terminal-created window before the
+// first agent turn exists. Cards use it to avoid offering a conversation link
+// until there is a conversation to open.
+const HerdrInitialTurnPendingDetail = "Herdr terminal 已创建，等待初始 turn 开始"
+
 func herdrAddress(sessionID string) (string, bool) {
 	address := strings.TrimPrefix(sessionID, herdrSessionPrefix)
 	return address, address != sessionID && address != ""
@@ -358,7 +363,7 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 			// reservation live until a turn was observed or an exit was reported.
 			if status.Turn == 0 && status.ExitCode == nil {
 				idleSince = time.Time{}
-				run.Status, run.Detail = "running", "Herdr terminal 已创建，等待初始 turn 开始"
+				run.Status, run.Detail = "running", HerdrInitialTurnPendingDetail
 				_ = d.store.SaveExecution(*run)
 				break
 			}
@@ -404,7 +409,6 @@ func (d *Dispatcher) sendHerdrFollowup(ctx context.Context, taskID, actor string
 	}
 	run.Status, run.Detail = "running", "评论已发送到原 Herdr terminal"
 	_ = d.store.SaveExecution(*run)
-	d.syncRunningTaskColumn(taskID, actor)
 	d.setFollowup(run.FollowupID, "sent")
 	d.trackHerdr(ctx, run)
 }

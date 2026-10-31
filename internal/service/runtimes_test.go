@@ -77,7 +77,8 @@ func TestDispatchHTTPChannels(t *testing.T) {
 					}
 				}
 				if selected != executor.RuntimeDSH && err == nil && current.Execution != nil && current.Execution.Status == "returned" {
-					if current.ColumnID != p.Columns[0].ID || !strings.HasPrefix(current.Execution.SessionID, "herdr:") {
+					doing, _ := p.ColumnByRole(model.ColumnRoleDoing)
+					if current.ColumnID != doing.ID || !strings.HasPrefix(current.Execution.SessionID, "herdr:") {
 						t.Fatalf("result=%+v", current)
 					}
 					return

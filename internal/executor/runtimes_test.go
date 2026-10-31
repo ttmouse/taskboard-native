@@ -74,8 +74,9 @@ func TestAllRuntimeOutcomes(t *testing.T) {
 				t.Fatalf("execution = %+v, err=%v", run, err)
 			}
 			cur, _ := st.Task(task.ID)
-			if cur.ColumnID != p.Columns[0].ID || cur.Version != task.Version {
-				t.Fatalf("dispatcher changed task workflow: %+v", cur)
+			doing, _ := p.ColumnByRole("doing")
+			if cur.ColumnID != doing.ID || cur.Version != task.Version+1 {
+				t.Fatalf("accepted dispatch did not move task into doing: %+v", cur)
 			}
 			comments, _ := st.Comments(task.ID)
 			if len(comments) != 2 || !strings.Contains(comments[0].Text, "派发 "+runtime.ID+" 执行") || !strings.Contains(comments[1].Text, "已交给 Herdr") {
@@ -113,8 +114,9 @@ func TestAllRuntimeCancellation(t *testing.T) {
 				t.Fatalf("closing tracking changed the Herdr session: %+v %v", run, err)
 			}
 			cur, _ := st.Task(task.ID)
-			if cur.ColumnID != p.Columns[0].ID {
-				t.Fatalf("dispatcher moved task after closing tracking: %+v", cur)
+			doing, _ := p.ColumnByRole("doing")
+			if cur.ColumnID != doing.ID || cur.Version != task.Version+1 {
+				t.Fatalf("accepted dispatch did not retain task in doing after closing tracking: %+v", cur)
 			}
 			if _, err := os.Stat(sendsLog); !os.IsNotExist(err) {
 				t.Fatalf("dispatcher unexpectedly sent to or killed the Herdr terminal: %v", err)

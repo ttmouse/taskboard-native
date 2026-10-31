@@ -163,15 +163,24 @@ func (s *Store) PatchTask(id string, version int, patch TaskPatch, by string) (m
 	if patch.Assignee != nil {
 		t.Assignee = *patch.Assignee
 	}
-	if patch.ColumnID != nil {
+	if patch.ColumnID != nil || restore {
 		p, err := s.projectLocked(ctx, t.ProjectID)
 		if err != nil {
 			return t, err
 		}
-		if err := hasColumn(p, *patch.ColumnID); err != nil {
-			return t, err
+		destination := t.ColumnID
+		if patch.ColumnID != nil {
+			if err := hasColumn(p, *patch.ColumnID); err != nil {
+				return t, err
+			}
+			destination = *patch.ColumnID
 		}
-		t.ColumnID = *patch.ColumnID
+		if restore || destination != t.ColumnID {
+			if err := s.assertUnblockedForColumnLocked(ctx, t, p, destination); err != nil {
+				return t, err
+			}
+		}
+		t.ColumnID = destination
 	}
 
 	var stmts []sqlite.Statement
@@ -592,6 +601,7 @@ func (s *Store) DeleteProject(id, by string) error {
 		{SQL: `DELETE FROM followups WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)`, Args: []any{id}},
 		{SQL: `DELETE FROM executions WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)`, Args: []any{id}},
 		{SQL: `DELETE FROM comments WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)`, Args: []any{id}},
+		{SQL: `DELETE FROM task_relations WHERE source_task_id IN (SELECT id FROM tasks WHERE project_id = ?) OR target_task_id IN (SELECT id FROM tasks WHERE project_id = ?)`, Args: []any{id, id}},
 		{SQL: `DELETE FROM tasks WHERE project_id = ?`, Args: []any{id}},
 		{SQL: `DELETE FROM "columns" WHERE project_id = ?`, Args: []any{id}},
 		{SQL: `DELETE FROM projects WHERE id = ?`, Args: []any{id}},

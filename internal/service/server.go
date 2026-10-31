@@ -190,10 +190,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/tasks", s.handleTasks)
 	mux.HandleFunc("POST /api/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleTask)
+	mux.HandleFunc("GET /api/tasks/{id}/handoff-log", s.handleHandoffLog)
 	mux.HandleFunc("POST /api/tasks/{id}/images", s.handleUploadImage)
 	mux.HandleFunc("POST /api/images", s.handleUploadStandaloneImage)
 	mux.HandleFunc("GET /api/images/{hash}", s.handleImage)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.handlePatchTask)
+	mux.HandleFunc("POST /api/tasks/{id}/relations/{type}/{relatedId}", s.handleAddTaskRelation)
+	mux.HandleFunc("DELETE /api/tasks/{id}/relations/{type}/{relatedId}", s.handleRemoveTaskRelation)
 	mux.HandleFunc("POST /api/tasks/{id}/archive", s.handleArchive)
 	mux.HandleFunc("POST /api/tasks/{id}/dispatch", s.handleDispatch)
 	mux.HandleFunc("POST /api/tasks/{id}/execution/release", s.handleReleaseExecution)
@@ -645,6 +648,27 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
+func (s *Server) handleHandoffLog(w http.ResponseWriter, r *http.Request) {
+	task, err := s.store.Task(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	events, err := executor.ReadTaskHandoffEvents(s.DBPath+".auto-handoff.jsonl", task.ID, executor.DefaultHandoffLogLimit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if events == nil {
+		events = []executor.HandoffEvent{}
+	}
+	writeJSON(w, http.StatusOK, executor.HandoffLogView{
+		TaskID:  task.ID,
+		Summary: executor.SummarizeHandoff(events),
+		Events:  events,
+	})
+}
+
 type newTask struct {
 	ProjectID   string `json:"projectId"`
 	ColumnID    string `json:"columnId"`
@@ -750,6 +774,63 @@ func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
+type taskRelationRequest struct {
+	Version *int `json:"version"`
+}
+type taskRelationResponse struct {
+	Task        model.Task `json:"task"`
+	RelatedTask model.Task `json:"relatedTask"`
+}
+
+func (s *Server) handleAddTaskRelation(w http.ResponseWriter, r *http.Request) {
+	var req taskRelationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Version == nil {
+		writeBadRequest(w, "version is required")
+		return
+	}
+	relType := r.PathValue("type")
+	switch relType {
+	case store.RelationParent, store.RelationBlocks, store.RelationBlockedBy, store.RelationRelated:
+	default:
+		writeBadRequest(w, "relation type must be parent, blocks, blocked_by, or related")
+		return
+	}
+	result, err := s.store.AddTaskRelation(r.PathValue("id"), *req.Version, relType, r.PathValue("relatedId"), agent(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, taskRelationResponse{Task: result.Task, RelatedTask: result.RelatedTask})
+}
+
+func (s *Server) handleRemoveTaskRelation(w http.ResponseWriter, r *http.Request) {
+	var req taskRelationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Version == nil {
+		writeBadRequest(w, "version is required")
+		return
+	}
+	relType := r.PathValue("type")
+	switch relType {
+	case store.RelationParent, store.RelationBlocks, store.RelationBlockedBy, store.RelationRelated:
+	default:
+		writeBadRequest(w, "relation type must be parent, blocks, blocked_by, or related")
+		return
+	}
+	result, err := s.store.RemoveTaskRelation(r.PathValue("id"), *req.Version, relType, r.PathValue("relatedId"), agent(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, taskRelationResponse{Task: result.Task, RelatedTask: result.RelatedTask})
+}
+
+
 type archiveRequest struct {
 	Version *int `json:"version"`
 }
@@ -780,6 +861,7 @@ type dispatchRequest struct {
 // and the automatic Herdr grace window is not enough (or never applied). A run
 // that may still be writing is refused: releasing it would allow a second
 // writer on the same card.
+
 func (s *Server) handleReleaseExecution(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	run, err := s.store.Execution(taskID)
@@ -831,7 +913,15 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if runtime == "" {
 		runtime = executor.RuntimeDSH
 	}
+	if !executor.KnownRuntime(runtime) {
+		writeBadRequest(w, "unknown runtime %q", runtime)
+		return
+	}
 	taskID := r.PathValue("id")
+	if err := s.store.AssertUnblocked(taskID); err != nil {
+		writeError(w, err)
+		return
+	}
 	if err := s.dispatch.Dispatch(taskID, runtime, agent(r)); err != nil {
 		if errors.Is(err, executor.ErrInProgress) {
 			writeJSON(w, http.StatusConflict, errorBody{Error: "dispatch_in_progress"})

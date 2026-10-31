@@ -112,8 +112,9 @@ func TestDesktopDispatchTracksRealTurnAndWritesSession(t *testing.T) {
 		return e != nil && e.Status == "returned", fmt.Sprint(e)
 	})
 	cur, _ := st.Task(task.ID)
-	if cur.ColumnID != task.ColumnID || cur.Version != task.Version {
-		t.Fatalf("program changed card: %+v", cur)
+	doing, _ := p.ColumnByRole("doing")
+	if cur.ColumnID != doing.ID || cur.Version != task.Version+1 {
+		t.Fatalf("accepted desktop dispatch did not move card into doing: %+v", cur)
 	}
 	comments, _ := st.Comments(task.ID)
 	all := fmt.Sprint(comments)
@@ -178,8 +179,9 @@ func TestDesktopWaitingApprovalAndCloseDetach(t *testing.T) {
 		return strings.Contains(s, "等待你的确认"), s
 	})
 	cur, _ := st.Task(task.ID)
-	if cur.ColumnID != p.Columns[0].ID {
-		t.Fatal("program claimed waiting task")
+	doing, _ := p.ColumnByRole("doing")
+	if cur.ColumnID != doing.ID {
+		t.Fatal("accepted desktop dispatch did not move task into doing")
 	}
 	d.Close()
 	cs, _ := st.Comments(task.ID)

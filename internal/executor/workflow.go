@@ -2,8 +2,9 @@ package executor
 
 import "taskboard-native/internal/model"
 
-// syncRunningTaskColumn reflects an accepted comment follow-up in the board's
-// workflow. New single-task dispatches remain owned by the execution Agent.
+// syncRunningTaskColumn reflects a channel-accepted session in the board's
+// workflow. A card already in doing is left unchanged; otherwise, accepted
+// work belongs in the active-work column while its session is running.
 func (d *Dispatcher) syncRunningTaskColumn(taskID, by string) {
 	task, err := d.store.Task(taskID)
 	if err != nil || task.Archived {
@@ -22,6 +23,6 @@ func (d *Dispatcher) syncRunningTaskColumn(taskID, by string) {
 		if readErr == nil && !latest.Archived && latest.ColumnID == doing.ID {
 			return
 		}
-		d.comment(taskID, by, "跟进已开始，但卡片未能自动移到「进行中」；请检查当前卡片状态："+err.Error())
+		d.comment(taskID, by, "执行已开始，但卡片未能自动移到「进行中」；请检查当前卡片状态："+err.Error())
 	}
 }

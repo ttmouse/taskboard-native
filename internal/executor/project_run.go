@@ -56,44 +56,63 @@ func (d *Dispatcher) DeleteProject(projectID, by string) error {
 func (d *Dispatcher) StartProjectRun(projectID, runtime, by string) (model.ProjectRun, error) {
 	d.projectRunMu.Lock()
 	defer d.projectRunMu.Unlock()
+	d.logHandoff(handoffEvent{Event: "run.start_requested", ProjectID: projectID, Runtime: runtime, Actor: by})
 	if _, ok := runtimeDefinitionFor(runtime); !ok {
+		d.logHandoff(handoffEvent{Event: "run.start_rejected", ProjectID: projectID, Runtime: runtime, Actor: by, Reason: "unknown_runtime"})
 		return model.ProjectRun{}, &store.InvalidError{Msg: fmt.Sprintf("unknown runtime %q", runtime)}
 	}
 	project, err := d.store.Project(projectID)
 	if err != nil {
+		d.logHandoff(handoffEvent{Event: "run.start_rejected", ProjectID: projectID, Runtime: runtime, Actor: by, Reason: "project_unavailable", ErrorType: errorType(err)})
 		return model.ProjectRun{}, err
 	}
 	dir := strings.TrimSpace(project.WorkspacePath)
 	if dir == "" {
+		d.logHandoff(handoffEvent{Event: "run.start_rejected", ProjectID: projectID, Runtime: runtime, Actor: by, Reason: "workspace_missing"})
 		return model.ProjectRun{}, &store.InvalidError{Msg: fmt.Sprintf("project %q has no workspacePath; set one before dispatching", project.Name)}
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		d.logHandoff(handoffEvent{Event: "run.start_rejected", ProjectID: projectID, Runtime: runtime, Actor: by, Reason: "workspace_unavailable", ErrorType: errorType(err)})
 		return model.ProjectRun{}, &store.InvalidError{Msg: fmt.Sprintf("workspacePath %q is not a directory on this machine", dir)}
 	}
 	if current, err := d.store.ProjectRun(projectID); err == nil && current.Running() {
+		d.logHandoff(handoffEvent{Event: "run.start_rejected", ProjectID: projectID, Runtime: runtime, Actor: by, RunStatus: current.Status, TaskID: current.CurrentTaskID, Reason: "already_running"})
 		return model.ProjectRun{}, &ErrProjectBusy{Msg: "该项目已有一轮承接在进行"}
 	} else if err != nil && err != store.ErrNotFound {
+		d.logHandoff(handoffEvent{Event: "run.start_rejected", ProjectID: projectID, Runtime: runtime, Actor: by, Reason: "run_state_unavailable", ErrorType: errorType(err)})
 		return model.ProjectRun{}, err
 	}
 	stalledDoing, ready, blocked, err := d.projectRunList(project)
 	if err != nil {
+		d.logHandoff(handoffEvent{Event: "run.queue_scan_failed", ProjectID: projectID, Runtime: runtime, Actor: by, ErrorType: errorType(err)})
 		return model.ProjectRun{}, err
 	}
+	d.logHandoff(handoffEvent{Event: "run.queue_scanned", ProjectID: projectID, Runtime: runtime, Actor: by, TaskIDs: append(append([]string{}, stalledDoing...), ready...), TaskID: blocked, Reason: fmt.Sprintf("stalled_doing=%d ready=%d blocked=%t", len(stalledDoing), len(ready), blocked != "")})
 
 	run := model.ProjectRun{ProjectID: projectID, Runtime: runtime, Status: "running"}
 	if blocked != "" {
 		run.CurrentTaskID = blocked
 		run.Detail = "等待卡片 " + blocked + " 的现有执行结束"
+		d.logHandoff(handoffEvent{Event: "run.waiting", ProjectID: project.ID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: blocked, Reason: "existing_execution_active"})
 	}
 	if err := d.store.SaveProjectRun(run); err != nil {
+		d.logHandoff(handoffEvent{Event: "run.start_failed", ProjectID: projectID, Runtime: runtime, Actor: by, ErrorType: errorType(err), Reason: "persist_initial_state"})
 		return model.ProjectRun{}, err
 	}
+	d.logHandoff(handoffEvent{Event: "run.started", ProjectID: projectID, Runtime: runtime, Actor: by, RunStatus: run.Status, TaskID: run.CurrentTaskID, TaskIDs: append([]string(nil), run.TaskIDs...), Cursor: run.Cursor, Reason: run.Detail})
 	if blocked != "" {
 		if _, _, err := d.claimProjectCard(blocked, by); err != nil {
 			run.Status, run.Detail = "failed", err.Error()
 			_ = d.store.SaveProjectRun(run)
 			return run, err
 		}
+		event := handoffEvent{Event: "task.claimed_existing_execution", ProjectID: projectID, Runtime: runtime, Actor: by, RunStatus: run.Status, TaskID: blocked, Reason: "do_not_redispatch_active_session"}
+		if execution, readErr := d.store.Execution(blocked); readErr == nil && execution != nil {
+			event.SessionID, event.ExecutionState = execution.SessionID, execution.Status
+		} else if readErr != nil {
+			event.ErrorType = errorType(readErr)
+		}
+		d.logHandoff(event)
 		return d.store.ProjectRun(projectID)
 	}
 	// Finished or broken 进行中 cards are pushed to 等你, never re-run; only
@@ -103,6 +122,7 @@ func (d *Dispatcher) StartProjectRun(projectID, runtime, by string) (model.Proje
 	if len(ready) == 0 {
 		run.Detail = "等待下一张卡片"
 		_ = d.store.SaveProjectRun(run)
+		d.logHandoff(handoffEvent{Event: "run.waiting", ProjectID: projectID, Runtime: runtime, Actor: by, RunStatus: run.Status, Reason: "no_ready_card"})
 		return run, nil
 	}
 	if err := d.store.SaveProjectRun(run); err != nil {
@@ -111,7 +131,10 @@ func (d *Dispatcher) StartProjectRun(projectID, runtime, by string) (model.Proje
 	if err := d.dispatchProjectCard(run, by); err != nil {
 		run.Status = "failed"
 		run.Detail = err.Error()
-		_ = d.store.SaveProjectRun(run)
+		if saveErr := d.store.SaveProjectRun(run); saveErr != nil {
+			d.logHandoff(handoffEvent{Event: "run.failure_persist_failed", ProjectID: projectID, Runtime: runtime, RunStatus: run.Status, ErrorType: errorType(saveErr)})
+		}
+		d.logHandoff(handoffEvent{Event: "run.failed", ProjectID: projectID, Runtime: runtime, Actor: by, RunStatus: run.Status, TaskID: run.CurrentTaskID, TaskIDs: append([]string(nil), run.TaskIDs...), Cursor: run.Cursor, ErrorType: errorType(err), Reason: "initial_dispatch_failed"})
 		return run, err
 	}
 	return d.store.ProjectRun(projectID)
@@ -129,8 +152,10 @@ func (d *Dispatcher) StopProjectRun(projectID string) (model.ProjectRun, error) 
 		run.Status = "stopped"
 		run.Detail = "已关闭自动承接"
 		if err := d.store.SaveProjectRun(run); err != nil {
+			d.logHandoff(handoffEvent{Event: "run.stop_failed", ProjectID: projectID, Runtime: run.Runtime, RunStatus: run.Status, ErrorType: errorType(err)})
 			return model.ProjectRun{}, err
 		}
+		d.logHandoff(handoffEvent{Event: "run.stopped", ProjectID: projectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: run.CurrentTaskID, Reason: "user_stopped"})
 	}
 	return run, nil
 }
@@ -163,6 +188,7 @@ func (d *Dispatcher) NoteProjectRun(task model.Task) {
 			// queue, so keep the switch on and continue with the next card.
 			run.CurrentTaskID = ""
 			run.Detail = "卡片 " + task.ID + " 已归档，继续自动承接"
+			d.logHandoff(handoffEvent{Event: "task.left_queue", ProjectID: run.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, ColumnID: task.ColumnID, Reason: "archived"})
 			if err := d.store.SaveProjectRun(run); err != nil {
 				return
 			}
@@ -172,6 +198,7 @@ func (d *Dispatcher) NoteProjectRun(task model.Task) {
 		if task.ColumnID == doing.ID {
 			return
 		}
+		d.logHandoff(handoffEvent{Event: "task.left_queue", ProjectID: run.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, ColumnID: task.ColumnID, Reason: "moved_by_user_or_agent"})
 		run.CurrentTaskID = ""
 		if err := d.store.SaveProjectRun(run); err != nil {
 			return
@@ -186,6 +213,7 @@ func (d *Dispatcher) continueProjectRun(project model.Project, by string) {
 	if err := d.dispatchNextReady(project, by); err != nil {
 		if current, readErr := d.store.ProjectRun(project.ID); readErr == nil {
 			d.failProjectRun(current, err.Error())
+			d.logHandoff(handoffEvent{Event: "run.continuation_failed", ProjectID: project.ID, Runtime: current.Runtime, Actor: by, RunStatus: "failed", TaskID: current.CurrentTaskID, ErrorType: errorType(err)})
 		}
 	}
 }
@@ -270,9 +298,13 @@ func (d *Dispatcher) dispatchProjectCard(run model.ProjectRun, by string) error 
 	}
 	claimed, version, err := d.claimProjectCard(id, by)
 	if err != nil {
+		d.logHandoff(handoffEvent{Event: "task.claim_failed", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: id, ErrorType: errorType(err)})
 		return err
 	}
+	d.logHandoff(handoffEvent{Event: "task.claimed", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: id, Cursor: run.Cursor, Reason: map[bool]string{true: "moved_to_doing", false: "already_doing"}[claimed]})
+	d.logHandoff(handoffEvent{Event: "task.dispatch_started", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: id, Cursor: run.Cursor})
 	if err := d.Dispatch(id, run.Runtime, by); err != nil {
+		d.logHandoff(handoffEvent{Event: "task.dispatch_failed", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: id, ErrorType: errorType(err), Reason: map[bool]string{true: "existing_execution", false: "dispatch_error"}[errors.Is(err, ErrInProgress)]})
 		if errors.Is(err, ErrInProgress) {
 			latest, readErr := d.store.ProjectRun(run.ProjectID)
 			if readErr != nil {
@@ -290,6 +322,11 @@ func (d *Dispatcher) dispatchProjectCard(run model.ProjectRun, by string) error 
 		}
 		return err
 	}
+	event := handoffEvent{Event: "task.dispatch_accepted", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: id}
+	if execution, readErr := d.store.Execution(id); readErr == nil && execution != nil {
+		event.SessionID, event.ExecutionState = execution.SessionID, execution.Status
+	}
+	d.logHandoff(event)
 	return nil
 }
 
@@ -362,6 +399,7 @@ func (d *Dispatcher) recoverProjectRuns() error {
 		if !run.Running() {
 			continue
 		}
+		d.logHandoff(handoffEvent{Event: "run.recovery_observed", ProjectID: run.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: run.CurrentTaskID, TaskIDs: append([]string(nil), run.TaskIDs...), Cursor: run.Cursor, Reason: "service_startup"})
 		if run.CurrentTaskID == "" {
 			d.continueProjectRun(project, "自动承接恢复")
 			continue
@@ -390,6 +428,7 @@ func (d *Dispatcher) recoverProjectRuns() error {
 				return err
 			}
 			if execution != nil && execution.Active() && !execution.Stalled() {
+				d.logHandoff(handoffEvent{Event: "run.recovery_session_active", ProjectID: run.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, SessionID: execution.SessionID, ExecutionState: execution.Status, ColumnID: task.ColumnID})
 				// The session is still alive: resume tracking it and claim an
 				// intake card so the board shows where the work happens.
 				if _, _, err := d.claimProjectCard(task.ID, "自动承接恢复"); err != nil {
@@ -398,6 +437,7 @@ func (d *Dispatcher) recoverProjectRuns() error {
 				continue
 			}
 			if execution != nil {
+				d.logHandoff(handoffEvent{Event: "run.recovery_session_ended", ProjectID: run.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, SessionID: execution.SessionID, ExecutionState: execution.Status, ColumnID: task.ColumnID})
 				// The session is over (or a CLI process died with the last
 				// service): the card must not block the queue. One that was
 				// already worked moves to the review column; an intake card
@@ -427,14 +467,19 @@ func (d *Dispatcher) recoverProjectRuns() error {
 			// No execution record: claim and start a fresh session.
 			claimed, version, err := d.claimProjectCard(task.ID, "自动承接恢复")
 			if err != nil {
+				d.logHandoff(handoffEvent{Event: "task.claim_failed", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: "自动承接恢复", RunStatus: run.Status, TaskID: task.ID, ErrorType: errorType(err)})
 				d.failProjectRun(run, err.Error())
 				continue
 			}
+			d.logHandoff(handoffEvent{Event: "task.dispatch_started", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: "自动承接恢复", RunStatus: run.Status, TaskID: task.ID, Cursor: run.Cursor})
 			if err := d.Dispatch(task.ID, run.Runtime, "自动承接恢复"); err != nil {
+				d.logHandoff(handoffEvent{Event: "task.dispatch_failed", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: "自动承接恢复", RunStatus: run.Status, TaskID: task.ID, ErrorType: errorType(err), Reason: "recovery_dispatch_error"})
 				if claimed {
 					d.releaseProjectCard(task.ID, version, "自动承接恢复")
 				}
 				d.failProjectRun(run, err.Error())
+			} else {
+				d.logHandoff(handoffEvent{Event: "task.dispatch_accepted", ProjectID: run.ProjectID, Runtime: run.Runtime, Actor: "自动承接恢复", RunStatus: run.Status, TaskID: task.ID})
 			}
 			continue
 		}
@@ -458,13 +503,28 @@ func (d *Dispatcher) dispatchNextReady(project model.Project, by string) error {
 	if err != nil {
 		return err
 	}
+	d.logHandoff(handoffEvent{Event: "run.queue_scanned", ProjectID: project.ID, Runtime: run.Runtime, Actor: by, TaskIDs: append(append([]string{}, stalledDoing...), ready...), TaskID: blocked, Reason: fmt.Sprintf("stalled_doing=%d ready=%d blocked=%t", len(stalledDoing), len(ready), blocked != "")})
 	if blocked != "" {
 		run.CurrentTaskID = blocked
 		run.Detail = "等待卡片 " + blocked + " 的现有执行结束"
 		if err := d.store.SaveProjectRun(run); err != nil {
 			return err
 		}
-		_, _, err = d.claimProjectCard(blocked, by)
+		claimed, _, err := d.claimProjectCard(blocked, by)
+		if err != nil {
+			d.logHandoff(handoffEvent{Event: "task.claim_failed", ProjectID: project.ID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: blocked, ErrorType: errorType(err)})
+			return err
+		}
+		event := handoffEvent{Event: "task.claimed_existing_execution", ProjectID: project.ID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, TaskID: blocked, Reason: "do_not_redispatch_active_session"}
+		if execution, readErr := d.store.Execution(blocked); readErr == nil && execution != nil {
+			event.SessionID, event.ExecutionState = execution.SessionID, execution.Status
+		} else if readErr != nil {
+			event.ErrorType = errorType(readErr)
+		}
+		if claimed {
+			event.Reason = "claimed_without_redispatch_active_session"
+		}
+		d.logHandoff(event)
 		return err
 	}
 	ready = append(d.pushStalledDoingCards(project, stalledDoing, by), ready...)
@@ -473,6 +533,7 @@ func (d *Dispatcher) dispatchNextReady(project model.Project, by string) error {
 	run.Detail = ""
 	if len(ready) == 0 {
 		run.Detail = "等待下一张卡片"
+		d.logHandoff(handoffEvent{Event: "run.waiting", ProjectID: project.ID, Runtime: run.Runtime, Actor: by, RunStatus: run.Status, Reason: "no_ready_card"})
 		return d.store.SaveProjectRun(run)
 	}
 	if err := d.store.SaveProjectRun(run); err != nil {
@@ -515,9 +576,11 @@ func (d *Dispatcher) finishProjectCard(taskID string) {
 	}
 	execution, err := d.store.Execution(task.ID)
 	if err != nil || execution == nil || !execution.Ended() {
+		d.logHandoff(handoffEvent{Event: "task.execution_not_converged", ProjectID: task.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, ColumnID: task.ColumnID, ErrorType: errorType(err), Reason: "execution_missing_or_active"})
 		d.failProjectRun(run, "卡片 "+task.ID+" 执行失败且仍在进行中，承接停止")
 		return
 	}
+	d.logHandoff(handoffEvent{Event: "task.execution_converged", ProjectID: task.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, SessionID: execution.SessionID, ExecutionState: execution.Status, ColumnID: task.ColumnID})
 	if d.advanceFinishedCard(project, task, *execution, "自动承接") {
 		run.CurrentTaskID, run.Detail = "", ""
 		if err := d.store.SaveProjectRun(run); err != nil {
@@ -555,15 +618,18 @@ func (d *Dispatcher) parkProjectCardForApproval(taskID string) {
 		review, hasReview := project.ColumnByRole(model.ColumnRoleReview)
 		if !hasReview {
 			run.Detail = "卡片 " + task.ID + " 等待人工审批，但项目没有用户等待列"
+			d.logHandoff(handoffEvent{Event: "task.approval_waiting", ProjectID: project.ID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, Reason: "review_column_missing"})
 			_ = d.store.SaveProjectRun(run)
 			return
 		}
 		if _, err := d.store.MoveTask(task.ID, task.Version, review.ID, "", "自动承接"); err != nil {
 			run.Detail = "卡片 " + task.ID + " 等待人工审批，移入「等你」失败：" + err.Error()
+			d.logHandoff(handoffEvent{Event: "task.approval_move_failed", ProjectID: project.ID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, ColumnID: task.ColumnID, ErrorType: errorType(err)})
 			_ = d.store.SaveProjectRun(run)
 			return
 		}
 		_ = d.comment(task.ID, "自动承接", "自动承接：当前会话等待人工审批，卡片移入「等你」；请完成审批或在评论中继续跟进。自动承接将继续检查后续卡片。")
+		d.logHandoff(handoffEvent{Event: "task.approval_parked", ProjectID: project.ID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: task.ID, ColumnID: review.ID, Reason: "agent_requested_human_approval"})
 	}
 	run.CurrentTaskID, run.Detail = "", ""
 	if err := d.store.SaveProjectRun(run); err != nil {
@@ -585,8 +651,10 @@ func (d *Dispatcher) advanceFinishedCard(project model.Project, task model.Task,
 		return false
 	}
 	if _, err := d.store.MoveTask(task.ID, task.Version, review.ID, "", by); err != nil {
+		d.logHandoff(handoffEvent{Event: "task.review_move_failed", ProjectID: task.ProjectID, Runtime: execution.Channel(), Actor: by, TaskID: task.ID, ExecutionState: execution.Status, ColumnID: task.ColumnID, ErrorType: errorType(err)})
 		return false
 	}
+	d.logHandoff(handoffEvent{Event: "task.moved_to_review", ProjectID: task.ProjectID, Runtime: execution.Channel(), Actor: by, TaskID: task.ID, ExecutionState: execution.Status, ColumnID: review.ID, Reason: "execution_ended_human_acceptance_required"})
 	_ = d.comment(task.ID, by, finishedCardReason(execution))
 	return true
 }
@@ -607,5 +675,9 @@ func finishedCardReason(execution model.Execution) string {
 func (d *Dispatcher) failProjectRun(run model.ProjectRun, detail string) {
 	run.Status = "failed"
 	run.Detail = detail
-	_ = d.store.SaveProjectRun(run)
+	if err := d.store.SaveProjectRun(run); err != nil {
+		d.logHandoff(handoffEvent{Event: "run.failure_persist_failed", ProjectID: run.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: run.CurrentTaskID, ErrorType: errorType(err)})
+		return
+	}
+	d.logHandoff(handoffEvent{Event: "run.failed", ProjectID: run.ProjectID, Runtime: run.Runtime, RunStatus: run.Status, TaskID: run.CurrentTaskID, TaskIDs: append([]string(nil), run.TaskIDs...), Cursor: run.Cursor, Reason: "internal_error"})
 }

@@ -1103,3 +1103,58 @@ func TestCommentRepliesAndParentDeletion(t *testing.T) {
 		t.Fatalf("comments after root deletion = %d %+v", status, comments)
 	}
 }
+
+type relationAPIResponse struct {
+	Task        model.Task `json:"task"`
+	RelatedTask model.Task `json:"relatedTask"`
+}
+
+func TestTaskRelationsAndDependencyGate(t *testing.T) {
+	srv := start(t)
+	projectID := fixtureProjectID(t, srv)
+	boardStatus, raw := request(t, srv, http.MethodGet, "/api/projects/"+projectID+"/board", "", nil)
+	if boardStatus != http.StatusOK {
+		t.Fatalf("board=%d %s", boardStatus, raw)
+	}
+	board := decode[Board](t, raw)
+	create := func(title string) model.Task {
+		status, body := request(t, srv, http.MethodPost, "/api/tasks", "test", map[string]any{"projectId": projectID, "columnId": board.Columns[0].ID, "title": title})
+		if status != http.StatusCreated {
+			t.Fatalf("create=%d %s", status, body)
+		}
+		return decode[model.Task](t, body)
+	}
+	blocked := create("dependent")
+	blocker := create("blocker")
+	path := "/api/tasks/" + blocked.ID + "/relations/blocked_by/" + blocker.ID
+	status, body := request(t, srv, http.MethodPost, path, "test", map[string]int{"version": blocked.Version})
+	if status != http.StatusOK {
+		t.Fatalf("add relation=%d %s", status, body)
+	}
+	result := decode[relationAPIResponse](t, body)
+	if len(result.Task.Relations.BlockedBy) != 1 || result.Task.Relations.BlockedBy[0].ID != blocker.ID {
+		t.Fatalf("relation result=%+v", result)
+	}
+	status, body = request(t, srv, http.MethodPatch, "/api/tasks/"+blocked.ID, "test", map[string]any{"version": result.Task.Version, "columnId": board.Columns[1].ID})
+	if status != http.StatusBadRequest || !strings.Contains(string(body), "前置未完成") {
+		t.Fatalf("blocked move=%d %s", status, body)
+	}
+	status, body = request(t, srv, http.MethodPatch, "/api/tasks/"+blocker.ID, "test", map[string]any{"version": blocker.Version, "columnId": board.Columns[3].ID})
+	if status != http.StatusOK {
+		t.Fatalf("complete blocker=%d %s", status, body)
+	}
+	status, body = request(t, srv, http.MethodPatch, "/api/tasks/"+blocked.ID, "test", map[string]any{"version": result.Task.Version, "columnId": board.Columns[1].ID})
+	if status != http.StatusOK {
+		t.Fatalf("move unblocked=%d %s", status, body)
+	}
+}
+
+
+func createTaskForTest(t *testing.T, srv *Server, projectID, columnID, title string) model.Task {
+	t.Helper()
+	status, raw := request(t, srv, http.MethodPost, "/api/tasks", "test", map[string]any{"projectId": projectID, "columnId": columnID, "title": title})
+	if status != http.StatusCreated {
+		t.Fatalf("create task=%d %s", status, raw)
+	}
+	return decode[model.Task](t, raw)
+}

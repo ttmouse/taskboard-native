@@ -95,6 +95,11 @@ printf 'returned\n'`)
 			if err := d.Continue(task.ID, cm.ID, "user"); err != nil {
 				t.Fatal(err)
 			}
+			doing, _ := p.ColumnByRole(model.ColumnRoleDoing)
+			cur, _ := st.Task(task.ID)
+			if cur.ColumnID != doing.ID {
+				t.Fatalf("accepted follow-up did not move card immediately: column=%q want=%q", cur.ColumnID, doing.ID)
+			}
 			if err := d.Continue(task.ID, cm.ID, "user"); err != nil {
 				t.Fatal(err)
 			}
@@ -118,8 +123,7 @@ printf 'returned\n'`)
 			if status, _ := st.FollowupStatus(task.ID, cm.ID); status != "sent" {
 				t.Fatalf("followup status = %q", status)
 			}
-			cur, _ := st.Task(task.ID)
-			doing, _ := p.ColumnByRole(model.ColumnRoleDoing)
+			cur, _ = st.Task(task.ID)
 			if cur.ColumnID != doing.ID {
 				t.Fatalf("active follow-up column = %q, want doing %q", cur.ColumnID, doing.ID)
 			}

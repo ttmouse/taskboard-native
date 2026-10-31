@@ -167,6 +167,10 @@ func (d *Dispatcher) Continue(taskID, commentID, by string) error {
 		}
 		return err
 	}
+	// The board has accepted this follow-up and reserved its single writer.
+	// Reflect the work in the active column before the asynchronous channel
+	// send so the UI does not leave an accepted follow-up parked in review.
+	d.syncRunningTaskColumn(taskID, by)
 	d.inflight[taskID] = ex
 	go func() {
 		defer cancel()

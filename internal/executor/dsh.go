@@ -34,6 +34,7 @@ type Dispatcher struct {
 	store             *store.Store
 	runtimeConfigPath string
 	boardURL          string
+	handoffLog        *autoHandoffLog
 
 	mu           sync.Mutex
 	projectRunMu sync.Mutex
@@ -50,6 +51,9 @@ func NewDispatcher(st *store.Store, configPaths ...string) *Dispatcher {
 	}
 	if len(configPaths) > 1 && configPaths[1] != "" {
 		d.boardURL = strings.TrimRight(configPaths[1], "/")
+	}
+	if len(configPaths) > 2 {
+		d.handoffLog = newAutoHandoffLog(configPaths[2])
 	}
 	if err := d.importDesktopReceipts(); err != nil {
 		d.recoveryErr = err
@@ -259,6 +263,10 @@ func (d *Dispatcher) Dispatch(taskID, runtime, by string) error {
 		d.mu.Unlock()
 		return &store.InvalidError{Msg: "task is archived"}
 	}
+	if err := d.store.AssertUnblocked(task.ID); err != nil {
+		d.mu.Unlock()
+		return err
+	}
 	run, err := d.store.Execution(taskID)
 	if err != nil {
 		d.mu.Unlock()
@@ -323,7 +331,7 @@ func (d *Dispatcher) Close() {
 // run carries one task from claim to result. Every failure path still
 // comments on the task — a silent dispatch is worse than a failed one.
 func (d *Dispatcher) run(ctx context.Context, task model.Task, project model.Project, dir, runtime, by string) {
-	d.runWithText(ctx, task, project.Name, dir, runtime, by, BuildTaskText(task), "")
+	d.runWithText(ctx, task, project.Name, dir, runtime, by, BuildDispatchTaskText(task, runtime), "")
 }
 
 // runWithText hands `text` to `runtime` as a fresh session. A non-empty
@@ -372,17 +380,17 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 			d.comment(task.ID, actor, fmt.Sprintf("Herdr 派发 %s 失败：%v。未回退到独立 CLI。", runtime, err))
 			return
 		}
-		run.SessionID, run.Status, run.Detail = sessionID, "running", ""
+		run.SessionID, run.Status, run.Detail = sessionID, "running", HerdrInitialTurnPendingDetail
 		if err := d.store.SaveExecution(*run); err != nil {
 			d.setFollowup(followupID, "unknown")
 			d.comment(task.ID, actor, "Herdr 已创建 terminal，但执行记录保存失败；不会另建会话："+err.Error())
 			return
 		}
 		d.setFollowup(followupID, "sent")
-		d.comment(task.ID, actor, fmt.Sprintf("已交给 Herdr %s（项目 space 中的任务 tab 已打开；发起人 %s；%s）。", runtime, by, time.Since(start).Round(time.Second)))
-		if followupID != "" {
+		if followupID == "" {
 			d.syncRunningTaskColumn(task.ID, actor)
 		}
+		d.comment(task.ID, actor, fmt.Sprintf("已交给 Herdr %s（项目 space 中的任务 tab 已打开；发起人 %s；%s）。", runtime, by, time.Since(start).Round(time.Second)))
 		d.trackHerdr(ctx, run)
 		return
 	}
@@ -422,7 +430,7 @@ func (d *Dispatcher) executeCLI(ctx context.Context, cmd *exec.Cmd, task model.T
 		if err := d.store.SaveExecution(*run); err != nil {
 			d.comment(task.ID, actor, "命令已启动，但执行状态写回失败："+err.Error())
 		}
-		if run.FollowupID != "" {
+		if run.FollowupID == "" {
 			d.syncRunningTaskColumn(task.ID, actor)
 		}
 		runErr = cmd.Wait()

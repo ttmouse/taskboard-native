@@ -226,6 +226,9 @@ func (s *Store) tasksLocked(ctx context.Context, projectID string, includeArchiv
 	for _, r := range rows.Values {
 		out = append(out, scanTask(r))
 	}
+	if err := s.enrichTasksLocked(ctx, out); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -260,7 +263,11 @@ func (s *Store) taskLocked(ctx context.Context, id string) (model.Task, error) {
 	if len(rows.Values) == 0 {
 		return model.Task{}, ErrNotFound
 	}
-	return scanTask(rows.Values[0]), nil
+	t := scanTask(rows.Values[0])
+	if err := s.enrichTaskLocked(ctx, &t); err != nil {
+		return model.Task{}, err
+	}
+	return t, nil
 }
 
 // resolveTaskIDLocked accepts a human-facing decimal task number, an exact

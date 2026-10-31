@@ -51,8 +51,9 @@ func TestHerdrUnreachableConvergesToDetached(t *testing.T) {
 		t.Fatalf("active executions after convergence = %+v, err=%v", active, err)
 	}
 	cur, _ := st.Task(task.ID)
-	if cur.ColumnID != p.Columns[0].ID || cur.Version != task.Version {
-		t.Fatalf("dispatcher changed the card's workflow: %+v", cur)
+	doing, _ := p.ColumnByRole("doing")
+	if cur.ColumnID != doing.ID || cur.Version != task.Version+1 {
+		t.Fatalf("accepted dispatch did not leave the card in doing: %+v", cur)
 	}
 	// The lock is released, so a person may dispatch the card again.
 	if err := d.Dispatch(task.ID, RuntimeClaude, "herdr-convergence-retry"); err != nil {
@@ -155,7 +156,7 @@ func TestHerdrFlapBelowThresholdKeepsTracking(t *testing.T) {
 	}
 	waitFor(t, "Herdr session recovered from the flap", func() (bool, string) {
 		run, err := st.Execution(task.ID)
-		return err == nil && run != nil && run.Status == "running", fmt.Sprint(run, err)
+		return err == nil && run != nil && run.Status == "running" && run.Detail == "", fmt.Sprint(run, err)
 	})
 	if run, _ := st.Execution(task.ID); run.Status != "running" || run.Detail != "" {
 		t.Fatalf("recovered record = %+v", run)

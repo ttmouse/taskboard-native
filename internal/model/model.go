@@ -128,8 +128,39 @@ type Task struct {
 	UpdatedAt   time.Time  `json:"updatedAt"`
 	UpdatedBy   string     `json:"updatedBy,omitempty"`
 	CompletedBy string     `json:"completedBy,omitempty"`
+	// Relations holds parent/sub-issue and blocking links (DSH-compatible).
+	// Always populated on GetTask/List/Board when the store enriches the task.
+	Relations TaskRelations `json:"relations"`
 }
 
+// TaskRelationSummary is the compact card pointer used inside Relations.
+type TaskRelationSummary struct {
+	ID         string `json:"id"`
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	ColumnID   string `json:"columnId"`
+	ColumnRole string `json:"columnRole,omitempty"`
+	Archived   bool   `json:"archived,omitempty"`
+}
+
+// TaskRelations mirrors dsh-taskboard's relations object on a Task.
+// parent: the single parent of this card; subIssues: children whose parent is this card.
+// blockedBy / blocks: directed blocking edges stored as relation_type=blocks.
+// related: undirected related links.
+type TaskRelations struct {
+	Parent    *TaskRelationSummary  `json:"parent,omitempty"`
+	SubIssues []TaskRelationSummary `json:"subIssues,omitempty"`
+	BlockedBy []TaskRelationSummary `json:"blockedBy,omitempty"`
+	Blocks    []TaskRelationSummary `json:"blocks,omitempty"`
+	Related   []TaskRelationSummary `json:"related,omitempty"`
+}
+
+
+// RelationResult is returned by add/remove relation endpoints.
+type RelationResult struct {
+	Task        Task `json:"task"`
+	RelatedTask Task `json:"relatedTask"`
+}
 // CompletingAgent recognizes the dispatcher's successful result comments.
 // Ordinary comments, failures and dispatch requests do not establish completion.
 func CompletingAgent(c Comment) string {

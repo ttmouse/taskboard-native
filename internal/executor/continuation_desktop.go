@@ -50,7 +50,6 @@ func (d *Dispatcher) continueDesktop(ctx context.Context, b *desktopBridge, task
 		d.comment(task.ID, actor, "评论已接收，但记录状态失败："+err.Error())
 		return
 	}
-	d.syncRunningTaskColumn(task.ID, actor)
 	d.comment(task.ID, actor, "已交回原 DSH 会话跟进评论 "+run.FollowupID+"。")
 	d.trackDesktop(ctx, b, task, run, actor)
 }

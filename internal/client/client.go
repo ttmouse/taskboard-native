@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"taskboard-native/internal/executor"
 	"taskboard-native/internal/model"
 )
 
@@ -481,6 +482,25 @@ func (c *Client) Move(id string, version int, toColumn, afterID string, atTop bo
 	return t, err
 }
 
+// AddRelation links relatedID to id under type (parent|blocks|blocked_by|related).
+func (c *Client) AddRelation(id string, version int, relType, relatedID string) (model.RelationResult, error) {
+	var out model.RelationResult
+	err := c.do(context.Background(), http.MethodPost,
+		"/api/tasks/"+id+"/relations/"+relType+"/"+relatedID,
+		map[string]any{"version": version}, &out)
+	return out, err
+}
+
+// RemoveRelation deletes the named link.
+func (c *Client) RemoveRelation(id string, version int, relType, relatedID string) (model.RelationResult, error) {
+	var out model.RelationResult
+	err := c.do(context.Background(), http.MethodDelete,
+		"/api/tasks/"+id+"/relations/"+relType+"/"+relatedID,
+		map[string]any{"version": version}, &out)
+	return out, err
+}
+
+
 // Archive soft-deletes a task.
 func (c *Client) Archive(id string, version int) (model.Task, error) {
 	if version == 0 {
@@ -520,6 +540,13 @@ func (c *Client) Restore(id string, version int) (model.Task, error) {
 	err := c.do(context.Background(), "PATCH", "/api/tasks/"+url.PathEscape(id),
 		TaskPatch{Version: version, Archived: &live}, &t)
 	return t, err
+}
+
+// HandoffLog returns recent automatic-handoff events for a task.
+func (c *Client) HandoffLog(taskID string) (executor.HandoffLogView, error) {
+	var out executor.HandoffLogView
+	err := c.get("/api/tasks/"+url.PathEscape(taskID)+"/handoff-log", &out)
+	return out, err
 }
 
 // Comments lists a task's comments.

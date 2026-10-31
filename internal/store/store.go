@@ -109,6 +109,20 @@ CREATE TABLE IF NOT EXISTS project_runs (
   detail TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS task_relations (
+  relation_type TEXT NOT NULL CHECK (relation_type IN ('parent', 'blocks', 'related')),
+  source_task_id TEXT NOT NULL,
+  target_task_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK (source_task_id <> target_task_id),
+  CHECK (relation_type <> 'related' OR source_task_id < target_task_id),
+  PRIMARY KEY (relation_type, source_task_id, target_task_id)
+);
+CREATE INDEX IF NOT EXISTS task_relations_target
+  ON task_relations(relation_type, target_task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS task_relations_one_parent
+  ON task_relations(target_task_id)
+  WHERE relation_type = 'parent';
 `
 
 // DefaultColumns returns the seeded board layout, each column carrying the
