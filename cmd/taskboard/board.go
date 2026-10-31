@@ -31,6 +31,7 @@ type api interface {
 	Board(projectID string) (client.Board, error)
 	Task(id string) (model.Task, error)
 	CreateTask(projectID, columnID, title, description, assignee string) (model.Task, error)
+	CreateTaskAndDispatch(projectID, columnID, title, description, assignee, runtime string) (model.Task, error)
 	Update(id string, version int, title, description, assignee *string) (model.Task, error)
 	Move(id string, version int, toColumn, afterID string, atTop bool) (model.Task, error)
 	Archive(id string, version int) (model.Task, error)
@@ -85,10 +86,14 @@ type detail struct {
 	commentParentID     string
 	commentParentAuthor string
 	commentMention      string // execution channel addressed with @ in the draft
-	mentionOpen         bool   // the @ picker is showing, waiting for a channel
-	mentionIndex        int    // keyboard-highlighted channel while the picker is open
-	commentFocus        int    // frames left to focus the composer on open or hand focus back after picking
-	commentCaretStart   bool   // the caret sat at the start when the field was built
+	fileMentionTargets  []workspaceMentionTarget
+	fileMentionIndex    int
+	mentionOpen         bool // the @ picker is showing, waiting for a channel
+	mentionIndex        int  // keyboard-highlighted channel while the picker is open
+	mentionSearchBase   string
+	mentionSearch       string
+	commentFocus        int  // frames left to focus the composer on open or hand focus back after picking
+	commentCaretStart   bool // the caret sat at the start when the field was built
 	comments            []model.Comment
 	loading             bool // comments still arriving
 	bodyImage           imageEdit
@@ -136,8 +141,12 @@ type form struct {
 	creating         bool   // form write is awaiting the service
 	// composeImages holds standalone image URLs pasted while composing the
 	// task; they are embedded in the task body when it is created.
-	composeImages []string
-	composeImage  imageEdit
+	composeImages        []string
+	fileMentionTargets   []workspaceMentionTarget
+	fileMentionIndex     int
+	fileMentionOpen      bool
+	fileMentionProjectID string
+	composeImage         imageEdit
 	// thumbs caches decoded bitmaps for the small preview strip so each
 	// image is fetched once, not every frame.
 	thumbs       map[string]ui.ImageSource
@@ -238,12 +247,16 @@ type board struct {
 	railFrom   float32   // the width it began at
 	railTo     float32   // the width it heads for
 
-	searchQuery          string // filter: title + description, all columns
-	searchOpen           bool   // sidebar search button → immersive centered search overlay
-	searchSelection      int    // highlighted search hit; -1 means no keyboard selection
-	searchSelectionQuery string // query the current keyboard selection belongs to
-	quickTitle           string // vertical-list top field; Enter creates in 待办
-	quickCreating        bool   // the quick-add request is awaiting the service
+	searchQuery               string // filter: title + description, all columns
+	searchOpen                bool   // sidebar search button → immersive centered search overlay
+	searchSelection           int    // highlighted search hit; -1 means no keyboard selection
+	searchSelectionQuery      string // query the current keyboard selection belongs to
+	quickTitle                string // vertical-list top field; Enter creates in 待办
+	quickCreating             bool   // the quick-add request is awaiting the service
+	quickFileMentionOpen      bool
+	quickFileMentionIndex     int
+	quickFileMentionProjectID string
+	quickFileMentionTargets   []workspaceMentionTarget
 
 	// colScrolls tracks per-column (and board) scroll offsets so the
 	// scrollbar theme can stay transparent until the user scrolls.
@@ -265,14 +278,15 @@ type board struct {
 func newBoard(a api) *board {
 	prefs := loadUIPrefs()
 	b := &board{
-		api:    a,
-		msgs:   make(chan func(), 64),
-		drafts: map[string]string{},
-		status: client.Connecting,
-		agent:  prefs.windowAgent(),
-		recent: map[string]time.Time{},
-		bounds: map[string]ui.Rect{},
-		prefs:  prefs,
+		api:         a,
+		msgs:        make(chan func(), 64),
+		drafts:      map[string]string{},
+		status:      client.Connecting,
+		agent:       prefs.windowAgent(),
+		projectSort: prefs.ProjectSort,
+		recent:      map[string]time.Time{},
+		bounds:      map[string]ui.Rect{},
+		prefs:       prefs,
 		// Launch into「全部项目」, not a concrete board like local.
 		cur: curGlobal,
 	}
@@ -741,6 +755,15 @@ func (b *board) sortedProjects() []model.Project {
 		})
 	}
 	return out
+}
+
+func (b *board) setProjectSort(mode string) {
+	if mode != "" && mode != "updated" && mode != "created" {
+		return
+	}
+	b.projectSort = mode
+	b.prefs.ProjectSort = mode
+	_ = saveUIPrefs(b.prefs)
 }
 
 // projectByID returns the project the id names, for the color the card's
@@ -1264,6 +1287,10 @@ func (b *board) saveDetailVersion(d *detail, title, body string, version int) {
 
 // moveTask relocates a card optimistically, then asks the service.
 func (b *board) moveTask(id, toColumn, afterID string, atTop bool) {
+	b.moveTaskWithSuccess(id, toColumn, afterID, atTop, nil)
+}
+
+func (b *board) moveTaskWithSuccess(id, toColumn, afterID string, atTop bool, onSuccess func()) {
 	t := b.task(id)
 	if t == nil {
 		return
@@ -1288,14 +1315,18 @@ func (b *board) moveTask(id, toColumn, afterID string, atTop bool) {
 	}
 	go func() {
 		_, err := b.api.Move(cur.ID, cur.Version, apiColumn, afterID, atTop)
-		if err != nil {
-			b.post(func() {
+		b.post(func() {
+			if err != nil {
 				if fresh, ferr := b.api.Task(cur.ID); ferr == nil {
 					b.replace(fresh)
 				}
-			})
-			b.toast("移动失败", err.Error())
-		}
+				b.toast("移动失败", err.Error())
+				return
+			}
+			if onSuccess != nil {
+				onSuccess()
+			}
+		})
 	}()
 }
 

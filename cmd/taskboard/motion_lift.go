@@ -58,7 +58,12 @@ func (b *board) liftedCard(c *ui.Context, t *ui.Theme, task *model.Task, slot ui
 		animation.Delay = 0 // the shared stage clock already owns the visual stagger
 		x := flight.AnimateTo(landingAxis{f.at, 'x'}, target.X, animation)
 		y := flight.AnimateTo(landingAxis{f.at, 'y'}, target.Y, animation)
-		flight.Absolute().Left(x).Top(y).Size(f.source.W, f.source.H).
+		// Keep the source width so the flight starts where it was measured,
+		// but let the content determine its height. A newly-created card can
+		// still be in its collapsing Enter transition when an agent claims it;
+		// copying that transient height into the flight clips the card until
+		// the destination slot appears after landing.
+		flight.Absolute().Left(x).Top(y).Width(f.source.W).
 			Translate(0, -8*elevation).Scale(1+0.025*elevation, 1+0.025*elevation).
 			Shadow(0, 16*elevation, 26*elevation, 0, ui.RGBA(0, 0, 0, 0.22*elevation)).
 			PassThrough()

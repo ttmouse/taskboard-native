@@ -15,18 +15,19 @@ import (
 // It mirrors the service's wire behaviour: writes bump versions, return
 // conflicts when the version is stale, and push events to subscribers.
 type fakeBoard struct {
-	mu          sync.Mutex
-	projects    []model.Project
-	tasks       []model.Task
-	seq         int64
-	delay       time.Duration // injected latency, standing in for a slow service
-	fail        error         // returned by every read when set
-	createFail  error         // returned by CreateTask when set
-	projectFail error         // returned by project create/update when set
-	subs        []func(model.Event)
-	now         time.Time
-	dispatches  [][2]string // recorded Dispatch(taskID, runtime) calls
-	projectRuns [][2]string // recorded StartProjectRun(projectID, runtime) calls
+	mu                  sync.Mutex
+	projects            []model.Project
+	tasks               []model.Task
+	seq                 int64
+	delay               time.Duration // injected latency, standing in for a slow service
+	fail                error         // returned by every read when set
+	createFail          error         // returned by CreateTask when set
+	projectFail         error         // returned by project create/update when set
+	subs                []func(model.Event)
+	now                 time.Time
+	dispatches          [][2]string // recorded Dispatch(taskID, runtime) calls
+	createAndDispatches [][2]string // recorded atomic create-and-dispatch calls
+	projectRuns         [][2]string // recorded StartProjectRun(projectID, runtime) calls
 }
 
 // seedBoard is the demo board the screenshots use: four columns, five
@@ -167,6 +168,17 @@ func (f *fakeBoard) CreateTask(projectID, columnID, title, description, assignee
 	}
 	f.tasks = append(f.tasks, t)
 	f.emitLocked(model.Event{Type: model.EventTaskCreated, ProjectID: projectID, ID: t.ID, Version: 1, By: "gui", Task: &t})
+	return t, nil
+}
+
+func (f *fakeBoard) CreateTaskAndDispatch(projectID, columnID, title, description, assignee, runtime string) (model.Task, error) {
+	t, err := f.CreateTask(projectID, columnID, title, description, assignee)
+	if err != nil || runtime == "" {
+		return t, err
+	}
+	f.mu.Lock()
+	f.createAndDispatches = append(f.createAndDispatches, [2]string{t.ID, runtime})
+	f.mu.Unlock()
 	return t, nil
 }
 

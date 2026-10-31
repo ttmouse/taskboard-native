@@ -72,12 +72,12 @@ func TestComposeCmdEnterDispatchesSelectedChannel(t *testing.T) {
 			}
 			tt.Type("快捷创建并派发")
 			tt.Key(ui.Cmd, ui.KeyEnter)
-			waitFor(t, tt, "建卡和派发", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.dispatches) == 1 })
+			waitFor(t, tt, "建卡和派发", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.createAndDispatches) == 1 })
 			if b.form != nil {
 				t.Fatal("Cmd+Enter did not close compose")
 			}
 			f.mu.Lock()
-			request := f.dispatches[0]
+			request := f.createAndDispatches[0]
 			f.mu.Unlock()
 			created, err := f.Task(request[0])
 			if err != nil || created.Title != "快捷创建并派发" || request[1] != channel.ID {

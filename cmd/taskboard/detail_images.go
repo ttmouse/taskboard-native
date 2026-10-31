@@ -151,7 +151,11 @@ func (b *board) detailMarkdown(c *ui.Context, text string) {
 			},
 		}
 	}
-	markdown.View(c, linkifyAbsolutePaths(text), d.markdown)
+	workspace := ""
+	if p, ok := b.projectByID(d.snap.ProjectID); ok {
+		workspace = p.WorkspacePath
+	}
+	markdown.View(c, linkifyAbsolutePaths(expandWorkspaceMentions(text, workspace)), d.markdown)
 }
 
 // retinaImageBlock gives standalone task images half their pixel dimensions

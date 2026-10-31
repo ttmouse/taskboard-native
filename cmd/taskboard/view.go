@@ -312,7 +312,7 @@ func (b *board) productionTopBar(c *ui.Context, t *ui.Theme) {
 // projectRunControl is the open project's continuous handoff switch.
 // Off opens the channel menu; on turns the switch off.
 func (b *board) projectRunControl(c *ui.Context, t *ui.Theme) {
-	label, tip, action := "自动承接", "开启后持续承接这个项目，一次一张", "开启自动承接"
+	label, tip, action := "自动承接", "开启后持续承接：清空待办与进行中，结束的卡自动移入等你，一次一张", "开启自动承接"
 	if runtime := b.projectRunRuntime[b.cur]; runtime != "" {
 		channel := runtimeLabel(runtime)
 		label, tip, action = channel+" 承接中", channel+" 正在承接这个项目，点击关闭", "关闭自动承接"
@@ -379,7 +379,7 @@ func (b *board) startProjectRun(runtime string) {
 			} else {
 				delete(b.projectRunRuntime, projectID)
 			}
-			b.toast("自动承接已开启", label+" 会持续处理，一次一张")
+			b.toast("自动承接已开启", label+" 会持续处理，自动把结束的卡移入等你，一次一张")
 		})
 	}()
 }
@@ -714,7 +714,7 @@ func (b *board) sidebarCollapseChip(c *ui.Context, t *ui.Theme, collapsing bool)
 // projectSortControl is the small sort dropdown left of 添加项目 in the
 // sidebar header: 默认（服务端顺序）/ 按更新时间（最近活跃在前）/
 // 按创建时间（最新在前）。
-func (b *board) projectSortControl(c *ui.Context, t *ui.Theme) {
+func (b *board) projectSortControl(c *ui.Context, t *ui.Theme, headerHovered bool) {
 	label, tip := "排序", "项目排序：默认"
 	switch b.projectSort {
 	case "updated":
@@ -722,17 +722,20 @@ func (b *board) projectSortControl(c *ui.Context, t *ui.Theme) {
 	case "created":
 		label, tip = "按创建", "项目排序：按创建时间（最新在前）"
 	}
-	ui.MenuButton(c, label, func(m *ui.Menu) {
+	control := ui.MenuButton(c, label, func(m *ui.Menu) {
 		if m.Item("默认排序").Checked(b.projectSort == "").Chosen() {
-			b.projectSort = ""
+			b.setProjectSort("")
 		}
 		if m.Item("按更新时间").Checked(b.projectSort == "updated").Chosen() {
-			b.projectSort = "updated"
+			b.setProjectSort("updated")
 		}
 		if m.Item("按创建时间").Checked(b.projectSort == "created").Chosen() {
-			b.projectSort = "created"
+			b.setProjectSort("created")
 		}
 	}).Label("项目排序").Tooltip(tip).BorderWidth(0)
+	if !headerHovered && !control.Hovered() && !control.Pressed() {
+		control.Opacity(0).PassThrough()
+	}
 }
 
 // projectSidebar is a quiet project switcher on L0 (window face), not a
@@ -772,7 +775,7 @@ func (b *board) projectSidebar(c *ui.Context, t *ui.Theme) {
 				hdr.Children(func() {
 					ui.Text(c, "项目").FontSize(fsm(t)).FontWeight(600).TextColor(t.TextMuted).
 						TextAlign(ui.Start).Grow(1)
-					b.projectSortControl(c, t)
+					b.projectSortControl(c, t, hdr.Hovered())
 					plus := ui.Button(c.Key("projects-hdr-add"), "+").Label("新建项目").Tooltip("新建项目").
 						Padding(t.Space(1), t.Space(1.5)).Radius(t.Radius).BorderWidth(0)
 					showPlus := hdr.Hovered() || plus.Hovered() || plus.Pressed()
@@ -1251,7 +1254,7 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 	ui.Row(c).FillWidth().
 		Padding(t.Space(2), padR+t.Space(1), t.Space(2), padL+t.Space(1)).
 		Children(func() {
-			ui.TextInput(c.Key("quick-add"), &b.quickTitle).
+			input := ui.TextInput(c.Key("quick-add"), &b.quickTitle).
 				FillWidth().
 				Placeholder("添加任务，回车创建").
 				Label("在「待办」中添加任务").
@@ -1261,6 +1264,33 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 				OnTextKey(func(k ui.TextKey) bool {
 					if b.quickCreating {
 						return true
+					}
+					if b.quickFileMentionOpen && k.Mods == 0 {
+						query, _ := workspaceMentionQuery(k.Text())
+						files := filterWorkspaceMentionTargets(b.quickFileMentionTargets, query, 20)
+						switch k.Key {
+						case ui.KeyDown:
+							if len(files) > 0 {
+								b.quickFileMentionIndex = (b.quickFileMentionIndex + 1) % len(files)
+							}
+							return true
+						case ui.KeyUp:
+							if len(files) > 0 {
+								b.quickFileMentionIndex = (b.quickFileMentionIndex + len(files) - 1) % len(files)
+							}
+							return true
+						case ui.KeyEnter:
+							if len(files) > 0 {
+								index := b.quickFileMentionIndex
+								if index < 0 || index >= len(files) {
+									index = 0
+								}
+								b.quickTitle = insertWorkspaceMention(k.Text(), files[index].Path)
+								k.SetText(b.quickTitle)
+								b.quickFileMentionOpen = false
+							}
+							return true
+						}
 					}
 					if k.Key == ui.KeyEscape && k.Mods == 0 {
 						k.SetText("")
@@ -1284,6 +1314,7 @@ func (b *board) quickAdd(c *ui.Context, t *ui.Theme, padL, padR float32) {
 					}
 					return true
 				})
+			b.quickFileMentionMenu(c, t, input)
 		})
 }
 
@@ -1320,18 +1351,18 @@ func (b *board) createTaskAndDispatch(projectID, columnID, title, description, r
 		}
 	}
 	go func() {
-		t, err := b.api.CreateTask(proj, columnID, title, description, "")
+		var err error
+		if runtime == "" {
+			_, err = b.api.CreateTask(proj, columnID, title, description, "")
+		} else {
+			_, err = b.api.CreateTaskAndDispatch(proj, columnID, title, description, "", runtime)
+		}
 		if err != nil {
 			b.toast("创建失败", err.Error())
 			complete(false)
 			return
 		}
 		complete(true)
-		if runtime != "" {
-			if err := b.api.Dispatch(t.ID, runtime); err != nil {
-				b.toast("任务已创建，派发失败", err.Error())
-			}
-		}
 	}()
 	return true
 }
@@ -1501,14 +1532,7 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 				Size(t.Space(6), t.Space(6)).Padding(0).Gap(0).Radius(t.Radius + 2).
 				BorderWidth(0).Center().
 				Label("打开 Herdr 中的 Codex 对话").Tooltip("打开 Herdr 中的 Codex 对话")
-			ink, face := t.TextMuted, ui.Transparent
-			switch {
-			case button.Pressed():
-				ink, face = t.Text, t.SurfacePressed
-			case button.Hovered():
-				ink, face = t.Text, t.Text.Alpha(0.10)
-			}
-			button.Background(face).TextColor(ink)
+			styleCardFooterIconButton(button, card, t)
 			button.Children(func() { ui.Icon(c, herdrConversation).Size(16, 16) })
 			if button.Clicked() {
 				openExecution = true
@@ -1545,8 +1569,12 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 			titleCol := ui.Column(c).Grow(1).Gap(t.Space(2))
 			titleCol.Children(func() {
 				drawTitle := func() {
-					title := ui.Text(c, task.Title).FontSize(t.FontSize).FontWeight(500).
-						Tooltip(task.Title)
+					titleText := task.Title
+					if p, ok := b.projectByID(task.ProjectID); ok {
+						titleText = displayWorkspaceMentions(titleText, p.WorkspacePath)
+					}
+					title := ui.Text(c, titleText).FontSize(t.FontSize).FontWeight(500).
+						Tooltip(titleText)
 					if !projectInline {
 						title = title.FillWidth()
 					}
@@ -1635,6 +1663,24 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 	return card
 }
 
+// styleCardFooterIconButton keeps the chat and approval actions consistent:
+// both appear when their card is hovered, use the same hover/press treatment,
+// and disappear together at rest.
+func styleCardFooterIconButton(button, card ui.Element, t *ui.Theme) {
+	show := card.Hovered() || button.Hovered() || button.Pressed()
+	ink, face := t.TextMuted, ui.Transparent
+	switch {
+	case button.Pressed():
+		ink, face = t.Text, t.SurfacePressed
+	case button.Hovered():
+		ink, face = t.Text, t.Text.Alpha(0.10)
+	}
+	button.Background(face).TextColor(ink)
+	if !show {
+		button.Opacity(0).PassThrough()
+	}
+}
+
 func (b *board) openTaskExecution(task *model.Task) {
 	project, ok := b.projectByID(task.ProjectID)
 	if !ok {
@@ -1657,24 +1703,7 @@ func (b *board) reviewCheckButton(c *ui.Context, t *ui.Theme, card ui.Element, t
 			// Lucide check mass sits left/high; 1px nudge for optical center.
 			ui.Icon(c, approveCheck).Size(16, 16).Margin(1, 0, 0, 1)
 		})
-	show := card.Hovered() || check.Hovered() || check.Pressed()
-	ink := t.TextMuted
-	chip := ui.Transparent
-	switch {
-	case check.Pressed():
-		ink = t.Text
-		chip = t.SurfacePressed
-	case check.Hovered():
-		ink = t.Text
-		chip = t.Text.Alpha(0.10)
-	case show:
-		ink = t.TextMuted
-		chip = ui.Transparent
-	}
-	check.Background(chip).TextColor(ink)
-	if !show {
-		check.Opacity(0).PassThrough()
-	}
+	styleCardFooterIconButton(check, card, t)
 	if check.Clicked() {
 		*approve = true
 		if done := b.columnIDByRole(model.ColumnRoleDone); done != "" {
@@ -1787,7 +1816,12 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					if currentTask != nil && b.columnHasRole(currentTask.ColumnID, model.ColumnRoleReview) &&
 						ui.PrimaryButton(c, "完成").Label("结束任务").Clicked() {
 						if done := b.columnIDByRole(model.ColumnRoleDone); done != "" {
-							b.moveTask(d.id, done, "", true)
+							b.moveTaskWithSuccess(d.id, done, "", true, func() {
+								if b.detail == d {
+									d.open = false
+									b.detail = nil
+								}
+							})
 						}
 					}
 					ui.Text(c, provenance(&d.snap)).FontSize(fxs(t)).TextColor(t.TextMuted).
@@ -1821,21 +1855,43 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 				}
 			})
 		})
-		// A trailing @ at a word start is the user addressing an agent. It
-		// never lands in the text: the address is stored as a field, so prose
-		// (an email, a quoted @) can never route work.
+		// A trailing @ starts the combined channel/file picker. File query
+		// text remains in the draft until a result is chosen.
 		if !d.mentionOpen && justTypedMention(d.comment) {
 			d.comment = strings.TrimSuffix(d.comment, "@")
 			d.mentionOpen = true
 			d.mentionIndex = 0
+			d.mentionSearchBase = d.comment
+			d.mentionSearch = ""
+		}
+		if !d.mentionOpen {
+			if query, ok := workspaceMentionQuery(d.comment); ok && query != "" {
+				d.mentionOpen = true
+				d.mentionIndex = 0
+				d.mentionSearchBase = strings.TrimRight(d.comment[:strings.LastIndex(d.comment, "@")], " \t\n")
+				d.mentionSearch = query
+			}
+		}
+		if d.mentionOpen && strings.HasPrefix(d.comment, d.mentionSearchBase) {
+			search := strings.TrimSpace(strings.TrimPrefix(d.comment, d.mentionSearchBase))
+			if !strings.ContainsAny(search, " \t\n") {
+				d.mentionSearch = search
+			}
 		}
 		// The outer surface supplies equal insets; the input adds none.
-		composer := ui.Box(c).FillWidth().Padding(t.Space(2), t.Space(2.5)).Gap(t.Space(2)).
-			Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4))
+		composer := ui.Box(c).FillWidth().Padding(0, t.Space(2.5)).Gap(t.Space(2)).
+			Radius(t.Radius + 2).BorderWidth(0).Background(t.SurfaceHover.Alpha(0.4)).
+			Label("评论输入容器")
 		b.mentionMenu(c, t, d, composer)
 		composer.
 			Children(func() {
-				ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+				if p, ok := b.projectByID(d.snap.ProjectID); ok {
+					b.workspaceMentionChips(c, t, &d.comment, p.WorkspacePath, "comment-file-chips")
+				}
+				// Give a one-line draft a taller row so AlignItems centers it
+				// vertically; multiline drafts grow the row with their own height.
+				ui.Row(c).FillWidth().Gap(t.Space(2)).MinHeight(t.Space(8)).
+					AlignItems(ui.Center).Label("评论输入区").Children(func() {
 					if d.commentParentID != "" {
 						if ui.Button(c.Key("reply-target-chip"), "回复 @"+d.commentParentAuthor+" ×").
 							Label("取消回复目标").Tooltip("正在回复 @"+d.commentParentAuthor+"；点击取消").
@@ -1861,7 +1917,8 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						originalRuntime = d.snap.Execution.Channel()
 					}
 					input := ui.TextArea(c, &d.comment).Placeholder(commentPlaceholder(d.commentMention, autoFollowup, originalRuntime)).Label("写评论").
-						Lines(1, 4).MinHeight(0).Grow(1).Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent).
+						Lines(1, 4).MinHeight(0).Grow(1).
+						Disabled(b.commenting).BorderWidth(0).Background(ui.Transparent).
 						Padding(0, 0)
 					// Read here, as the field is built: an element cannot be
 					// read again from the key handler, which runs later.
@@ -1879,21 +1936,28 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					b.imageInput(input, d, &d.comment, &d.commentImage, mygo.Clipboard.ReadImage)
 					input.OnTextKey(func(key ui.TextKey) bool {
 						if d.mentionOpen && key.Mods == 0 {
-							channels := executor.Runtimes()
+							query, hasFileQuery := commentMentionSearch(d)
+							showChannels := !hasFileQuery || query == ""
+							files := b.filteredWorkspaceMentions(d, query)
+							count := mentionOptionCount(len(executor.Runtimes()), len(files), showChannels)
 							switch key.Key {
 							case ui.KeyDown:
-								d.mentionIndex = (d.mentionIndex + 1) % len(channels)
+								if count > 0 {
+									d.mentionIndex = (d.mentionIndex + 1) % count
+								}
 								return true
 							case ui.KeyUp:
-								d.mentionIndex = (d.mentionIndex + len(channels) - 1) % len(channels)
+								if count > 0 {
+									d.mentionIndex = (d.mentionIndex + count - 1) % count
+								}
 								return true
 							case ui.KeyEnter:
-								if len(channels) > 0 {
+								if count > 0 {
 									index := d.mentionIndex
-									if index < 0 || index >= len(channels) {
+									if index < 0 || index >= count {
 										index = 0
 									}
-									b.selectMentionChannel(d, channels[index].ID)
+									b.selectMentionOption(d, index)
 								}
 								return true
 							}
@@ -1921,9 +1985,11 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						b.sendComment()
 					}
 				})
-				ui.Scroll(c).FillWidth().MaxHeight(t.Space(40)).Children(func() {
-					b.imagePreview(c.Key("comment-preview"), &d.comment, &d.commentImage, "评论")
-				})
+				if d.commentImage.uploading || localImageMarkdown.MatchString(d.comment) {
+					ui.Scroll(c).FillWidth().MaxHeight(t.Space(40)).Children(func() {
+						b.imagePreview(c.Key("comment-preview"), &d.comment, &d.commentImage, "评论")
+					})
+				}
 			})
 	})
 	if pane.OverlayShortcut(0, ui.KeyEscape) {
@@ -1950,8 +2016,10 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 // Esc / backdrop / 关闭 clears the query and closes.
 func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 	children := make(map[string][]model.Comment)
+	byID := make(map[string]model.Comment, len(d.comments))
 	var roots []model.Comment
 	for _, cm := range d.comments {
+		byID[cm.ID] = cm
 		if cm.ParentCommentID == "" {
 			roots = append(roots, cm)
 		} else {
@@ -1969,17 +2037,6 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 				ui.Avatar(c, cm.Author, nil).Size(20, 20)
 				ui.Text(c, cm.Author).FontSize(fsm(t)).FontWeight(600).
 					MaxLines(1).Ellipsis("…").Tooltip(cm.Author)
-				if cm.ParentCommentID != "" {
-					parentAuthor := "评论"
-					for _, parent := range d.comments {
-						if parent.ID == cm.ParentCommentID {
-							parentAuthor = parent.Author
-							break
-						}
-					}
-					ui.Text(c, "回复 @"+parentAuthor).FontSize(fxs(t)).TextColor(t.TextMuted).
-						MaxLines(1).Ellipsis("…").Tooltip("回复 @" + parentAuthor)
-				}
 				if cm.Mention != "" {
 					ui.Text(c, "@"+runtimeLabel(cm.Mention)).FontSize(fxs(t)).
 						TextColor(t.Accent).MaxLines(1).Ellipsis("…").
@@ -2017,6 +2074,26 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 					})
 				}
 			})
+			if cm.ParentCommentID != "" {
+				parent, ok := byID[cm.ParentCommentID]
+				ui.Column(c.Key("reply-context-"+cm.ID)).FillWidth().Gap(t.Space(0.5)).
+					Padding(t.Space(1.5), t.Space(2)).Radius(t.Radius).
+					Background(t.Surface).Children(func() {
+					if !ok {
+						ui.Text(c, "回复的评论已不可用").FontSize(fxs(t)).TextColor(t.TextMuted)
+						return
+					}
+					ui.Text(c, "回复给 "+parent.Author).FontSize(fxs(t)).
+						FontWeight(600).TextColor(t.TextMuted).
+						Label("回复给 " + parent.Author)
+					preview := strings.Join(strings.Fields(parent.Text), " ")
+					if preview == "" {
+						preview = "（空评论）"
+					}
+					ui.Text(c, preview).FontSize(fxs(t)).TextColor(t.TextMuted).
+						MaxLines(2).Ellipsis("…").Tooltip(parent.Text)
+				})
+			}
 			if d.commentEditID == cm.ID {
 				ui.TextArea(c, &d.commentEditText).Label("编辑评论内容").FillWidth().MinHeight(t.Space(12))
 				ui.Row(c).Gap(t.Space(2)).Children(func() {
@@ -2028,7 +2105,7 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 					}
 				})
 			} else {
-				b.detailMarkdown(c, cm.Text)
+				b.detailMarkdown(c, commentMarkdown(cm.Text))
 			}
 			if cm.Author == b.agent && cm.Mention == "" && ui.Button(c.Key("continue-"+cm.ID), "让 AI 跟进").Label("跟进评论："+cm.ID).
 				Tooltip("把这条评论交回任务的原始 AI 会话").Disabled(b.commenting).Clicked() {
@@ -2666,6 +2743,9 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 		if len(f.composeImages) > 0 || f.composeImage.uploading {
 			b.composeThumbStrip(c, t, f)
 		}
+		if p, ok := b.projectByID(f.projectID); ok {
+			b.workspaceMentionChips(c, t, &f.name, p.WorkspacePath, "compose-file-chips")
+		}
 		// The input pill owns its entrance motion so the upward travel is visible,
 		// independent of DialogBase's panel positioning.
 		ui.Row(c).Key("compose-input-pill").Transition(ui.ElementTransition{
@@ -2689,6 +2769,33 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 					AutoFocus().
 					ReadOnly(f.creating || f.composeImage.uploading).
 					OnTextKey(func(k ui.TextKey) bool {
+						if f.fileMentionOpen && k.Mods == 0 {
+							query, _ := workspaceMentionQuery(k.Text())
+							files := filterWorkspaceMentionTargets(f.fileMentionTargets, query, 20)
+							switch k.Key {
+							case ui.KeyDown:
+								if len(files) > 0 {
+									f.fileMentionIndex = (f.fileMentionIndex + 1) % len(files)
+								}
+								return true
+							case ui.KeyUp:
+								if len(files) > 0 {
+									f.fileMentionIndex = (f.fileMentionIndex + len(files) - 1) % len(files)
+								}
+								return true
+							case ui.KeyEnter:
+								if len(files) > 0 {
+									index := f.fileMentionIndex
+									if index < 0 || index >= len(files) {
+										index = 0
+									}
+									f.name = insertWorkspaceMention(k.Text(), files[index].Path)
+									k.SetText(f.name)
+									f.fileMentionOpen = false
+								}
+								return true
+							}
+						}
 						if k.Key != ui.KeyEnter {
 							return false
 						}
@@ -2713,6 +2820,7 @@ func (b *board) taskComposeImmersive(c *ui.Context, t *ui.Theme, f *form, open *
 						startCreate(title, "", stay)
 						return true
 					})
+				b.taskFileMentionMenu(c, t, f, input)
 				b.composePaste(input, f)
 				// mygo's RGBA alpha is 0–1. A byte-scale 18 clamps to opaque
 				// black, which hides this dark ↑ on the white pill.

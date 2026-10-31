@@ -63,6 +63,9 @@ func TestProjectSortControl(t *testing.T) {
 	if b.projectSort != "updated" {
 		t.Fatalf("projectSort = %q, want updated", b.projectSort)
 	}
+	if got := loadUIPrefs().ProjectSort; got != "updated" {
+		t.Fatalf("persisted ProjectSort = %q, want updated", got)
+	}
 	if got, want := yOf("活跃项目") < yOf("新项目"), true; got != want {
 		t.Fatalf("updated order: 活跃项目(%v) should be above 新项目(%v)", yOf("活跃项目"), yOf("新项目"))
 	}
@@ -80,6 +83,13 @@ func TestProjectSortControl(t *testing.T) {
 	settle(t, tt)
 	if b.projectSort != "created" {
 		t.Fatalf("projectSort = %q, want created", b.projectSort)
+	}
+	if got := loadUIPrefs().ProjectSort; got != "created" {
+		t.Fatalf("persisted ProjectSort = %q, want created", got)
+	}
+	restarted := newBoard(fake)
+	if restarted.projectSort != "created" {
+		t.Fatalf("projectSort after new board startup = %q, want created", restarted.projectSort)
 	}
 	if got, want := yOf("新项目") < yOf("活跃项目"), true; got != want {
 		t.Fatalf("created order: 新项目(%v) should be above 活跃项目(%v)", yOf("新项目"), yOf("活跃项目"))

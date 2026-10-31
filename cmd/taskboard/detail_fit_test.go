@@ -69,6 +69,32 @@ func TestDetailFillsRightPaneAndKeepsSidebar(t *testing.T) {
 	}
 }
 
+func TestCommentComposerCentersSingleLineVertically(t *testing.T) {
+	isolatePrefs(t)
+	b := newBoard(seedBoard())
+	tt := ui.NewTester(b.view, 1280, 800)
+	waitFor(t, tt, "看板载入", func() bool { return b.task("t-1") != nil })
+	b.openDetail(*b.task("t-1"))
+	waitFor(t, tt, "评论载入", func() bool { return !b.detail.loading })
+	b.detail.comment = "单行评论草稿"
+	settle(t, tt)
+
+	container, containerOK := tt.Find("评论输入容器")
+	row, rowOK := tt.Find("评论输入区")
+	input, inputOK := tt.Find("写评论")
+	if !containerOK || !rowOK || !inputOK {
+		t.Fatalf("comment composer container/row/input missing: container=%v row=%v input=%v", containerOK, rowOK, inputOK)
+	}
+	if row.H <= input.H || container.H != row.H {
+		t.Fatalf("single-line input has no symmetric vertical centering room: container=%+v row=%+v input=%+v", container, row, input)
+	}
+	top := input.Y - container.Y
+	bottom := container.Y + container.H - (input.Y + input.H)
+	if top < 0 || bottom < 0 || top-bottom > 1 || bottom-top > 1 {
+		t.Fatalf("single-line input is not vertically centered in its container: top=%.1f bottom=%.1f container=%+v input=%+v", top, bottom, container, input)
+	}
+}
+
 // The task fields keep usable room: fitting the footer by collapsing the
 // content would hide what the reader opened the sheet for.
 func TestDetailContentKeepsUsableHeight(t *testing.T) {

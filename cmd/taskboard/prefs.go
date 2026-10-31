@@ -93,6 +93,7 @@ type uiPrefs struct {
 	DisplayName       string          `json:"displayName,omitempty"`       // user's display name for agent identity; falls back to "gui"
 	LastTaskProjectID string          `json:"lastTaskProjectId,omitempty"` // project preselected by the next global ⌘N
 	LastTaskRuntime   string          `json:"lastTaskRuntime,omitempty"`   // execution channel preselected by the next task composer
+	ProjectSort       string          `json:"projectSort,omitempty"`       // sidebar project order: default / updated / created
 	GlobalNewTaskHot  bool            `json:"globalNewTaskHot"`            // ⌘⇧N works while the app is in the background
 }
 
@@ -134,6 +135,9 @@ func loadUIPrefs() uiPrefs {
 	}
 	if !p.Appearance.valid() {
 		p.Appearance = appearSystem
+	}
+	if p.ProjectSort != "" && p.ProjectSort != "updated" && p.ProjectSort != "created" {
+		p.ProjectSort = ""
 	}
 	return p
 }

@@ -59,6 +59,27 @@ func TestUIPrefsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUIPrefsProjectSortRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+	t.Setenv("TASKBOARD_DB", "")
+
+	if err := saveUIPrefs(uiPrefs{ProjectSort: "updated"}); err != nil {
+		t.Fatalf("save project sort: %v", err)
+	}
+	if got := loadUIPrefs().ProjectSort; got != "updated" {
+		t.Fatalf("loaded ProjectSort = %q, want updated", got)
+	}
+
+	if err := saveUIPrefs(uiPrefs{ProjectSort: "invalid"}); err != nil {
+		t.Fatalf("save invalid project sort: %v", err)
+	}
+	if got := loadUIPrefs().ProjectSort; got != "" {
+		t.Fatalf("invalid ProjectSort = %q after load, want default", got)
+	}
+}
+
 // TestUIPrefsGlobalHotkeyRoundTrip covers the ⌘⇧N global-hotkey switch: a
 // prefs file without the key (fresh install, or one written before the
 // switch existed) defaults to ON — the user who never touched the setting

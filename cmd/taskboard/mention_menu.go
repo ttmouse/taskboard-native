@@ -1,6 +1,10 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/egoist/mygo/ui"
 
 	"taskboard-native/internal/executor"
@@ -14,6 +18,17 @@ import (
 // It must be built after the box it anchors to, in the same frame; the panel
 // flips above the box when the sheet leaves no room below.
 func (b *board) mentionMenu(c *ui.Context, t *ui.Theme, d *detail, box ui.Element) {
+	query, hasFileQuery := commentMentionSearch(d)
+	channels := executor.Runtimes()
+	showChannels := !hasFileQuery || query == ""
+	var files []workspaceMentionTarget
+	if d.mentionOpen {
+		files = b.filteredWorkspaceMentions(d, query)
+	}
+	channelCount := 0
+	if showChannels {
+		channelCount = len(channels)
+	}
 	ui.PopoverBase(c, box, &d.mentionOpen, func(panel ui.Element) {
 		panel.Width(t.Space(66)).
 			Padding(t.Space(1.5)).
@@ -27,11 +42,12 @@ func (b *board) mentionMenu(c *ui.Context, t *ui.Theme, d *detail, box ui.Elemen
 			AttachTo(box, ui.AnchorTopLeft, ui.AnchorBottomLeft)
 		panel.Children(func() {
 			ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
-				ui.Text(c, "跟进渠道").
-					FontSize(fxs(t)).TextColor(t.TextMuted).
-					Padding(t.Space(1), t.Space(1.5), t.Space(0.5), t.Space(1.5))
-				channels := executor.Runtimes()
-				for i, channel := range channels {
+				if showChannels {
+					ui.Text(c, "跟进渠道").
+						FontSize(fxs(t)).TextColor(t.TextMuted).
+						Padding(t.Space(1), t.Space(1.5), t.Space(0.5), t.Space(1.5))
+				}
+				for i, channel := range channels[:channelCount] {
 					ch := channel
 					item := ui.ButtonBase(c.Key("mention-"+ch.ID)).
 						Label("评论提醒 "+ch.Label).
@@ -62,12 +78,297 @@ func (b *board) mentionMenu(c *ui.Context, t *ui.Theme, d *detail, box ui.Elemen
 						b.selectMentionChannel(d, ch.ID)
 					}
 				}
+				if len(files) > 0 {
+					label := "项目文件"
+					if query != "" {
+						label = "匹配文件"
+					}
+					ui.Text(c, label).FontSize(fxs(t)).TextColor(t.TextMuted).
+						Padding(t.Space(1), t.Space(1.5), t.Space(0.5), t.Space(1.5))
+				}
+				for i, target := range files {
+					index := channelCount + i
+					target := target
+					item := ui.ButtonBase(c.Key("file-mention-"+target.Path)).
+						Label("提及项目文件 "+target.Path).
+						FillWidth().Height(t.Space(8)).Padding(t.Space(1), t.Space(1.5)).
+						Gap(t.Space(1)).AlignItems(ui.Center).Justify(ui.Start).
+						BorderWidth(0).Radius(t.Radius)
+					face := ui.Transparent
+					if index == d.mentionIndex {
+						face = t.Text.Alpha(0.12)
+					}
+					if item.Hovered() {
+						face = t.Text.Alpha(0.08)
+					}
+					if item.Pressed() {
+						face = t.Text.Alpha(0.14)
+					}
+					item.Background(face).Children(func() {
+						icon := "📄"
+						if target.IsDir {
+							icon = "📁"
+						}
+						ui.Text(c, icon).FontSize(fsm(t))
+						ui.Text(c, target.Path).FontSize(fsm(t)).TextColor(t.Text).
+							MaxLines(1).Ellipsis("…").Tooltip(target.Path)
+					})
+					if item.Clicked() {
+						d.comment = insertWorkspaceMention(d.comment, target.Path)
+						d.mentionOpen = false
+						d.commentFocus = 3
+					}
+				}
+				if !showChannels && len(files) == 0 {
+					ui.Text(c, "没有匹配的项目文件").FontSize(fsm(t)).
+						TextColor(t.TextMuted).Padding(t.Space(1.5), t.Space(2))
+				}
 			})
 		})
 	})
 }
 
+func (b *board) filteredWorkspaceMentions(d *detail, query string) []workspaceMentionTarget {
+	if d == nil {
+		return nil
+	}
+	if d.fileMentionTargets == nil {
+		if p, ok := b.projectByID(d.snap.ProjectID); ok && strings.TrimSpace(p.WorkspacePath) != "" {
+			d.fileMentionTargets = workspaceMentionTargets(p.WorkspacePath)
+		} else {
+			d.fileMentionTargets = []workspaceMentionTarget{}
+		}
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	out := make([]workspaceMentionTarget, 0, 20)
+	for _, target := range d.fileMentionTargets {
+		if query == "" || strings.Contains(strings.ToLower(target.Path), query) {
+			out = append(out, target)
+			if len(out) == 20 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func (b *board) taskFileMentionMenu(c *ui.Context, t *ui.Theme, f *form, box ui.Element) {
+	query, open := workspaceMentionQuery(f.name)
+	if open {
+		f.fileMentionOpen = true
+		if f.fileMentionProjectID != f.projectID || f.fileMentionTargets == nil {
+			f.fileMentionProjectID = f.projectID
+			if p, ok := b.projectByID(f.projectID); ok {
+				f.fileMentionTargets = workspaceMentionTargets(p.WorkspacePath)
+			} else {
+				f.fileMentionTargets = []workspaceMentionTarget{}
+			}
+		}
+	}
+	if !open {
+		f.fileMentionOpen = false
+	}
+	if !f.fileMentionOpen {
+		return
+	}
+	files := filterWorkspaceMentionTargets(f.fileMentionTargets, query, 20)
+	ui.PopoverBase(c, box, &f.fileMentionOpen, func(panel ui.Element) {
+		panel.Width(t.Space(70)).Padding(t.Space(1.5)).Radius(t.Radius+6).
+			BorderWidth(1).BorderColor(t.Border).Background(t.Surface).
+			Shadow(0, 14, 34, 0, ui.RGBA(0, 0, 0, 0.22)).Margin(t.Space(1)).
+			AttachTo(box, ui.AnchorTopLeft, ui.AnchorBottomLeft)
+		panel.Children(func() {
+			ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
+				ui.Text(c, "项目文件").FontSize(fxs(t)).TextColor(t.TextMuted).
+					Padding(t.Space(1), t.Space(1.5), t.Space(0.5), t.Space(1.5))
+				for i, target := range files {
+					target := target
+					item := ui.ButtonBase(c.Key("task-file-mention-"+target.Path)).
+						Label("提及项目文件 "+target.Path).FillWidth().Height(t.Space(8)).
+						Padding(t.Space(1), t.Space(1.5)).Gap(t.Space(1)).
+						AlignItems(ui.Center).Justify(ui.Start).BorderWidth(0).Radius(t.Radius)
+					face := ui.Transparent
+					if i == f.fileMentionIndex {
+						face = t.Text.Alpha(0.12)
+					}
+					if item.Hovered() {
+						face = t.Text.Alpha(0.08)
+					}
+					item.Background(face).Children(func() {
+						icon := "📄"
+						if target.IsDir {
+							icon = "📁"
+						}
+						ui.Text(c, icon).FontSize(fsm(t))
+						ui.Text(c, target.Path).FontSize(fsm(t)).TextColor(t.Text).
+							MaxLines(1).Ellipsis("…").Tooltip(target.Path)
+					})
+					if item.Clicked() {
+						f.name = insertWorkspaceMention(f.name, target.Path)
+						f.fileMentionOpen = false
+					}
+				}
+				if len(files) == 0 {
+					ui.Text(c, "没有匹配的项目文件").FontSize(fsm(t)).TextColor(t.TextMuted).
+						Padding(t.Space(1.5), t.Space(2))
+				}
+			})
+		})
+	})
+}
+
+func (b *board) quickFileMentionMenu(c *ui.Context, t *ui.Theme, box ui.Element) {
+	query, open := workspaceMentionQuery(b.quickTitle)
+	if open {
+		b.quickFileMentionOpen = true
+		if b.quickFileMentionProjectID != b.cur || b.quickFileMentionTargets == nil {
+			b.quickFileMentionProjectID = b.cur
+			if p, ok := b.projectByID(b.cur); ok {
+				b.quickFileMentionTargets = workspaceMentionTargets(p.WorkspacePath)
+			} else {
+				b.quickFileMentionTargets = []workspaceMentionTarget{}
+			}
+		}
+	}
+	if !open {
+		b.quickFileMentionOpen = false
+	}
+	if !b.quickFileMentionOpen {
+		return
+	}
+	files := filterWorkspaceMentionTargets(b.quickFileMentionTargets, query, 20)
+	ui.PopoverBase(c, box, &b.quickFileMentionOpen, func(panel ui.Element) {
+		panel.Width(t.Space(70)).Padding(t.Space(1.5)).Radius(t.Radius+6).
+			BorderWidth(1).BorderColor(t.Border).Background(t.Surface).
+			Shadow(0, 14, 34, 0, ui.RGBA(0, 0, 0, 0.22)).Margin(t.Space(1)).
+			AttachTo(box, ui.AnchorTopLeft, ui.AnchorBottomLeft)
+		panel.Children(func() {
+			ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
+				ui.Text(c, "项目文件").FontSize(fxs(t)).TextColor(t.TextMuted).
+					Padding(t.Space(1), t.Space(1.5), t.Space(0.5), t.Space(1.5))
+				for i, target := range files {
+					target := target
+					item := ui.ButtonBase(c.Key("quick-file-mention-"+target.Path)).
+						Label("提及项目文件 "+target.Path).FillWidth().Height(t.Space(8)).
+						Padding(t.Space(1), t.Space(1.5)).Gap(t.Space(1)).
+						AlignItems(ui.Center).Justify(ui.Start).BorderWidth(0).Radius(t.Radius)
+					face := ui.Transparent
+					if i == b.quickFileMentionIndex {
+						face = t.Text.Alpha(0.12)
+					}
+					if item.Hovered() {
+						face = t.Text.Alpha(0.08)
+					}
+					item.Background(face).Children(func() {
+						icon := "📄"
+						if target.IsDir {
+							icon = "📁"
+						}
+						ui.Text(c, icon).FontSize(fsm(t))
+						ui.Text(c, target.Path).FontSize(fsm(t)).TextColor(t.Text).
+							MaxLines(1).Ellipsis("…").Tooltip(target.Path)
+					})
+					if item.Clicked() {
+						b.quickTitle = insertWorkspaceMention(b.quickTitle, target.Path)
+						b.quickFileMentionOpen = false
+					}
+				}
+				if len(files) == 0 {
+					ui.Text(c, "没有匹配的项目文件").FontSize(fsm(t)).TextColor(t.TextMuted).
+						Padding(t.Space(1.5), t.Space(2))
+				}
+			})
+		})
+	})
+}
+
+func filterWorkspaceMentionTargets(targets []workspaceMentionTarget, query string, limit int) []workspaceMentionTarget {
+	query = strings.ToLower(strings.TrimSpace(query))
+	out := make([]workspaceMentionTarget, 0, limit)
+	for _, target := range targets {
+		if query == "" || strings.Contains(strings.ToLower(target.Path), query) {
+			out = append(out, target)
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func (b *board) workspaceMentionChips(c *ui.Context, t *ui.Theme, value *string, root, key string) {
+	paths := workspaceMentionPaths(*value)
+	if len(paths) == 0 {
+		return
+	}
+	ui.Row(c.Key(key)).FillWidth().Gap(t.Space(1)).Children(func() {
+		for _, rel := range paths {
+			rel := rel
+			icon := "📄"
+			if root != "" {
+				if info, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err == nil && info.IsDir() {
+					icon = "📁"
+				}
+			}
+			label := icon + " " + rel
+			if ui.Button(c.Key(key+"-"+rel), label+" ×").
+				Label("移除文件提及 "+rel).Tooltip("项目路径："+rel).
+				FontSize(fxs(t)).Padding(t.Space(0.5), t.Space(1)).BorderWidth(0).
+				Radius(t.Space(2)).Background(t.Accent.Alpha(0.16)).TextColor(t.Accent).Clicked() {
+				token := "@{" + rel + "}"
+				*value = strings.Replace(*value, token, "", 1)
+			}
+		}
+	})
+}
+
+func (b *board) selectMentionOption(d *detail, index int) {
+	query, hasFileQuery := commentMentionSearch(d)
+	showChannels := !hasFileQuery || query == ""
+	channels := executor.Runtimes()
+	if showChannels && index < len(channels) {
+		b.selectMentionChannel(d, channels[index].ID)
+		return
+	}
+	files := b.filteredWorkspaceMentions(d, query)
+	fileIndex := index
+	if showChannels {
+		fileIndex -= len(channels)
+	}
+	if fileIndex >= 0 && fileIndex < len(files) {
+		if strings.HasPrefix(d.comment, d.mentionSearchBase) {
+			d.comment = d.mentionSearchBase
+		}
+		d.comment = insertWorkspaceMention(d.comment, files[fileIndex].Path)
+		d.mentionOpen = false
+		d.commentFocus = 3
+	}
+}
+
+func commentMentionSearch(d *detail) (string, bool) {
+	if query, ok := workspaceMentionQuery(d.comment); ok {
+		return query, true
+	}
+	if d != nil && d.mentionOpen && strings.HasPrefix(d.comment, d.mentionSearchBase) {
+		query := strings.TrimSpace(strings.TrimPrefix(d.comment, d.mentionSearchBase))
+		if query != "" && !strings.ContainsAny(query, " \t\n") {
+			return query, true
+		}
+	}
+	return "", false
+}
+
+func mentionOptionCount(channels int, files int, showChannels bool) int {
+	if showChannels {
+		return channels + files
+	}
+	return files
+}
+
 func (b *board) selectMentionChannel(d *detail, channelID string) {
+	if strings.HasPrefix(d.comment, d.mentionSearchBase) {
+		d.comment = d.mentionSearchBase
+	}
 	d.commentMention = channelID
 	d.mentionOpen = false
 	// Picking a channel must not steal focus from the draft.

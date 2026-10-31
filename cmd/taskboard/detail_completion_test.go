@@ -28,6 +28,7 @@ func TestReviewDetailCanCompleteTask(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if task, err := f.Task("t-5"); err == nil && task.ColumnID == "c-done" {
+			waitFor(t, tt, "完成后详情关闭", func() bool { return b.detail == nil })
 			return
 		}
 		time.Sleep(time.Millisecond)

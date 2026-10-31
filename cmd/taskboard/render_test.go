@@ -452,10 +452,38 @@ func TestCardFooterActionsShareHoverStyle(t *testing.T) {
 	})
 	settle(t, tt)
 
+	tt.Move(0, 0)
+	tt.Frame()
 	open, _ := tt.Find("打开 Herdr 中的 Codex 对话")
 	approve, _ := tt.Find("验收通过，移到完成")
 	if open.W != approve.W || open.H != approve.H {
 		t.Fatalf("footer action sizes differ: open=%+v approve=%+v", open, approve)
+	}
+	colorCount := func(bounds ui.Rect) int {
+		img := tt.Image()
+		colors := make(map[uint32]struct{})
+		for y := int(bounds.Y + 4); y < int(bounds.Y+bounds.H-4); y++ {
+			for x := int(bounds.X + 4); x < int(bounds.X+bounds.W-4); x++ {
+				pixel := img.RGBAAt(x, y)
+				key := uint32(pixel.R)<<24 | uint32(pixel.G)<<16 | uint32(pixel.B)<<8 | uint32(pixel.A)
+				colors[key] = struct{}{}
+			}
+		}
+		return len(colors)
+	}
+	openAtRest, approveAtRest := colorCount(open), colorCount(approve)
+	if openAtRest != 1 || approveAtRest != 1 {
+		t.Fatalf("footer actions should both be hidden at rest: open colors=%d approve colors=%d", openAtRest, approveAtRest)
+	}
+	title, _ := tt.Find("打开任务：把看板接上 SSE")
+	tt.Move(title.X+title.W/2, title.Y+title.H/2)
+	tt.Advance(50 * time.Millisecond)
+	tt.Frame()
+	if n := colorCount(open); n <= openAtRest {
+		t.Fatalf("chat action did not appear when its card was hovered: colors=%d", n)
+	}
+	if n := colorCount(approve); n <= approveAtRest {
+		t.Fatalf("approval action did not appear with the chat action: colors=%d", n)
 	}
 
 	hoverPixel := func(bounds ui.Rect) [4]uint32 {
@@ -696,8 +724,11 @@ func TestReplyToCommentInThread(t *testing.T) {
 	waitFor(t, tt, "详情关闭", func() bool { return b.detail == nil })
 	b.openDetail(*b.task("t-1"))
 	waitFor(t, tt, "回复线程显示", func() bool {
-		return b.detail != nil && !b.detail.loading && tt.HasText("这是回复") && tt.HasText("回复 @linus")
+		return b.detail != nil && !b.detail.loading && tt.HasText("这是回复") && tt.HasText("回复给 linus")
 	})
+	if !tt.HasText("已加 atTop，拖到列顶也能落位。") {
+		t.Fatal("reply context does not show the parent comment text")
+	}
 }
 
 func TestOwnCommentEditLivesInOverflowMenu(t *testing.T) {

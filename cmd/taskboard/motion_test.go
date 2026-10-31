@@ -184,6 +184,47 @@ func TestMovingCardStaysVisibleAcrossColumns(t *testing.T) {
 	}
 }
 
+func TestNewlyCreatedCardFlightKeepsItsFullHeight(t *testing.T) {
+	f := seedBoard()
+	task := model.Task{
+		ID: "t-dispatch", ProjectID: "local", ColumnID: "c-todo",
+		Title: "直接派发的新任务",
+		Description: "第一行正文\n第二行正文\n第三行正文\n第四行正文",
+		Position: 3000, Version: 1,
+	}
+	f.add(task)
+	b := newBoard(f)
+	configureMotion(b, "B · 柔和弹簧")
+	defer b.stop()
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return b.task(task.ID) != nil })
+	settle(t, tt)
+	label := "打开任务：" + task.Title
+	full, ok := tt.Find(label)
+	if !ok || full.H <= 40 {
+		t.Fatalf("test card did not render at full height: %+v", full)
+	}
+
+	// A direct dispatch can move the card while its create/enter frame still
+	// reports a collapsed source height. The flight must derive its own height
+	// from the full card content instead of freezing that transient measurement.
+	source := b.bounds[task.ID]
+	source.H = full.H / 3
+	b.bounds[task.ID] = source
+	task.ColumnID, task.Version = "c-doing", task.Version+1
+	b.post(func() {
+		b.applyEvent(model.Event{Type: model.EventTaskMoved, ProjectID: b.cur, Task: &task})
+	})
+	tt.Frame()
+	flying, ok := tt.Find(label)
+	if !ok {
+		t.Fatal("moving card lost its identity")
+	}
+	if flying.H < full.H-1 {
+		t.Fatalf("flight clipped card content: flight height %.1f, full height %.1f", flying.H, full.H)
+	}
+}
+
 func TestParallelFlightsAndRetarget(t *testing.T) {
 	b := newBoard(seedBoard())
 	configureMotion(b, "B · 柔和弹簧")
