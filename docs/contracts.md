@@ -19,6 +19,7 @@ tasks(id TEXT PK, number INT UNIQUE, project_id TEXT, column_id TEXT, title TEXT
       position INT, version INT, archived INT, last_agent TEXT,
       created_at TEXT, updated_at TEXT)
 comments(id TEXT PK, task_id TEXT, author TEXT, body TEXT, mention TEXT, parent_comment_id TEXT DEFAULT '', created_at TEXT)
+task_relations(relation_type TEXT, source_task_id TEXT, target_task_id TEXT, created_at TEXT)
 project_runs(project_id TEXT PK, runtime TEXT, status TEXT, task_ids TEXT, cursor INT, current_task_id TEXT, detail TEXT, updated_at TEXT)
 ```
 
@@ -37,12 +38,15 @@ project_runs(project_id TEXT PK, runtime TEXT, status TEXT, task_ids TEXT, curso
 | POST | `/api/projects` | `{name, workspacePath?}` → 201 Project，含默认四列 |
 | PATCH | `/api/projects/{id}` | `{name?, workspacePath?}`（提供即更新）→ 200 Project，事件 `project.changed`；`name` 须非空，`workspacePath` 空字符串清除路径、`~`/`~/` 前缀展开为家目录、展开后须为本机存在的绝对目录；不迁移卡片、不创建目录 |
 | DELETE | `/api/projects/{id}` | → 200 `{"ok":true}`，级联移除项目及全部卡片；项目自动承接仍开启或任一卡片执行记录活跃时返回 409 `project_busy`，须先停止承接或等原会话结束 |
-| GET | `/api/projects/{id}/board` | `Board`（列 + 任务，含 archived=false；每张任务含可选 `execution` 会话记录） |
+| GET | `/api/projects/{id}/board` | `Board`（列 + archived=false 的任务；每张任务含可选 `execution` 和 `relations`） |
 | PATCH | `/api/projects/{id}/columns/{columnID}` | `{"role":"intake|doing|review|done|""}` → 200 `Column`，事件 `project.changed`；`role` 必填且须在枚举内，否则 400；项目或列不存在、列不属于该项目 404；同项目内该角色已被另一个列占用 409 `role_conflict`（不静默抢占）；把列重设成自己已有的值或空字符串（清空）允许 |
-| GET | `/api/tasks?projectId=` | `[Task]`，projectId 必填；每张任务含可选 `execution` 会话记录；可选 columnId、assignee、limit、offset、summary |
-| GET | `/api/tasks/{id}` | `Task`（含正文与全部评论） |
+| GET | `/api/tasks?projectId=` | `[Task]`，projectId 必填；每张任务含可选 `execution` 会话记录和 `relations`；可选 columnId、assignee、limit、offset、summary |
+| GET | `/api/tasks/{id}` | `Task`（含正文、全部评论与 `relations`；关系摘要含 id/number/title/columnId/archived） |
+| POST | `/api/tasks/{id}/relations/{type}/{relatedId}` | `{"version":N}` → 200 `{"task":Task,"relatedTask":Task}`；类型 `parent`（relatedId 是父卡）、`blocks`（本卡阻塞 relatedId）、`blocked_by`（relatedId 阻塞本卡）、`related`（无向）。双方须在同项目且不得是自身；每张子卡只有一个父卡，父子关系拒绝成环。向已在 `doing` / `review` 的卡添加 `blocked_by` 时也执行依赖门禁。关系变化为两端任务发布 `task.updated`；更换父卡时旧父卡也收到更新事件。 |
+| DELETE | `/api/tasks/{id}/relations/{type}/{relatedId}` | `{"version":N}` → 200 `{"task":Task,"relatedTask":Task}`；移除对应关系，版本冲突返回 409。 |
+| GET | `/api/tasks/{id}/handoff-log` | `{taskId,summary,events}`：该卡最近自动承接 JSONL 事件（taskId 或 taskIds 命中，最多约 100 条，旧→新）；`summary` 含 runtime、startedAt、endedAt、durationMs、lastEvent/lastLabel、reason、outcome；任务号/短 id 经既有 resolveTaskID；无日志时 events 为空数组 |
 | POST | `/api/tasks` | `NewTask`（可选 `dispatchRuntime`）→ 201 `Task`，事件 `task.created`；带 `dispatchRuntime` 时同一请求建卡并派发该渠道（先校验渠道与项目 workspacePath，无效 400 不建卡；渠道确认接收后卡片移入 `doing`，启动失败回写失败评论并保留原列） |
-| PATCH | `/api/tasks/{id}` | `TaskPatch`（version 必填）→ 200 `Task`；移动列时事件 `task.moved`（带 from/to），否则 `task.updated` |
+| PATCH | `/api/tasks/{id}` | `TaskPatch`（version 必填）→ 200 `Task`；移入或恢复到 `doing` / `review` 前，未归档 blocker 必须位于 `done` 角色列，否则 400；已归档 blocker 按已关闭处理；移动列时事件 `task.moved`（带 from/to），否则 `task.updated` |
 | POST | `/api/tasks/{id}/archive` | `{"version":N}` → 200 `Task`，事件 `task.archived` |
 | GET | `/api/tasks/{id}/comments` | `[Comment]` |
 | POST | `/api/tasks/{id}/comments` | `NewComment`（`text`，可选 `mention`：`dsh`\|`codex`\|`pi`\|`claude`、`parentCommentId`）→ 201 `Comment`，事件 `comment.added`；`parentCommentId` 必须属于同一任务，允许回复任意层级评论；`mention` 未知渠道返回 400。在评审列添加带 `mention` 的评论时，评论保存后将卡片移回入口列（若项目定义了入口列），并发出 `task.moved`；普通评论不触发此回退。 |
@@ -137,7 +141,7 @@ tb serve [--addr ...]        # 前台跑服务（--detach 后台）
 
 - 原生新建任务和评论输入框支持项目文件提及：在词首输入 `@` 后从当前项目 `workspacePath` 下搜索文件/目录，选中项以 `@{相对路径}` 写入文本并在建议列表中显示类型图标。最多扫描 500 个非隐藏条目，跳过 `.git`、`node_modules`、`vendor` 和符号链接；没有有效工作目录时不提供文件建议。已保存文本中的提及在任务正文/评论显示为可点击的文件链接，目标始终限定在项目工作目录内；未识别或旧文本中的 `@` 保持普通文本。提及只保存在原有标题/描述/评论文本中，不增加 API 字段或文件上传接口。
 
-- 单窗口看板：项目切换、列、卡片、建卡/编辑/移动/评论（可回复任意评论；作者可从更多菜单编辑或删除自己的评论）/归档、加载态（`plugins/loading`）、空态、明暗主题跟随系统。
+- 单窗口看板：项目切换、列、卡片、建卡/编辑/移动/评论（可回复任意评论；作者可从更多菜单编辑或删除自己的评论）、子任务与阻塞关系、复制卡（含评论）、归档、加载态（`plugins/loading`）、空态、明暗主题跟随系统。
 - 数据只经 HTTP 客户端；SSE 事件就地更新，不整表重建。版本冲突按契约拉详情对齐。
 - 视觉规格见 `docs/design.md`（乔布斯产出）。
 

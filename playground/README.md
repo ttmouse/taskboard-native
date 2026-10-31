@@ -12,7 +12,7 @@
 
 ## 直接使用
 
-打开 `build/playground/darwin-arm64/Taskboard Motion Playground.app`。在顶栏选择方案，再点“播放同一场景”；可点“停止”后换方案重播。
+打开 `build/playground/darwin-arm64/Taskboard Motion Playground.app`。在顶栏选择方案，再点“播放同一场景”；可点“停止”后换方案重播。顶栏标题右侧显示当前构建版本——Playground 与正式 App 各自独立编号，`scripts/generate_version.py` 同时生成两者的版本常量，避免屏幕上的版本和 Finder 里看到的 bundle 版本对不上。
 
 每次播放都通过该 App 独立启动的 HTTP API：清理临时场景 → 连续新增三卡 → 错峰经过进行中、评审、完成 → 两卡同时回到不同状态 → 再次完成。创建间隔固定 180ms、API 移动间隔固定 120ms，三套方案不改变请求时序。场景全部使用临时数据库，只保留到本机临时目录的生命周期；不读取正式数据库，退出不会自动删除任何目录。
 
@@ -31,6 +31,12 @@ go run -tags motionplayground ./cmd/taskboard
 ```
 
 可选 `--variant A` / `B` / `C`，`--autoplay` 自动播放一次，`--compare` 自动顺次播放三个方案。
+
+## 评论回复静态样张
+
+顶栏「评论回复样张」或启动参数 `--reply` 会打开一页静态样张，专门用来看任务详情里回复的呈现：每条回复在自己正文上方引用被回复评论的作者与原文（作者用强调色，最多两行、超出省略，悬停看全文）；被引用的评论已删除时显示「原评论已删除」，回复块位置不跳；回复按时间正序排在父评论下面，左侧一条竖线表示归属；超过两层不再继续缩进，避免卡片被竖线挤窄到读不下——这一条与正式详情页的 `commentThreads` 完全一致。页面只画假数据，不读写服务，按钮没有绑定动作；左上「返回看板」回到 Playground。
+
+同样的视图函数在无显示环境下也能出图：`GOFLAGS=-tags=motionplayground go test ./cmd/taskboard -run TestReplySamplePage` 会把 1280×1500 与 1060×700 两版样张写到 `docs/assets/render/reply-page.png`、`reply-page-narrow.png`，并断言引用块、缩进、竖线与最小窗口边界都在。
 
 ## 隔离与验收门
 
