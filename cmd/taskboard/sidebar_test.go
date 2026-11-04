@@ -214,7 +214,7 @@ func TestSidebarToggleKeyReleaseNoRetrigger(t *testing.T) {
 
 
 // TestSidebarToggleKeyRepeatDoesNotRetrigger: MyGo routes isARepeat
-// KeyPressed into OnShortcut. Holding Cmd+B must not flip-flop the rail.
+// KeyPressed into OnShortcut. Repeats inside the cooldown must not flip-flop.
 func TestSidebarToggleKeyRepeatDoesNotRetrigger(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
@@ -235,28 +235,66 @@ func TestSidebarToggleKeyRepeatDoesNotRetrigger(t *testing.T) {
 		t.Fatal("key gate should arm after the first ⌘B")
 	}
 
-	// Simulate auto-repeat arriving before the hold-guard elapses.
+	// Simulate auto-repeat arriving before the cooldown elapses.
 	tt.Advance(50 * time.Millisecond)
 	tt.Frame()
 	if b.allowSidebarKeyShortcut() {
-		t.Fatal("auto-repeat within hold-guard toggled again")
+		t.Fatal("auto-repeat within cooldown toggled again")
 	}
 	if !b.prefs.SidebarCollapsed {
 		t.Fatal("auto-repeat flipped the sidebar open")
 	}
 
-	// After hold-guard + quiet with no further repeats, a real second press works.
-	tt.Advance(sidebarKeyHoldGuard + sidebarKeyQuiet + 20*time.Millisecond)
+	// After cooldown, a real second press works (gate may still be armed).
+	tt.Advance(sidebarKeyCooldown + 20*time.Millisecond)
 	tt.Frame()
-	if b.sidebarKeyGate {
-		t.Fatal("key gate did not clear after quiet gap")
-	}
 	tt.Key(ui.Cmd, ui.KeyB)
 	tt.Frame()
 	if b.prefs.SidebarCollapsed {
-		t.Fatal("second ⌘B after quiet gap did not restore the sidebar")
+		t.Fatal("second ⌘B after cooldown did not restore the sidebar")
 	}
-	fmt.Printf("sidebar_perf case=key_repeat_guard suppressed=true restored_after_quiet=true\n")
+	fmt.Printf("sidebar_perf case=key_repeat_guard suppressed=true restored_after_cooldown=true\n")
+}
+
+// TestSidebarToggleHoldPastCooldownRetriggers: a held chord whose repeats
+// arrive farther apart than the cooldown must produce multiple toggles.
+func TestSidebarToggleHoldPastCooldownRetriggers(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	wantCollapsed := []bool{true, false, true}
+	for i, want := range wantCollapsed {
+		if i > 0 {
+			// Gap longer than cooldown, as if the OS delivered a slow repeat.
+			tt.Advance(sidebarKeyCooldown + 50*time.Millisecond)
+			tt.Frame()
+		}
+		if !b.allowSidebarKeyShortcut() {
+			t.Fatalf("step %d: expected accept after cooldown gap", i+1)
+		}
+		b.toggleSidebarForCase("key_down")
+		tt.Frame()
+		if b.prefs.SidebarCollapsed != want {
+			t.Fatalf("step %d: SidebarCollapsed=%v, want %v", i+1, b.prefs.SidebarCollapsed, want)
+		}
+	}
+	// A tight repeat still inside the window must stay suppressed.
+	tt.Advance(50 * time.Millisecond)
+	tt.Frame()
+	if b.allowSidebarKeyShortcut() {
+		t.Fatal("tight repeat after last accept should stay blocked")
+	}
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("tight repeat flipped the sidebar")
+	}
+	fmt.Printf("sidebar_perf case=key_hold_past_cooldown toggles=3 suppressed_tight=true\n")
 }
 
 func TestSidebarToggleIconClickLatency(t *testing.T) {

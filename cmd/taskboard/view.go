@@ -1013,22 +1013,23 @@ func (b *board) sidebarWidth(t *ui.Theme) float32 {
 }
 
 
-// sidebarKeyHoldGuard covers macOS "Delay Until Repeat" so the first
-// isARepeat after a hold cannot clear the gate during the quiet gap.
-const (
-	sidebarKeyHoldGuard = 400 * time.Millisecond
-	sidebarKeyQuiet     = 100 * time.Millisecond
-)
+// sidebarKeyCooldown is the minimum gap between accepted Cmd+B toggles.
+// Auto-repeat inside the window is ignored; after it elapses a held chord
+// may toggle again (caller saw long repeat intervals still blocked forever
+// when the old gate re-armed on every rejected repeat).
+const sidebarKeyCooldown = 400 * time.Millisecond
 
 // allowSidebarKeyShortcut reports whether this Cmd+B OnShortcut should
-// toggle. Auto-repeat refreshes the gate so a held chord cannot flip-flop
-// the drawer; after release the quiet gap past the hold-guard opens it again.
+// toggle. Cooldown is measured from the last *accepted* toggle only —
+// rejected repeats must not refresh ArmedAt.
 func (b *board) allowSidebarKeyShortcut() bool {
 	now := b.sidebarNow()
 	if b.sidebarKeyGate {
 		b.sidebarKeySeenAt = now
-		b.sidebarKeyArmedAt = now
-		return false
+		if now.Sub(b.sidebarKeyArmedAt) < sidebarKeyCooldown {
+			return false
+		}
+		// Cooldown elapsed: accept even if the key is still held.
 	}
 	b.sidebarKeyGate = true
 	b.sidebarKeySeenAt = now
@@ -1041,10 +1042,7 @@ func (b *board) tickSidebarKeyGate() {
 		return
 	}
 	now := b.sidebarNow()
-	if now.Sub(b.sidebarKeyArmedAt) < sidebarKeyHoldGuard {
-		return
-	}
-	if now.Sub(b.sidebarKeySeenAt) < sidebarKeyQuiet {
+	if now.Sub(b.sidebarKeyArmedAt) < sidebarKeyCooldown {
 		return
 	}
 	b.sidebarKeyGate = false

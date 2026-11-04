@@ -423,10 +423,10 @@ type board struct {
 	sidebarPerfToggleAt    time.Time
 	sidebarPerfFirstChange time.Duration
 	sidebarPerfCase        string
-	// sidebarKeyGate suppresses Cmd+B auto-repeat (MyGo delivers isARepeat
-	// KeyPressed into OnShortcut the same as the first press). Armed on an
-	// accepted key toggle; refreshed while repeats arrive; cleared after a
-	// quiet gap past the hold-guard so a real second press still works.
+	// sidebarKeyGate / sidebarKeyArmedAt implement a Cmd+B cooldown: MyGo
+	// delivers isARepeat KeyPressed into OnShortcut like the first press.
+	// ArmedAt is the last *accepted* toggle; repeats inside the cooldown are
+	// ignored, but a held chord may re-toggle once the window elapses.
 	sidebarKeyGate    bool
 	sidebarKeyArmedAt time.Time
 	sidebarKeySeenAt  time.Time
