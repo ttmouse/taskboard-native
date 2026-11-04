@@ -36,6 +36,40 @@ type herdrLaunchError struct {
 	uncertain bool
 }
 
+// herdrErrorKind distinguishes Herdr failures that should fall back to CLI
+// from those that should surface directly (Herder works fine, the project
+// just isn't configured for it).
+type herdrErrorKind int
+
+const (
+	// herdrErrUnavailable means Herdr binary or service cannot be reached at all.
+	// The dispatcher should fall back to direct CLI execution.
+	herdrErrUnavailable herdrErrorKind = iota
+	// herdrErrConfig means Herdr is reachable but the project isn't wired up
+	// (no matching space etc.). Fallback is NOT appropriate — Herdr IS
+	// available, just not for this project.
+	herdrErrConfig
+)
+
+type herdrError struct {
+	kind herdrErrorKind
+	err  error
+}
+
+func (e *herdrError) Error() string { return e.err.Error() }
+func (e *herdrError) Unwrap() error { return e.err }
+
+// isHerdrUnavailable reports whether err classifies as herdrErrUnavailable.
+func isHerdrUnavailable(err error) bool {
+	var herdrErr *herdrError
+	if errors.As(err, &herdrErr) {
+		return herdrErr.kind == herdrErrUnavailable
+	}
+	// Legacy: anything that wraps the original exec errors from ResolveHerdrApp
+	// (e.g. from herdrCommand) also counts as unavailable.
+	return strings.Contains(err.Error(), "找不到 herdr-app") || strings.Contains(err.Error(), "找不到 hc")
+}
+
 var errHerdrSpaceNotFound = errors.New("Herdr project space not found")
 
 var herdrSpaceLocks sync.Map
@@ -50,6 +84,20 @@ func ResolveHerdrApp() (string, error) {
 // omits the directory containing Herdr Core's hc command.
 func ResolveHerdrCore() (string, error) {
 	return resolveHerdrExecutable("hc")
+}
+
+// herdrAvailable reports whether both herdr-app and hc are installed on this
+// machine. The dispatcher uses it to decide whether a non-DSH runtime should
+// route through Herdr or fall back to direct CLI execution. It is a variable
+// so tests can simulate a machine without Herdr deterministically.
+var herdrAvailable = func() bool {
+	if _, err := ResolveHerdrApp(); err != nil {
+		return false
+	}
+	if _, err := ResolveHerdrCore(); err != nil {
+		return false
+	}
+	return true
 }
 
 func resolveHerdrExecutable(name string) (string, error) {
@@ -185,40 +233,46 @@ func herdrCreate(ctx context.Context, task model.Task, projectName, dir, runtime
 	spaceLock.Lock()
 	defer spaceLock.Unlock()
 
+	// Phase 1: initial herdr ls — a failure here means Herdr truly is
+	// unavailable (binary missing or service unreachable), so we classify
+	// these as Unavailable and let the dispatcher fall back to CLI.
 	command, err := herdrCommand(ctx, "ls")
 	if err != nil {
-		return "", fmt.Errorf("无法读取 Herdr space 列表：%w", err)
+		return "", &herdrError{kind: herdrErrUnavailable, err: fmt.Errorf("无法读取 Herdr space 列表：%w", err)}
 	}
 	spacesRaw, err := command.Output()
 	if err != nil {
-		return "", fmt.Errorf("无法读取 Herdr space 列表：%w", err)
+		return "", &herdrError{kind: herdrErrUnavailable, err: fmt.Errorf("无法读取 Herdr space 列表：%w", err)}
 	}
 	spaceID, err := herdrSpaceForFolder(spacesRaw, dir, projectName)
 	if errors.Is(err, errHerdrSpaceNotFound) {
+		// Phase 2: create the space — herdr ls already worked, so any failure
+		// here means Herdr IS reachable but doesn't support this command or
+		// rejects it for project-specific reasons. We call that Config.
 		createArgs := []string{"do", "space.new", "--name", projectName, "--folder", dir}
 		command, commandErr := herdrCommand(ctx, createArgs...)
 		if commandErr != nil {
-			return "", fmt.Errorf("无法在 Herdr 创建项目 space：%w", commandErr)
+			return "", &herdrError{kind: herdrErrUnavailable, err: fmt.Errorf("无法在 Herdr 创建项目 space：%w", commandErr)}
 		}
 		out, createErr := command.CombinedOutput()
 		if createErr != nil {
-			return "", fmt.Errorf("无法在 Herdr 创建项目 space：%s", strings.TrimSpace(string(out)))
+			return "", &herdrError{kind: herdrErrConfig, err: fmt.Errorf("无法在 Herdr 创建项目 space：%s", strings.TrimSpace(string(out)))}
 		}
 		command, err = herdrCommand(ctx, "ls")
 		if err != nil {
-			return "", fmt.Errorf("Herdr 已请求创建项目 space，但无法重新读取 space 列表：%w", err)
+			return "", &herdrError{kind: herdrErrUnavailable, err: fmt.Errorf("Herdr 已请求创建项目 space，但无法重新读取 space 列表：%w", err)}
 		}
 		spacesRaw, err = command.Output()
 		if err != nil {
-			return "", fmt.Errorf("Herdr 已请求创建项目 space，但无法重新读取 space 列表：%w", err)
+			return "", &herdrError{kind: herdrErrConfig, err: fmt.Errorf("Herdr 已请求创建项目 space，但无法重新读取 space 列表：%w", err)}
 		}
 		spaceID, err = herdrSpaceForFolder(spacesRaw, dir, projectName)
 		if err != nil {
-			return "", fmt.Errorf("Herdr 已请求创建项目 space，但无法确认它：%w", err)
+			return "", &herdrError{kind: herdrErrConfig, err: fmt.Errorf("Herdr 已请求创建项目 space，但无法确认它：%w", err)}
 		}
 	}
 	if err != nil {
-		return "", err
+		return "", &herdrError{kind: herdrErrConfig, err: err}
 	}
 	argv := []string{"env", "TASKBOARD_ADDR=" + strings.TrimPrefix(boardURL, "http://"), "TB_AGENT=" + actor, "TASKBOARD_DISPATCH_TASK_ID=" + task.ID, runtime}
 	switch runtime {

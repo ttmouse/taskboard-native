@@ -197,6 +197,115 @@ func TestDispatchFailureKeepsColumn(t *testing.T) {
 	}
 }
 
+// withoutHerdr simulates a machine without the Herdr binaries. Dispatch must
+// still work there by spawning the runtime CLI directly.
+func withoutHerdr(t *testing.T) {
+	t.Helper()
+	previous := herdrAvailable
+	herdrAvailable = func() bool { return false }
+	t.Cleanup(func() { herdrAvailable = previous })
+}
+
+func TestDispatchFallsBackToCLIWhenHerdrMissing(t *testing.T) {
+	withoutHerdr(t)
+	st := newTestStore(t)
+	p, task := projectWithWorkspace(t, st)
+	marker := filepath.Join(t.TempDir(), "cli-args")
+	t.Setenv("CLI_MARKER", marker)
+	installFakeCLI(t, `printf '%s\n' "$PWD" "$@" > "$CLI_MARKER"`)
+	d := NewDispatcher(st)
+	defer d.Close()
+
+	if err := d.Dispatch(task.ID, RuntimeCodex, "fallback-test"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "CLI fallback returned", func() (bool, string) {
+		run, err := st.Execution(task.ID)
+		return err == nil && run != nil && run.Status == "returned", fmt.Sprint(run, err)
+	})
+	run, err := st.Execution(task.ID)
+	if err != nil || run == nil || run.Channel() != RuntimeCodex || run.SessionID != "" {
+		t.Fatalf("fallback execution = %+v, err=%v", run, err)
+	}
+	args, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("fallback never launched the CLI: %v", err)
+	}
+	if !strings.Contains(string(args), BuildTaskText(task)) {
+		t.Fatalf("fallback prompt = %q", args)
+	}
+	// The Codex review pipeline needs `hc run`, which only exists inside Herdr.
+	if strings.Contains(string(args), "hc run") {
+		t.Fatalf("fallback prompt still requires Herdr's hc: %q", args)
+	}
+	comments, _ := st.Comments(task.ID)
+	for _, c := range comments {
+		if strings.Contains(c.Text, "已交给 Herdr") {
+			t.Fatalf("missing Herdr still reported as used: %q", c.Text)
+		}
+	}
+	cur, _ := st.Task(task.ID)
+	doing, _ := p.ColumnByRole("doing")
+	if cur.ColumnID != doing.ID {
+		t.Fatalf("fallback dispatch did not move the card into doing: %+v", cur)
+	}
+}
+
+func TestDispatchFallsBackToCLIWhenHerdrUnreachable(t *testing.T) {
+	st := newTestStore(t)
+	_, task := projectWithWorkspace(t, st)
+	dir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "cli-args")
+	t.Setenv("CLI_MARKER", marker)
+	// Both binaries resolve, so Herdr looks installed; but its service is down
+	// and `herdr-app ls` fails. The dispatcher must fall back instead of
+	// leaving the card stuck.
+	for _, name := range []string{"herdr-app", "hc"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nprintf '%s\n' \"$PWD\" \"$@\" > \"$CLI_MARKER\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	d := NewDispatcher(st)
+	defer d.Close()
+
+	if err := d.Dispatch(task.ID, RuntimeCodex, "fallback-test"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "CLI fallback returned", func() (bool, string) {
+		run, err := st.Execution(task.ID)
+		return err == nil && run != nil && run.Status == "returned", fmt.Sprint(run, err)
+	})
+	run, err := st.Execution(task.ID)
+	if err != nil || run == nil || run.Channel() != RuntimeCodex || run.SessionID != "" {
+		t.Fatalf("fallback execution = %+v, err=%v", run, err)
+	}
+	if _, err := os.ReadFile(marker); err != nil {
+		t.Fatalf("fallback never launched the CLI: %v", err)
+	}
+	comments, _ := st.Comments(task.ID)
+	if !hasComment(comments, "回退到独立 CLI 执行") {
+		t.Fatalf("fallback reason missing from comments: %+v", comments)
+	}
+	for _, c := range comments {
+		if strings.Contains(c.Text, "已交给 Herdr") {
+			t.Fatalf("unreachable Herdr still reported as used: %q", c.Text)
+		}
+	}
+}
+
+func hasComment(comments []model.Comment, substr string) bool {
+	for _, c := range comments {
+		if strings.Contains(c.Text, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDispatchInFlightMutex(t *testing.T) {
 	st := newTestStore(t)
 	p, task := projectWithWorkspace(t, st)

@@ -358,43 +358,62 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 		return
 	}
 	if runtime != RuntimeDSH {
+		// Every non-DSH outcome (Herdr accepted, Herdr failed, or CLI fallback)
+		// must release the auto-run queue for this card.
 		defer d.finishProjectCard(task.ID)
+	}
+	if runtime != RuntimeDSH && herdrAvailable() {
 		start := time.Now()
 		run := &model.Execution{TaskID: task.ID, Runtime: runtime, Status: "submitting", FollowupID: followupID, Detail: "正在请求 Herdr 在项目 space 中创建 tab"}
 		if err := d.store.SaveExecution(*run); err != nil {
-			d.setFollowup(followupID, "failed")
-			d.comment(task.ID, actor, "保存 Herdr 派发意图失败，尚未创建 tab："+err.Error())
-			return
-		}
-		sessionID, err := herdrCreate(ctx, task, projectName, dir, runtime, d.boardURL, actor, text)
-		if err != nil {
-			var launchErr *herdrLaunchError
-			if errors.As(err, &launchErr) && launchErr.uncertain {
-				run.Status, run.Detail = "unknown", "Herdr 创建 tab 的回执不确定；禁止再次创建，请先在项目 space 核对："+err.Error()
-				d.setFollowup(followupID, "unknown")
-			} else {
-				run.Status, run.Detail = "failed", err.Error()
-				d.setFollowup(followupID, "failed")
+			d.comment(task.ID, actor, "保存 Herdr 派发意图失败，回退 CLI："+err.Error())
+		} else {
+			sessionID, herr := herdrCreate(ctx, task, projectName, dir, runtime, d.boardURL, actor, text)
+			if herr == nil {
+				run.SessionID, run.Status, run.Detail = sessionID, "running", HerdrInitialTurnPendingDetail
+				if err := d.store.SaveExecution(*run); err != nil {
+					d.setFollowup(followupID, "unknown")
+					d.comment(task.ID, actor, "Herdr 已创建 terminal，但执行记录保存失败；不会另建会话："+err.Error())
+					return
+				}
+				d.setFollowup(followupID, "sent")
+				if followupID == "" {
+					d.syncRunningTaskColumn(task.ID, actor)
+				}
+				d.comment(task.ID, actor, fmt.Sprintf("已交给 Herdr %s（项目 space 中的任务 tab 已打开；发起人 %s；%s）。", runtime, by, time.Since(start).Round(time.Second)))
+				d.trackHerdr(ctx, run)
+				return
 			}
-			_ = d.store.SaveExecution(*run)
-			d.comment(task.ID, actor, fmt.Sprintf("Herdr 派发 %s 失败：%v。未回退到独立 CLI。", runtime, err))
-			return
+			// herdrCreate failed — classify: Herdr unavailable → fall through;
+			// Herdr config problem (space mismatch etc.) → surface directly.
+			if isHerdrUnavailable(herr) {
+				run.Status, run.Detail = "failed", herr.Error()
+				_ = d.store.SaveExecution(*run)
+				d.comment(task.ID, actor, fmt.Sprintf("Herdr 派发 %s 失败：%v。回退到独立 CLI 执行。", runtime, herr))
+				// fall through to CLI path
+			} else {
+				var launchErr *herdrLaunchError
+				if errors.As(herr, &launchErr) && launchErr.uncertain {
+					run.Status, run.Detail = "unknown", "Herdr 创建 tab 的回执不确定；禁止再次创建，请先在项目 space 核对："+herr.Error()
+					d.setFollowup(followupID, "unknown")
+				} else {
+					run.Status, run.Detail = "failed", herr.Error()
+					d.setFollowup(followupID, "failed")
+				}
+				_ = d.store.SaveExecution(*run)
+				d.comment(task.ID, actor, fmt.Sprintf("Herdr 派发 %s 失败：%v。", runtime, herr))
+				return
+			}
 		}
-		run.SessionID, run.Status, run.Detail = sessionID, "running", HerdrInitialTurnPendingDetail
-		if err := d.store.SaveExecution(*run); err != nil {
-			d.setFollowup(followupID, "unknown")
-			d.comment(task.ID, actor, "Herdr 已创建 terminal，但执行记录保存失败；不会另建会话："+err.Error())
-			return
-		}
-		d.setFollowup(followupID, "sent")
-		if followupID == "" {
-			d.syncRunningTaskColumn(task.ID, actor)
-		}
-		d.comment(task.ID, actor, fmt.Sprintf("已交给 Herdr %s（项目 space 中的任务 tab 已打开；发起人 %s；%s）。", runtime, by, time.Since(start).Round(time.Second)))
-		d.trackHerdr(ctx, run)
-		return
 	}
 
+	// The code-review pipeline asks the agent to start a Claude reviewer with
+	// `hc run`, which only exists inside Herdr. A fresh non-DSH dispatch only
+	// reaches this point when Herdr was unavailable and we fell back to a
+	// headless CLI, so hand the agent the plain task text.
+	if runtime != RuntimeDSH && followupID == "" {
+		text = BuildTaskText(task)
+	}
 	start := time.Now()
 	cmd, err := execCommand(ctx, dir, text, runtime, d.runtimeConfigPath)
 	if err != nil {
