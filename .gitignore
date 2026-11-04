@@ -3,3 +3,13 @@ build/
 .mygo/
 .gocache/
 *.bak.*
+
+# 运行期 / 本地产物（不提交）
+.DS_Store
+.dsh/
+.taskboard/
+.zwork/
+.tmp/
+docs/.dsh-review/
+Taskboard-*.zip
+taskboard-packaged.png
