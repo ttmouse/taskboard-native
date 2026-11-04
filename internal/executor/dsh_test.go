@@ -68,9 +68,9 @@ func waitFor(t *testing.T, what string, cond func() (bool, string)) {
 }
 
 func TestBuildTaskText(t *testing.T) {
-	task := model.Task{ID: "task-123", Title: "修复崩溃", Description: "点卡片会崩。\n"}
+	task := model.Task{ID: "task-123", Title: "修复\n崩溃", Description: "点卡片会崩。\n"}
 	text := BuildTaskText(task)
-	if want := "使用 manage-taskboard-native 执行任务 task-123。"; text != want {
+	if want := "任务：修复 崩溃\n使用 manage-taskboard-native 执行任务 task-123。"; text != want {
 		t.Fatalf("task text = %q, want %q", text, want)
 	}
 }
@@ -231,7 +231,7 @@ func TestDispatchFallsBackToCLIWhenHerdrMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fallback never launched the CLI: %v", err)
 	}
-	if !strings.Contains(string(args), BuildTaskText(task)) {
+	if !strings.Contains(string(args), buildTaskTextForRuntime(task, RuntimeCodex)) {
 		t.Fatalf("fallback prompt = %q", args)
 	}
 	// The Codex review pipeline needs `hc run`, which only exists inside Herdr.

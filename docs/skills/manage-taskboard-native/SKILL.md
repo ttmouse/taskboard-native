@@ -8,6 +8,10 @@ description: Operate the taskboard-native board (localhost:47826) via tb CLI or 
 Board: **`127.0.0.1:47826`** (native MyGo app + SQLite service).  
 Not the DSH plugin board on `:47825`.
 
+## 收到任务 ID 后快速接手
+
+派发提示中的标题只是会话列表用的快照。加载本技能后，先用 `tb show <taskId> --json` 读取原卡；CLI 不可用时用本技能下方的本机 HTTP 接口。不要在首次读卡前搜索记忆、技能目录、CLI 帮助或整个工作区。读回标题、正文、评论、项目 ID、列、version 和 execution 后，再按任务需要查询项目目录、其他技能或工作区。`TASKBOARD_DISPATCH_TASK_ID` 只用于核对本次执行锁，不能代替读卡。
+
 Primary interface: **`tb` CLI** (`cmd/tb`). HTTP under `/api/...` is equivalent. Set:
 
 ```sh
@@ -54,13 +58,14 @@ TB_AGENT=豆皮 tb <command>
 
 自动承接开启时：服务把「清空进行中/待办队列」做成项目职责，可能在会话收敛后代为移入「等你」并写一条说明评论；这与单卡手动派发的「程序不因会话结束移列」不同。无论哪种模式，**结果评论与验收证据仍必须由执行 Agent 写入**；「完成」列仍只由人类确认。不要把「卡已在等你」或「执行已返回」当成交付完成。
 
-派发只需提供任务 ID 和技能名，例如：
+派发文本将标题放在首行，便于会话列表辨认。Codex 渠道显式调用技能，例如：
 
 ```text
-使用 manage-taskboard-native 执行任务 <taskId>。
+任务：<派发时标题>
+$manage-taskboard-native 执行任务 <taskId>。
 ```
 
-任务标题、正文、项目和状态列以 API 返回的最新数据为准，不要求派发提示词重复携带。通过宿主技能工具或 `~/.agents/skills/manage-taskboard-native/SKILL.md` 加载本技能；无法加载时明确报告，不得声称已使用。
+其他渠道使用同样的标题首行和 `使用 manage-taskboard-native 执行任务 <taskId>。`。任务标题、正文、项目和状态列以 API 返回的最新数据为准，不要求派发提示词重复携带正文。通过宿主技能工具或 `~/.agents/skills/manage-taskboard-native/SKILL.md` 加载本技能；无法加载时明确报告，不得声称已使用。
 
 被评论跟进唤醒时，只处理那一条评论：读原卡和该评论，按评论要求执行、验证、回写结果和状态。评论可能带 `mention` 字段（人类用 `@渠道` 指定由哪个渠道跟进）；`mention` 与你自己渠道不同说明这条评论被明确交给了另一个渠道，不要抢着处理，遇到与自己渠道不一致的 `mention` 先核对后再决定。`tb followup` 是发起入口，跟进提示本身就是它投递的；在被它唤醒的会话里再调用它只会拿到「已接收评论跟进请求」，卡片不会有任何变化——那不是完成，不要把它当成结果汇报。
 

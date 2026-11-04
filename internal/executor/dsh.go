@@ -412,7 +412,7 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 	// reaches this point when Herdr was unavailable and we fell back to a
 	// headless CLI, so hand the agent the plain task text.
 	if runtime != RuntimeDSH && followupID == "" {
-		text = BuildTaskText(task)
+		text = buildTaskTextForRuntime(task, runtime)
 	}
 	start := time.Now()
 	cmd, err := execCommand(ctx, dir, text, runtime, d.runtimeConfigPath)
@@ -522,10 +522,22 @@ func (d *Dispatcher) setFollowup(commentID, status string) {
 	d.store.SetFollowupStatus(commentID, status)
 }
 
-// BuildTaskText hands off a card reference; the skill owns the workflow and
-// reads current task content and project metadata from the board.
+// BuildTaskText puts the dispatch-time title first for conversation lists.
+// The skill still reads the current task and project metadata from the board.
 func BuildTaskText(task model.Task) string {
-	return fmt.Sprintf("使用 manage-taskboard-native 执行任务 %s。", task.ID)
+	return buildTaskText(task, "使用 manage-taskboard-native")
+}
+
+func buildTaskTextForRuntime(task model.Task, runtime string) string {
+	if runtime == RuntimeCodex {
+		return buildTaskText(task, "$manage-taskboard-native")
+	}
+	return BuildTaskText(task)
+}
+
+func buildTaskText(task model.Task, skillCall string) string {
+	title := strings.Join(strings.Fields(task.Title), " ")
+	return fmt.Sprintf("任务：%s\n%s 执行任务 %s。", title, skillCall, task.ID)
 }
 
 // tail keeps the last n runes of s (whole runes, no mid-character cut).

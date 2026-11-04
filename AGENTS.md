@@ -50,4 +50,4 @@
 
 ## 周期任务
 
-启动与例行工作前阅读 [docs/periodic-tasks.md](docs/periodic-tasks.md)；结果写回看板「周期任务表」卡。
+执行周期任务或启动例行巡检前阅读 [docs/periodic-tasks.md](docs/periodic-tasks.md)；结果写回看板「周期任务表」卡。普通派发卡先按任务 ID 读取原卡，不因周期任务约定额外读取该表。

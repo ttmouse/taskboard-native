@@ -45,7 +45,7 @@ func classifyTask(task model.Task) taskType {
 // handoff. Only Codex code-generation dispatches start the Claude review stage;
 // other explicitly selected runtimes keep their existing single-agent flow.
 func BuildDispatchTaskText(task model.Task, runtime string) string {
-	base := BuildTaskText(task)
+	base := buildTaskTextForRuntime(task, runtime)
 	typeOfTask := classifyTask(task)
 	mode, ok := taskExecutionModes[typeOfTask]
 	if !ok || mode != executionModeCodeReview || runtime != RuntimeCodex {
