@@ -306,7 +306,7 @@ type form struct {
 	name             string
 	workspacePath    string // project form: local working directory
 	color            string // project form: accent color; "" → automatic slot
-	gitCommitOnDone  bool // project edit: 验收完成时自动 Git 提交
+	gitCommitOnDone  bool   // project edit: 验收完成时自动 Git 提交
 	pickingWorkspace bool   // one native directory picker at a time
 	columnID         string // task form only: target column
 	projectID        string // task form only: which project receives the card
@@ -412,14 +412,24 @@ type board struct {
 	// Position+Size transitions would lag behind the pane and got clipped at
 	// its left edge, so paneResize asks them to follow the pane exactly
 	// instead of tweening toward it. paneW is last frame's pane width.
-	paneW      float32
-	frameH     float32 // the window height this frame laid out at
-	paneResize bool
-	railArmed  bool      // the rail is on screen, so a change can animate
-	railNow    float32   // the rail's width as this frame shows it
-	railAt     time.Time // when the current slide began
-	railFrom   float32   // the width it began at
-	railTo     float32   // the width it heads for
+	paneW                  float32
+	frameH                 float32 // the window height this frame laid out at
+	paneResize             bool
+	railArmed              bool      // the rail is on screen, so a change can animate
+	railNow                float32   // the rail's width as this frame shows it
+	railAt                 time.Time // when the current slide began
+	railFrom               float32   // the width it began at
+	railTo                 float32   // the width it heads for
+	sidebarPerfToggleAt    time.Time
+	sidebarPerfFirstChange time.Duration
+	sidebarPerfCase        string
+
+	// taskViewCache keeps per-column card slices ready for each frame. The
+	// board is rebuilt during sidebar motion, so scanning and sorting every
+	// task from each column renderer on every animation frame was needless
+	// main-thread work.
+	taskViewCache       map[string][]model.Task
+	taskViewCacheFilter string
 
 	searchQuery               string // filter: title + description, all columns
 	searchOpen                bool   // sidebar search button → immersive centered search overlay
@@ -448,7 +458,7 @@ type board struct {
 	streaming    bool                 // the SSE reader is running
 	recent       map[string]time.Time // task ID → until when it shows as changed
 	bounds       map[string]ui.Rect
-	cardHeights  map[string]float32 // persist row height for virtual list placeholders
+	cardHeights  map[string]float32   // persist row height for virtual list placeholders
 	sfxMuteUntil map[string]time.Time // per-task debounce for column-change cues
 	motionState                       // accepted motion shared with the Playground
 }
@@ -689,6 +699,7 @@ func (b *board) applyEvent(ev model.Event) {
 	if ev.ProjectID != "" && b.cur != "" && b.cur != curGlobal && ev.ProjectID != b.cur {
 		return
 	}
+	b.invalidateTaskViewCache()
 	switch ev.Type {
 	case model.EventTaskCreated, model.EventTaskUpdated, model.EventTaskMoved:
 		if ev.Task == nil {
@@ -851,6 +862,7 @@ func (b *board) applySnapshot(snapshot *model.BoardSnapshot) {
 	}
 	b.columns = columns
 	b.tasks = tasks
+	b.invalidateTaskViewCache()
 	b.clearMotion()
 	b.sortTasks()
 	if b.detail != nil {
@@ -1022,23 +1034,30 @@ func (b *board) scrollbarActive() bool {
 // filter. Search is scoped to the search overlay and must not change the board
 // behind it.
 func (b *board) tasksIn(columnID string) []model.Task {
-	var out []model.Task
-	for _, t := range b.tasks {
-		if t.ColumnID != columnID {
-			continue
+	if b.taskViewCache == nil || b.taskViewCacheFilter != b.timeFilter {
+		b.taskViewCache = make(map[string][]model.Task)
+		b.taskViewCacheFilter = b.timeFilter
+		for _, task := range b.tasks {
+			if !b.timeFilterHits(task) {
+				continue
+			}
+			b.taskViewCache[task.ColumnID] = append(b.taskViewCache[task.ColumnID], task)
 		}
-		if !b.timeFilterHits(t) {
-			continue
+		for id := range b.taskViewCache {
+			sort.SliceStable(b.taskViewCache[id], func(i, j int) bool {
+				a, c := b.taskViewCache[id][i], b.taskViewCache[id][j]
+				if a.Position != c.Position {
+					return a.Position < c.Position
+				}
+				return a.CreatedAt.Before(c.CreatedAt)
+			})
 		}
-		out = append(out, t)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Position != out[j].Position {
-			return out[i].Position < out[j].Position
-		}
-		return out[i].CreatedAt.Before(out[j].CreatedAt)
-	})
-	return out
+	return b.taskViewCache[columnID]
+}
+
+func (b *board) invalidateTaskViewCache() {
+	b.taskViewCache = nil
 }
 
 // timeFilterHits reports whether a task passes the active time filter.
@@ -1241,6 +1260,7 @@ func (b *board) upsert(t model.Task) (applied, inserted bool) {
 		b.reconcilePlacement(t)
 		b.noteMove(b.tasks[i], t)
 		b.tasks[i] = t
+		b.invalidateTaskViewCache()
 		b.sortTasks()
 		return true, false
 	}
@@ -1249,6 +1269,7 @@ func (b *board) upsert(t model.Task) (applied, inserted bool) {
 	}
 	b.reconcilePlacement(t)
 	b.tasks = append(b.tasks, t)
+	b.invalidateTaskViewCache()
 	b.sortTasks()
 	return true, true
 }
@@ -1260,6 +1281,7 @@ func (b *board) remove(id string) bool {
 		}
 		columnID := b.tasks[i].ColumnID
 		b.tasks = append(b.tasks[:i], b.tasks[i+1:]...)
+		b.invalidateTaskViewCache()
 		b.compactColumn(columnID, "")
 		b.forgetMotion(id)
 		if b.detail != nil && b.detail.id == id {
@@ -1318,6 +1340,7 @@ func (b *board) appendComment(taskID string, cm model.Comment) bool {
 			}
 		}
 		b.tasks[i].Comments = append(b.tasks[i].Comments, cm)
+		b.invalidateTaskViewCache()
 		if b.detail != nil && b.detail.id == taskID {
 			for _, have := range b.detail.comments {
 				if have.ID == cm.ID {
@@ -1580,7 +1603,6 @@ func (b *board) archiveTask(id string) {
 	}()
 }
 
-
 func (b *board) changeTaskRelation(taskID string, version int, kind, relatedID string, remove bool) {
 	go func() {
 		var task, related model.Task
@@ -1605,7 +1627,6 @@ func (b *board) changeTaskRelation(taskID string, version int, kind, relatedID s
 
 // restore undoes an archive: the service clears the flag and puts the card
 // back at the bottom of its own column, and the pushed event redraws it.
-
 
 // createRelatedTask creates an intake card then links it under kind
 // (sub → parent of new card is current; blocks / blocker as relation API kinds).
@@ -1665,8 +1686,6 @@ func (b *board) createRelatedTask(anchorID, kind, title string) {
 func (b *board) createSubtask(parentID, title string) {
 	b.createRelatedTask(parentID, "sub", title)
 }
-
-
 
 // relationCandidateTasks lists same-project non-archived cards for relation pickers,
 // excluding IDs in exclude and applying DSH-style cycle guards for parent/child.
@@ -2182,12 +2201,14 @@ func (b *board) replace(t model.Task) {
 			b.reconcilePlacement(t)
 			b.noteMove(b.tasks[i], t)
 			b.tasks[i] = t
+			b.invalidateTaskViewCache()
 			b.sortTasks()
 			return
 		}
 	}
 	b.reconcilePlacement(t)
 	b.tasks = append(b.tasks, t)
+	b.invalidateTaskViewCache()
 	b.sortTasks()
 }
 

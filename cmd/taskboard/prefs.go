@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/egoist/mygo"
 	"taskboard-native/internal/service"
@@ -183,6 +184,10 @@ func saveUIPrefs(p uiPrefs) error {
 	if err != nil {
 		return err
 	}
+	return saveUIPrefsAt(path, p)
+}
+
+func saveUIPrefsAt(path string, p uiPrefs) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -191,9 +196,63 @@ func saveUIPrefs(p uiPrefs) error {
 		return err
 	}
 	raw = append(raw, '\n')
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".ui-prefs-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+type uiPrefsWrite struct {
+	path  string
+	prefs uiPrefs
+}
+
+var (
+	uiPrefsAsyncOnce  sync.Once
+	uiPrefsAsyncQueue = make(chan uiPrefsWrite, 1)
+	uiPrefsAsyncMu    sync.Mutex
+)
+
+// saveUIPrefsAsync queues a snapshot for the single background writer. A
+// one-item queue coalesces rapid changes while preserving the latest value;
+// the caller (notably a shortcut callback) never waits for filesystem I/O.
+func saveUIPrefsAsync(p uiPrefs) {
+	path, err := prefsPath()
+	if err != nil {
+		return
+	}
+	uiPrefsAsyncOnce.Do(func() {
+		go func() {
+			for req := range uiPrefsAsyncQueue {
+				_ = saveUIPrefsAt(req.path, req.prefs)
+			}
+		}()
+	})
+	uiPrefsAsyncMu.Lock()
+	defer uiPrefsAsyncMu.Unlock()
+	select {
+	case uiPrefsAsyncQueue <- uiPrefsWrite{path: path, prefs: p}:
+	default:
+		// Replace a pending stale snapshot. The active write, if any, is
+		// serialized before this newest queued value.
+		select {
+		case <-uiPrefsAsyncQueue:
+		default:
+		}
+		uiPrefsAsyncQueue <- uiPrefsWrite{path: path, prefs: p}
+	}
 }

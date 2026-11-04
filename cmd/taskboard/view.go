@@ -104,7 +104,7 @@ func (b *board) view(c *ui.Context) {
 	// Drag the edge grip to resize; width persists in ui-prefs.
 	b.ensureSidebarWidth(t)
 	// Cmd+B toggles the project sidebar (same as the panel icon chip).
-	c.OnShortcut(ui.Cmd, ui.KeyB, func() { b.toggleSidebar() })
+	c.OnShortcut(ui.Cmd, ui.KeyB, func() { b.toggleSidebarForCase("key_down") })
 	// Cmd+F opens task search (same as the sidebar/top-bar search action).
 	// Avoid stacking it over task details; window shortcuts wait while a
 	// dialog is up.
@@ -522,6 +522,7 @@ const (
 // it is safe to ask more than once in a frame (MyGo builds a view repeatedly):
 // b.railAt is when the current slide began and b.railFrom where it began.
 func (b *board) railWidth(split ui.Element, c *ui.Context, t *ui.Theme) float32 {
+	previous := b.railNow
 	b.ensureSidebarWidth(t)
 	if len(b.projects) == 0 {
 		// No rail at all, and nothing to animate from once one arrives.
@@ -570,7 +571,25 @@ func (b *board) railWidth(split ui.Element, c *ui.Context, t *ui.Theme) float32 
 		v = target
 	}
 	b.railNow = v
+	b.recordSidebarFirstChange(previous, v)
+	// Custom rail tween is not a MyGo Animate*; without this the drawer
+	// freezes after the key-down frame and only resumes on the next input
+	// (usually B key-up) — which reads as "Cmd+B waits for release".
+	c.AnimationFrame()
 	return v
+}
+
+func (b *board) recordSidebarFirstChange(previous, current float32) {
+	if b.sidebarPerfToggleAt.IsZero() || b.sidebarPerfFirstChange != 0 || absDiff(previous, current) < 0.001 {
+		return
+	}
+	b.sidebarPerfFirstChange = time.Since(b.sidebarPerfToggleAt)
+	duration := railOpenFor
+	if b.prefs.SidebarCollapsed {
+		duration = railCollapseFor
+	}
+	fmt.Printf("sidebar_perf case=%s toggle_to_first_rail_change_ms=%.3f animation_ms=%d\n",
+		b.sidebarPerfCase, float64(b.sidebarPerfFirstChange)/float64(time.Millisecond), int(duration/time.Millisecond))
 }
 
 // railFraction is how much of the rail is on screen, 0 to 1, as the frame
@@ -714,7 +733,7 @@ func (b *board) sidebarCollapseChip(c *ui.Context, t *ui.Theme, collapsing bool)
 	}
 	chip.Background(face).TextColor(ink)
 	if chip.Clicked() {
-		b.toggleSidebar()
+		b.toggleSidebarForCase("icon_click")
 	}
 }
 
@@ -988,8 +1007,31 @@ func (b *board) sidebarWidth(t *ui.Theme) float32 {
 }
 
 func (b *board) toggleSidebar() {
+	b.toggleSidebarForCase("direct")
+}
+
+func (b *board) toggleSidebarForCase(perfCase string) {
 	b.prefs.SidebarCollapsed = !b.prefs.SidebarCollapsed
-	_ = saveUIPrefs(b.prefs)
+	b.sidebarPerfToggleAt = time.Now()
+	b.sidebarPerfFirstChange = 0
+	b.sidebarPerfCase = perfCase
+	// Start the slide from the keyboard or chip event itself. Waiting for the
+	// next layout pass to arm railAt guarantees one frame with no visible
+	// change after the user's input.
+	b.railFrom = b.railNow
+	b.railTo = 0
+	if !b.prefs.SidebarCollapsed {
+		b.railTo = b.sidebarW
+	}
+	b.railAt = b.sidebarNow()
+	saveUIPrefsAsync(b.prefs)
+}
+
+func (b *board) sidebarNow() time.Time {
+	if b.frameCtx != nil {
+		return b.frameCtx.Now()
+	}
+	return time.Now()
 }
 
 func (b *board) offlineBanner(c *ui.Context, t *ui.Theme) {
@@ -2433,7 +2475,7 @@ func (b *board) commentThreads(c *ui.Context, t *ui.Theme, d *detail) {
 					}
 					if ui.Button(c.Key("cancel-comment-"+cm.ID), "取消").Disabled(b.commenting).Clicked() {
 						d.commentEditID, d.commentEditText = "", ""
-				}
+					}
 				})
 			} else {
 				b.commentBodyView(c, d, cm)

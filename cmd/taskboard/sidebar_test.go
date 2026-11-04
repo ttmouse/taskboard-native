@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -102,6 +105,203 @@ func TestSidebarToggleShortcut(t *testing.T) {
 	settle(t, tt)
 	if b.prefs.SidebarCollapsed {
 		t.Fatal("⌘B did not restore the sidebar")
+	}
+}
+
+func TestSidebarToggleKeyDownLatency(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	// MyGo OnShortcut runs on KeyPressed. Tester.Key sends press then release;
+	// settle after press already flips the pref before release is delivered.
+	tt.Key(ui.Cmd, ui.KeyB)
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("⌘B key-down did not collapse the sidebar")
+	}
+	for i := 0; i < 4 && b.sidebarPerfFirstChange == 0; i++ {
+		tt.Advance(time.Millisecond)
+		tt.Frame()
+	}
+	if b.sidebarPerfFirstChange <= 0 || b.sidebarPerfFirstChange >= 50*time.Millisecond {
+		t.Fatalf("key_down first rail change = %v, want (0, 50ms)", b.sidebarPerfFirstChange)
+	}
+	t.Logf("key_down first rail change: %.3fms", float64(b.sidebarPerfFirstChange)/float64(time.Millisecond))
+	settle(t, tt)
+}
+
+// TestSidebarToggleAnimatesBeforeKeyRelease is the regression for 0.1.94:
+// the preference flipped on key-down, but the drawer only moved after B
+// released because railWidth never called AnimationFrame. Prove the rail
+// slides with no KeyUp / KeyReleased at all.
+func TestSidebarToggleAnimatesBeforeKeyRelease(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	startW := b.railNow
+	if startW <= 0 {
+		t.Fatalf("rail resting width = %v, want open sidebar", startW)
+	}
+	// Same path Cmd+B OnShortcut takes on KeyPressed (before any KeyReleased).
+	b.toggleSidebarForCase("key_down")
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("key-down toggle did not collapse the sidebar")
+	}
+	tt.Frame()
+	moved := false
+	for i := 0; i < 12; i++ {
+		tt.Advance(8 * time.Millisecond)
+		tt.Frame()
+		if b.railNow < startW-0.5 {
+			moved = true
+			break
+		}
+	}
+	if !moved {
+		t.Fatalf("rail did not slide without key-release: start=%.2f now=%.2f", startW, b.railNow)
+	}
+	if b.sidebarPerfFirstChange <= 0 || b.sidebarPerfFirstChange >= 50*time.Millisecond {
+		t.Fatalf("first rail change on key-down path = %v, want (0, 50ms)", b.sidebarPerfFirstChange)
+	}
+	t.Logf("key_down_before_release first rail change: %.3fms rail=%.2f→%.2f",
+		float64(b.sidebarPerfFirstChange)/float64(time.Millisecond), startW, b.railNow)
+	fmt.Printf("sidebar_perf case=key_down_before_release toggle_to_first_rail_change_ms=%.3f\n",
+		float64(b.sidebarPerfFirstChange)/float64(time.Millisecond))
+}
+
+func TestSidebarToggleKeyReleaseNoRetrigger(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	tt.Key(ui.Cmd, ui.KeyB)
+	tt.Frame()
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("⌘B key-down did not collapse the sidebar")
+	}
+	settle(t, tt)
+	before := b.prefs.SidebarCollapsed
+	// Exercise a held key and its release as distinct input events. The Cmd+B
+	// shortcut was delivered above; this unmodified B press must not toggle it.
+	tt.KeyDown(ui.KeyB)
+	tt.Frame()
+	tt.KeyUp(ui.KeyB)
+	tt.Frame()
+	if b.prefs.SidebarCollapsed != before {
+		t.Fatal("KeyUp retriggered the sidebar toggle")
+	}
+	fmt.Printf("sidebar_perf case=key_release no_change=true toggle_to_first_rail_change_ms=0.000\n")
+}
+
+func TestSidebarToggleIconClickLatency(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	if err := tt.Click("收起侧栏"); err != nil {
+		t.Fatalf("click collapse chip: %v", err)
+	}
+	tt.Frame()
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("collapse chip did not collapse the sidebar")
+	}
+	for i := 0; i < 4 && b.sidebarPerfFirstChange == 0; i++ {
+		tt.Advance(time.Millisecond)
+		tt.Frame()
+	}
+	if b.sidebarPerfFirstChange <= 0 || b.sidebarPerfFirstChange >= 50*time.Millisecond {
+		t.Fatalf("icon_click first rail change = %v, want (0, 50ms)", b.sidebarPerfFirstChange)
+	}
+	t.Logf("icon_click first rail change: %.3fms", float64(b.sidebarPerfFirstChange)/float64(time.Millisecond))
+}
+
+func TestSidebarTogglePersistsLatestPreferenceAsynchronously(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	b.toggleSidebar()
+	b.toggleSidebar()
+	want, err := prefsPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		raw, readErr := os.ReadFile(want)
+		if readErr == nil {
+			var got uiPrefs
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
+			}
+			if !got.SidebarCollapsed {
+				return // two immediate toggles settle back to expanded
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("latest sidebar preference was not persisted")
+}
+
+func TestSidebarAnimationReusesColumnTaskIndex(t *testing.T) {
+	fake := seedBoard()
+	b := newBoard(fake)
+	b.tasks = append([]model.Task(nil), fake.tasks...)
+	first := b.tasksIn("c-todo")
+	if len(first) == 0 {
+		t.Fatal("seed board has no todo task")
+	}
+	for i := 0; i < 12; i++ { // equivalent repeated lookups across rail frames
+		again := b.tasksIn("c-todo")
+		if len(again) == 0 || &again[0] != &first[0] {
+			t.Fatalf("frame %d rebuilt the per-column task slice", i)
+		}
+	}
+
+	updated := first[0]
+	updated.Position += 100
+	if applied, _ := b.upsert(updated); !applied {
+		t.Fatal("task update was not applied")
+	}
+	after := b.tasksIn("c-todo")
+	found := false
+	for _, task := range after {
+		if task.ID == updated.ID {
+			found = true
+			if task.Position != updated.Position {
+				t.Fatalf("cached position = %v, want %v", task.Position, updated.Position)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("updated task %q disappeared from its column", updated.ID)
 	}
 }
 
@@ -241,6 +441,12 @@ func TestSidebarToggleAnimatesCrisply(t *testing.T) {
 		tt.Advance(16 * time.Millisecond)
 		tt.Frame()
 	}
+	if b.sidebarPerfFirstChange <= 0 || b.sidebarPerfFirstChange >= 50*time.Millisecond {
+		t.Errorf("toggle to first rail width change = %v, want (0, 50ms); animation is %v",
+			b.sidebarPerfFirstChange, railCollapseFor)
+	}
+	t.Logf("toggle to first rail width change: %v; collapse animation: %v",
+		b.sidebarPerfFirstChange, railCollapseFor)
 
 	if last := widths[len(widths)-1]; last >= 0.5 {
 		t.Fatalf("rail never finished collapsing; widths %v", widths)
