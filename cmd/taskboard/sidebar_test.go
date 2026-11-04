@@ -236,11 +236,10 @@ func TestSidebarToggleKeyRepeatDoesNotRetrigger(t *testing.T) {
 	}
 
 	// Simulate auto-repeat arriving before the cooldown elapses.
+	// Use a real Key so allow runs on the live frame clock.
 	tt.Advance(50 * time.Millisecond)
+	tt.Key(ui.Cmd, ui.KeyB)
 	tt.Frame()
-	if b.allowSidebarKeyShortcut() {
-		t.Fatal("auto-repeat within cooldown toggled again")
-	}
 	if !b.prefs.SidebarCollapsed {
 		t.Fatal("auto-repeat flipped the sidebar open")
 	}
@@ -258,6 +257,8 @@ func TestSidebarToggleKeyRepeatDoesNotRetrigger(t *testing.T) {
 
 // TestSidebarToggleHoldPastCooldownRetriggers: a held chord whose repeats
 // arrive farther apart than the cooldown must produce multiple toggles.
+// Drive real Key events so ArmedAt is stamped from the live frame clock
+// (frameCtx.Now() is zero outside a frame).
 func TestSidebarToggleHoldPastCooldownRetriggers(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
@@ -276,22 +277,18 @@ func TestSidebarToggleHoldPastCooldownRetriggers(t *testing.T) {
 			tt.Advance(sidebarKeyCooldown + 50*time.Millisecond)
 			tt.Frame()
 		}
-		if !b.allowSidebarKeyShortcut() {
-			t.Fatalf("step %d: expected accept after cooldown gap", i+1)
-		}
-		b.toggleSidebarForCase("key_down")
+		tt.Key(ui.Cmd, ui.KeyB)
 		tt.Frame()
 		if b.prefs.SidebarCollapsed != want {
 			t.Fatalf("step %d: SidebarCollapsed=%v, want %v", i+1, b.prefs.SidebarCollapsed, want)
 		}
 	}
 	// A tight repeat still inside the window must stay suppressed.
+	before := b.prefs.SidebarCollapsed
 	tt.Advance(50 * time.Millisecond)
+	tt.Key(ui.Cmd, ui.KeyB)
 	tt.Frame()
-	if b.allowSidebarKeyShortcut() {
-		t.Fatal("tight repeat after last accept should stay blocked")
-	}
-	if !b.prefs.SidebarCollapsed {
+	if b.prefs.SidebarCollapsed != before {
 		t.Fatal("tight repeat flipped the sidebar")
 	}
 	fmt.Printf("sidebar_perf case=key_hold_past_cooldown toggles=3 suppressed_tight=true\n")
