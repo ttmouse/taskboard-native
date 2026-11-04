@@ -1017,7 +1017,7 @@ func (b *board) sidebarWidth(t *ui.Theme) float32 {
 // Auto-repeat inside the window is ignored; after it elapses a held chord
 // may toggle again (caller saw long repeat intervals still blocked forever
 // when the old gate re-armed on every rejected repeat).
-const sidebarKeyCooldown = 400 * time.Millisecond
+const sidebarKeyCooldown = 120 * time.Millisecond
 
 // allowSidebarKeyShortcut reports whether this Cmd+B OnShortcut should
 // toggle. Cooldown is measured from the last *accepted* toggle only —

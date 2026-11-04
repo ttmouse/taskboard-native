@@ -255,6 +255,31 @@ func TestSidebarToggleKeyRepeatDoesNotRetrigger(t *testing.T) {
 	fmt.Printf("sidebar_perf case=key_repeat_guard suppressed=true restored_after_cooldown=true\n")
 }
 
+// A deliberate second press should work at a pace faster than the old 400ms gate.
+func TestSidebarToggleRapidSecondPress(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	tt.Key(ui.Cmd, ui.KeyB)
+	tt.Frame()
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("first ⌘B did not collapse")
+	}
+	tt.Advance(150 * time.Millisecond)
+	tt.Key(ui.Cmd, ui.KeyB)
+	tt.Frame()
+	if b.prefs.SidebarCollapsed {
+		t.Fatal("second ⌘B after 150ms did not restore the sidebar")
+	}
+}
+
 // TestSidebarToggleHoldPastCooldownRetriggers: a held chord whose repeats
 // arrive farther apart than the cooldown must produce multiple toggles.
 // Drive real Key events so ArmedAt is stamped from the live frame clock
