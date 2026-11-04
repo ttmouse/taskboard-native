@@ -212,6 +212,53 @@ func TestSidebarToggleKeyReleaseNoRetrigger(t *testing.T) {
 	fmt.Printf("sidebar_perf case=key_release no_change=true toggle_to_first_rail_change_ms=0.000\n")
 }
 
+
+// TestSidebarToggleKeyRepeatDoesNotRetrigger: MyGo routes isARepeat
+// KeyPressed into OnShortcut. Holding Cmd+B must not flip-flop the rail.
+func TestSidebarToggleKeyRepeatDoesNotRetrigger(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	t.Cleanup(func() { mygo.App.SetPath(mygo.PathUserData, "") })
+
+	b := newBoard(seedBoard())
+	tt := newBoardTester(b)
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("把看板接上 SSE") })
+	settle(t, tt)
+
+	tt.Key(ui.Cmd, ui.KeyB)
+	tt.Frame()
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("first ⌘B did not collapse")
+	}
+	if !b.sidebarKeyGate {
+		t.Fatal("key gate should arm after the first ⌘B")
+	}
+
+	// Simulate auto-repeat arriving before the hold-guard elapses.
+	tt.Advance(50 * time.Millisecond)
+	tt.Frame()
+	if b.allowSidebarKeyShortcut() {
+		t.Fatal("auto-repeat within hold-guard toggled again")
+	}
+	if !b.prefs.SidebarCollapsed {
+		t.Fatal("auto-repeat flipped the sidebar open")
+	}
+
+	// After hold-guard + quiet with no further repeats, a real second press works.
+	tt.Advance(sidebarKeyHoldGuard + sidebarKeyQuiet + 20*time.Millisecond)
+	tt.Frame()
+	if b.sidebarKeyGate {
+		t.Fatal("key gate did not clear after quiet gap")
+	}
+	tt.Key(ui.Cmd, ui.KeyB)
+	tt.Frame()
+	if b.prefs.SidebarCollapsed {
+		t.Fatal("second ⌘B after quiet gap did not restore the sidebar")
+	}
+	fmt.Printf("sidebar_perf case=key_repeat_guard suppressed=true restored_after_quiet=true\n")
+}
+
 func TestSidebarToggleIconClickLatency(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TASKBOARD_DB", filepath.Join(dir, "tb.db"))

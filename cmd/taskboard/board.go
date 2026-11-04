@@ -423,6 +423,13 @@ type board struct {
 	sidebarPerfToggleAt    time.Time
 	sidebarPerfFirstChange time.Duration
 	sidebarPerfCase        string
+	// sidebarKeyGate suppresses Cmd+B auto-repeat (MyGo delivers isARepeat
+	// KeyPressed into OnShortcut the same as the first press). Armed on an
+	// accepted key toggle; refreshed while repeats arrive; cleared after a
+	// quiet gap past the hold-guard so a real second press still works.
+	sidebarKeyGate    bool
+	sidebarKeyArmedAt time.Time
+	sidebarKeySeenAt  time.Time
 
 	// taskViewCache keeps per-column card slices ready for each frame. The
 	// board is rebuilt during sidebar motion, so scanning and sorting every

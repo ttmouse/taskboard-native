@@ -81,6 +81,7 @@ func syncText(b *board, t *ui.Theme) string {
 // view renders one frame.
 func (b *board) view(c *ui.Context) {
 	b.frameCtx = c
+	b.tickSidebarKeyGate()
 	b.pump()
 	theme := c.Theme()
 	if theme.Dark && !c.Preferences().HighContrast {
@@ -104,7 +105,12 @@ func (b *board) view(c *ui.Context) {
 	// Drag the edge grip to resize; width persists in ui-prefs.
 	b.ensureSidebarWidth(t)
 	// Cmd+B toggles the project sidebar (same as the panel icon chip).
-	c.OnShortcut(ui.Cmd, ui.KeyB, func() { b.toggleSidebarForCase("key_down") })
+	c.OnShortcut(ui.Cmd, ui.KeyB, func() {
+		if !b.allowSidebarKeyShortcut() {
+			return
+		}
+		b.toggleSidebarForCase("key_down")
+	})
 	// Cmd+F opens task search (same as the sidebar/top-bar search action).
 	// Avoid stacking it over task details; window shortcuts wait while a
 	// dialog is up.
@@ -1004,6 +1010,44 @@ func (b *board) ensureSidebarWidth(t *ui.Theme) {
 func (b *board) sidebarWidth(t *ui.Theme) float32 {
 	b.ensureSidebarWidth(t)
 	return b.sidebarW
+}
+
+
+// sidebarKeyHoldGuard covers macOS "Delay Until Repeat" so the first
+// isARepeat after a hold cannot clear the gate during the quiet gap.
+const (
+	sidebarKeyHoldGuard = 400 * time.Millisecond
+	sidebarKeyQuiet     = 100 * time.Millisecond
+)
+
+// allowSidebarKeyShortcut reports whether this Cmd+B OnShortcut should
+// toggle. Auto-repeat refreshes the gate so a held chord cannot flip-flop
+// the drawer; after release the quiet gap past the hold-guard opens it again.
+func (b *board) allowSidebarKeyShortcut() bool {
+	now := b.sidebarNow()
+	if b.sidebarKeyGate {
+		b.sidebarKeySeenAt = now
+		b.sidebarKeyArmedAt = now
+		return false
+	}
+	b.sidebarKeyGate = true
+	b.sidebarKeySeenAt = now
+	b.sidebarKeyArmedAt = now
+	return true
+}
+
+func (b *board) tickSidebarKeyGate() {
+	if !b.sidebarKeyGate {
+		return
+	}
+	now := b.sidebarNow()
+	if now.Sub(b.sidebarKeyArmedAt) < sidebarKeyHoldGuard {
+		return
+	}
+	if now.Sub(b.sidebarKeySeenAt) < sidebarKeyQuiet {
+		return
+	}
+	b.sidebarKeyGate = false
 }
 
 func (b *board) toggleSidebar() {
