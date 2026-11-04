@@ -1559,7 +1559,7 @@ func herdrExecutionIcon(status string) *ui.SVG {
 // carries the card's provenance in one quiet line — version, the agent
 // that wrote it last, and when — because who moved a task is this
 // board's story.
-func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Element {
+func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task, key string) ui.Element {
 	// 全部项目 names the card's project and wears its color: the project
 	// dot beside the name and the 3px left-edge bar both use projectColor.
 	projectName := ""
@@ -1572,7 +1572,7 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task) ui.Elemen
 			projectColorSet = true
 		}
 	}
-	card := ui.Box(c.Key(task.ID)).FillWidth().
+	card := ui.Box(c.Key(key)).FillWidth().
 		Padding(t.Space(3.5)).Gap(t.Space(2)).Radius(t.Radius + 2).
 		BorderWidth(0).
 		Focusable().Cursor(ui.CursorPointer).Role(ui.RoleButton).

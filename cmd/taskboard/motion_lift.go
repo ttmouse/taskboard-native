@@ -49,7 +49,7 @@ func (b *board) liftedCard(c *ui.Context, t *ui.Theme, task *model.Task, slot ui
 		}
 	}
 	ui.Overlay(c, func() {
-		flight := b.taskCard(c.Key("lifted-flight"), t, task)
+		flight := b.taskCard(c, t, task, task.ID+"-lifted-flight")
 		target := f.source
 		if elapsed >= singleLift && slot.Bounds().W > 0 {
 			target = slot.Bounds()

@@ -11,7 +11,7 @@ import (
 func (b *board) dragSourceOpacity() float32 { return 0 }
 
 func (b *board) cardView(c *ui.Context, t *ui.Theme, task *model.Task) {
-	card := b.taskCard(c, t, task)
+	card := b.taskCard(c, t, task, task.ID)
 	if f := b.liftedFlights[task.ID]; f != nil {
 		b.liftedCard(c, t, task, card, f)
 		return
@@ -55,7 +55,7 @@ func (b *board) cardView(c *ui.Context, t *ui.Theme, task *model.Task) {
 	// animating it too makes the visible card chase a moving destination.
 	card.Transition(ui.ElementTransition{Colors: true}).Opacity(0).PassThrough().Label("")
 	ui.Overlay(c, func() {
-		flight := b.taskCard(c, t, task).Width(b.columnWidth(c, t) - 2*t.Space(3))
+		flight := b.taskCard(c, t, task, task.ID+"-flight").Width(b.columnWidth(c, t) - 2*t.Space(3))
 		b.observeDragGrab(task.ID, flight)
 		tr := b.cardTransition(t, task)
 		tr.Match = cardMatch{ID: task.ID}

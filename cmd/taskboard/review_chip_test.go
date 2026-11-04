@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/ui"
 )
 
 // TestReviewCheckChipGeometry pins the 评审 ✓ chip's geometry: a 24×24 chip
@@ -142,5 +143,34 @@ func TestReviewChipStaysInsideCard(t *testing.T) {
 	defer f.Close()
 	if err := png.Encode(f, sub); err != nil {
 		t.Fatalf("encode %s: %v", path, err)
+	}
+}
+
+func TestReviewCheckMovesTaskToDone(t *testing.T) {
+	isolatePrefs(t)
+	fake := seedBoard()
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+	tt.SetPreferences(ui.Preferences{ReduceMotion: true})
+	b.prefs.TitleOnlyCards = true
+
+	waitFor(t, tt, "评审任务", func() bool { return tt.HasText("验收通过，移到完成") })
+	settle(t, tt)
+	card := b.bounds["t-5"]
+	tt.Move(card.X+card.W/2, card.Y+card.H/2)
+	tt.Frame()
+	chip, ok := tt.Find("验收通过，移到完成")
+	if !ok {
+		t.Fatal("评审通过操作缺失")
+	}
+	tt.Move(chip.X+chip.W/2, chip.Y+chip.H/2)
+	tt.Frame()
+	tt.ClickAt(chip.X+chip.W/2, chip.Y+chip.H/2)
+	waitFor(t, tt, "任务移入完成列", func() bool {
+		task := b.task("t-5")
+		return task != nil && task.ColumnID == "c-done"
+	})
+	if got := b.task("t-5").ColumnID; got != "c-done" {
+		t.Fatalf("task column = %q, want c-done", got)
 	}
 }
