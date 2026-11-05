@@ -185,8 +185,8 @@ func TestRenderBoardLightAndDark(t *testing.T) {
 	save(t, tt, "board-dark.png")
 }
 
-// TestRenderEmpty checks the board with no cards: every column shows its
-// placeholder instead of inventing content.
+// TestRenderEmpty checks the horizontal board with no cards: every column
+// keeps its name and tells the user that cards can be added or dropped there.
 func TestRenderEmpty(t *testing.T) {
 	fake := seedBoard()
 	fake.tasks = nil
@@ -197,15 +197,67 @@ func TestRenderEmpty(t *testing.T) {
 		return tt.HasText("待办") && tt.HasText("完成")
 	})
 	settle(t, tt)
-	if tt.HasText("还没有任务") || tt.HasText("添加任务，或拖入") {
-		t.Fatalf("empty columns should show no reminder; texts: %v", tt.Texts())
-	}
-	for _, want := range []string{"待办", "进行中", "评审", "完成"} {
+	for _, want := range []string{
+		"待办", "进行中", "评审", "完成", "0 个任务",
+		"还没有任务", "把卡片拖到这里，或点顶部的「新建任务」",
+	} {
 		if !tt.HasText(want) {
-			t.Errorf("empty frame lacks column %q", want)
+			t.Errorf("empty frame lacks %q; texts: %v", want, tt.Texts())
 		}
 	}
+	hints := 0
+	for _, s := range tt.Texts() {
+		if s == "还没有任务" {
+			hints++
+		}
+	}
+	if hints != len(b.columns) {
+		t.Errorf("%d empty hints for %d empty columns; texts: %v", hints, len(b.columns), tt.Texts())
+	}
 	save(t, tt, "empty-light.png")
+}
+
+// TestRenderPopulatedColumnHasNoHint checks that the empty hint is a
+// property of the column's tasks, not of the board.
+func TestRenderPopulatedColumnHasNoHint(t *testing.T) {
+	fake := seedBoard()
+	now := fake.now
+	fake.add(model.Task{
+		ID: "t-6", ProjectID: "local", ColumnID: "c-done", Title: "归档已完成",
+		Position: 1000, Version: 1, CreatedAt: now, UpdatedAt: now,
+	})
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+
+	waitFor(t, tt, "看板载入", func() bool { return tt.HasText("归档已完成") })
+	settle(t, tt)
+	if tt.HasText("还没有任务") || tt.HasText("把卡片拖到这里") {
+		t.Errorf("populated columns show an empty hint; texts: %v", tt.Texts())
+	}
+}
+
+// TestRenderVerticalEmptyHasNoHint checks that the stacked board keeps its
+// header-only empty rows.
+func TestRenderVerticalEmptyHasNoHint(t *testing.T) {
+	isolatePrefs(t)
+	if err := saveUIPrefs(uiPrefs{BoardVertical: true}); err != nil {
+		t.Fatal(err)
+	}
+	fake := seedBoard()
+	fake.tasks = nil
+	b := newBoard(fake)
+	tt := newBoardTester(b)
+
+	waitFor(t, tt, "空看板", func() bool {
+		return tt.HasText("待办") && tt.HasText("完成")
+	})
+	settle(t, tt)
+	if !b.prefs.BoardVertical {
+		t.Fatal("board is not stacked")
+	}
+	if tt.HasText("还没有任务") || tt.HasText("把卡片拖到这里") {
+		t.Errorf("stacked empty rows show a hint; texts: %v", tt.Texts())
+	}
 }
 
 // TestRenderLoading captures the first frame of a slow board: the loading

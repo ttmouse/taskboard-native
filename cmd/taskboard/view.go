@@ -1275,6 +1275,11 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 			scroll.Margin(0, -gutter, 0, 0)
 		}
 		scroll.Children(func() {
+			// The hint gives way to a hovering card so the drop preview and
+			// the landed card share one position.
+			if !b.prefs.BoardVertical && len(tasks) == 0 && !over {
+				b.columnEmptyState(c, t)
+			}
 			// Bottom inset is intentional scroll padding: when the user
 			// reaches the last card, the column still has air under it so
 			// the card is not flush against the window edge.
@@ -1285,6 +1290,19 @@ func (b *board) columnView(c *ui.Context, t *ui.Theme, col *model.Column, width 
 			})
 		})
 		b.noteScroll(track)
+	})
+}
+
+// columnEmptyState tells a first-time user that an empty column accepts
+// cards. It passes the pointer through so a drag still resolves to the
+// column's drop target.
+func (b *board) columnEmptyState(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).FillWidth().AlignItems(ui.Center).Gap(t.Space(1)).PaddingY(t.Space(5)).
+		PassThrough().Children(func() {
+		ui.Text(c, "还没有任务").FontSize(fsm(t)).FontWeight(500).
+			TextColor(t.TextMuted).PassThrough()
+		ui.Text(c, "把卡片拖到这里，或点顶部的「新建任务」").FontSize(fsm(t)).
+			TextColor(t.TextMuted.Alpha(0.8)).TextAlign(ui.Center).PassThrough()
 	})
 }
 
