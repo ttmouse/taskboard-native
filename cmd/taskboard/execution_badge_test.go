@@ -115,20 +115,23 @@ func TestReturnedExecutionBadgeOnlyInReviewColumn(t *testing.T) {
 }
 
 func TestHerdrExecutionDetailMentionsWriteLock(t *testing.T) {
-	got := herdrExecutionDetail("disconnected", "连接异常")
+	got := remoteExecutionDetail("herdr:t7", "disconnected", "连接异常")
 	for _, want := range []string{"连接异常", "写锁", "不可重派", "2 分钟"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("disconnected detail %q missing %q", got, want)
 		}
 	}
-	released := herdrExecutionDetail("released", "已释放")
+	released := remoteExecutionDetail("herdr:t7", "released", "已释放")
 	for _, want := range []string{"已释放写锁", "重新派发"} {
 		if !strings.Contains(released, want) {
 			t.Fatalf("released detail %q missing %q", released, want)
 		}
 	}
-	if running := herdrExecutionDetail("running", "运行中"); running != "Herdr 执行状态：运行中" {
+	if running := remoteExecutionDetail("herdr:t7", "running", "运行中"); running != "Herdr 执行状态：运行中" {
 		t.Fatalf("running detail = %q", running)
+	}
+	if t3 := remoteExecutionDetail("t3:mcp:t-1", "disconnected", "连接异常"); !strings.HasPrefix(t3, "T3 执行状态：") {
+		t.Fatalf("T3 detail = %q", t3)
 	}
 }
 

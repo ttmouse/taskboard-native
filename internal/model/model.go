@@ -230,12 +230,21 @@ func (e Execution) Active() bool {
 		return false
 	}
 	// detached means "tracking stopped, session still alive" — a state only the
-	// desktop channel can resume. A Herdr terminal cannot be resumed that way, so
-	// a detached Herdr record is really a released one under an older spelling.
-	if e.Status == "detached" && strings.HasPrefix(strings.TrimSpace(e.SessionID), "herdr:") {
+	// desktop channel can resume. Remote transports (Herdr terminal, T3 thread)
+	// cannot be resumed that way, so a detached record there is really a
+	// released one under an older spelling.
+	if e.Status == "detached" && e.remoteHosted() {
 		return false
 	}
 	return true
+}
+
+// remoteHosted reports a session owned by an external transport whose state is
+// tracked by polling, not by a local process. The prefix list is duplicated
+// here because model cannot import executor; keep the two in sync.
+func (e Execution) remoteHosted() bool {
+	sessionID := strings.TrimSpace(e.SessionID)
+	return strings.HasPrefix(sessionID, "herdr:") || strings.HasPrefix(sessionID, "t3:")
 }
 
 // Ended reports a converged session: whatever the outcome, the turn is over
@@ -255,11 +264,12 @@ func (e Execution) Releasable() bool {
 }
 
 // Stalled reports a CLI run whose process died with the service. The desktop
-// channel keeps a live session behind "disconnected" and resumes tracking, but
-// a codex/pi process is gone for good: nothing will ever move this record
+// channel keeps a live session behind "disconnected" and resumes tracking, and
+// the remote transports (Herdr, T3) resume their own tracking after a restart.
+// A codex/pi CLI process is gone for good: nothing will ever move this record
 // again, so it must not block a fresh dispatch or a comment follow-up.
 func (e Execution) Stalled() bool {
-	return e.Channel() != "dsh" && !strings.HasPrefix(e.SessionID, "herdr:") && e.Status == "disconnected"
+	return e.Channel() != "dsh" && !e.remoteHosted() && e.Status == "disconnected"
 }
 
 // ProjectRun is one project-level handoff. TaskIDs is fixed when the run

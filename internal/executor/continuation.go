@@ -142,6 +142,22 @@ func (d *Dispatcher) Continue(taskID, commentID, by string) error {
 					err = fmt.Errorf("Herdr 原 terminal 当前状态为 %q；先在 Herdr 中处理后再跟进", state)
 				}
 			}
+		} else if threadID, ok := t3SessionAddress(run.SessionID); ok {
+			plan, planErr := t3Plan(d.runtimeConfigPath, runtime)
+			if planErr != nil {
+				err = planErr
+			} else if plan == nil {
+				err = fmt.Errorf("T3 transport 不可用，不能续原线程")
+			} else {
+				var remote t3Show
+				remote, err = t3Get(preflight, plan, threadID)
+				if err == nil {
+					state := t3State(remote)
+					if state != "idle" && state != "completed" {
+						err = fmt.Errorf("T3 原线程当前状态为 %q；先在线程中处理后再跟进", state)
+					}
+				}
+			}
 		} else {
 			cmd, err = execCommand(ctx, project.WorkspacePath, text, runtime, d.runtimeConfigPath)
 			if err == nil {
@@ -190,6 +206,10 @@ func (d *Dispatcher) Continue(taskID, commentID, by string) error {
 		}
 		if _, ok := herdrAddress(run.SessionID); ok {
 			d.sendHerdrFollowup(ctx, taskID, definition.Label, run, text)
+			return
+		}
+		if _, ok := t3SessionAddress(run.SessionID); ok {
+			d.sendT3Followup(ctx, taskID, definition.Label, run, text)
 			return
 		}
 		d.comment(taskID, definition.Label, "正在原会话跟进评论 "+commentID+"（发起人 "+by+"）。")
