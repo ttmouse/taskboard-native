@@ -208,9 +208,12 @@ func trackT3Show(t *testing.T, showBody string, wantStatus, wantDetail string) {
 	defer d.Close()
 	bin := writeFakeT3(t, showBody)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	done := make(chan struct{})
 	run := &model.Execution{TaskID: task.ID, Runtime: RuntimeCodex, SessionID: "t3:mcp:t-1", Status: "running"}
-	go d.trackT3(ctx, run, testT3Plan(t, bin, t.TempDir()))
+	go func() {
+		defer close(done)
+		d.trackT3(ctx, run, testT3Plan(t, bin, t.TempDir()))
+	}()
 	waitFor(t, "execution "+wantStatus, func() (bool, string) {
 		execution, err := st.Execution(task.ID)
 		if err != nil || execution == nil {
@@ -219,6 +222,8 @@ func trackT3Show(t *testing.T, showBody string, wantStatus, wantDetail string) {
 		ok := execution.Status == wantStatus && (wantDetail == "" || execution.Detail == wantDetail)
 		return ok, execution.Status + " / " + execution.Detail
 	})
+	cancel()
+	<-done
 }
 
 func TestT3StatusMapping(t *testing.T) {
@@ -254,9 +259,12 @@ exit 1
 		defer d.Close()
 		bin := writeFakeT3(t, `printf 'connection refused\n' >&2; exit 1`)
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		done := make(chan struct{})
 		run := &model.Execution{TaskID: task.ID, Runtime: RuntimeCodex, SessionID: "t3:mcp:t-1", Status: "running"}
-		go d.trackT3(ctx, run, testT3Plan(t, bin, t.TempDir()))
+		go func() {
+			defer close(done)
+			d.trackT3(ctx, run, testT3Plan(t, bin, t.TempDir()))
+		}()
 		sawDisconnected := false
 		waitFor(t, "unreachable grace", func() (bool, string) {
 			execution, err := st.Execution(task.ID)
@@ -268,6 +276,8 @@ exit 1
 			}
 			return execution.Status == "released", execution.Status + " / " + execution.Detail
 		})
+		cancel()
+		<-done
 		if !sawDisconnected {
 			t.Fatal("never reported disconnected before releasing the write lock")
 		}
