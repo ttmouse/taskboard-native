@@ -69,6 +69,26 @@ func NewDispatcher(st *store.Store, configPaths ...string) *Dispatcher {
 			d.resumeHerdrTracking(run)
 			continue
 		}
+		if _, ok := t3SessionAddress(run.SessionID); ok {
+			// T3 threads survive the service: resume the same thread instead
+			// of opening a second writer. Without a usable transport the
+			// record cannot be tracked any more, so converge it to released.
+			plan, planErr := t3Plan(d.runtimeConfigPath, run.Channel())
+			if planErr != nil || plan == nil {
+				detail := "服务重启后 T3 transport 不可用；已释放写锁"
+				if planErr != nil {
+					detail += "：" + planErr.Error()
+				}
+				run.Status, run.Detail = "released", detail
+				if err := st.SaveExecution(run); err != nil {
+					d.recoveryErr = err
+					return d
+				}
+				continue
+			}
+			d.resumeT3Tracking(run, plan)
+			continue
+		}
 		if run.SessionID == "" && (run.Status == "submitting" || run.Status == "unknown") {
 			// Herdr may have accepted the tab creation before its response was
 			// lost. There is no address to reconnect to, so block redispatch and
@@ -358,9 +378,36 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 		return
 	}
 	if runtime != RuntimeDSH {
-		// Every non-DSH outcome (Herdr accepted, Herdr failed, or CLI fallback)
+		// Every non-DSH outcome (Herdr/T3 accepted, failed, or CLI fallback)
 		// must release the auto-run queue for this card.
 		defer d.finishProjectCard(task.ID)
+	}
+	// T3 is a transport, not a channel: the runtime stays codex/claude and
+	// only the session prefix differs. Resolve it before touching Herdr so a
+	// broken t3 section fails loudly instead of silently opening a second
+	// writer somewhere else.
+	var t3Transport *t3RuntimePlan
+	if runtime != RuntimeDSH {
+		plan, planErr := t3Plan(d.runtimeConfigPath, runtime)
+		if planErr != nil {
+			d.comment(task.ID, actor, "T3 渠道配置无效，未派发："+planErr.Error())
+			return
+		}
+		if !plan.canStart() {
+			// T3 refuses a thread without a model. Treat the gap as "not
+			// configured" so the card falls back to the next transport
+			// instead of failing.
+			plan = nil
+		}
+		t3Transport = plan
+	}
+	triedT3 := false
+	if t3Transport != nil && t3Transport.preferT3 {
+		triedT3 = true
+		switch d.tryT3Dispatch(ctx, task, dir, runtime, actor, by, text, followupID, t3Transport) {
+		case transportDispatched, transportStopped:
+			return
+		}
 	}
 	if runtime != RuntimeDSH && herdrAvailable() {
 		start := time.Now()
@@ -406,11 +453,20 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 			}
 		}
 	}
+	// Default priority is Herdr → T3 → CLI, so T3 picks up exactly the cases
+	// where Herdr is absent or unreachable. `prefer: "t3"` already tried T3
+	// above and reached here only when it was unreachable.
+	if t3Transport != nil && !triedT3 {
+		switch d.tryT3Dispatch(ctx, task, dir, runtime, actor, by, text, followupID, t3Transport) {
+		case transportDispatched, transportStopped:
+			return
+		}
+	}
 
 	// The code-review pipeline asks the agent to start a Claude reviewer with
 	// `hc run`, which only exists inside Herdr. A fresh non-DSH dispatch only
-	// reaches this point when Herdr was unavailable and we fell back to a
-	// headless CLI, so hand the agent the plain task text.
+	// reaches this point when neither Herdr nor T3 took it, so hand the agent
+	// the plain task text.
 	if runtime != RuntimeDSH && followupID == "" {
 		text = buildTaskTextForRuntime(task, runtime)
 	}
