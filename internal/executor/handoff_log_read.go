@@ -18,8 +18,10 @@ type HandoffEvent struct {
 	Timestamp      time.Time `json:"timestamp"`
 	Event          string    `json:"event"`
 	ProjectID      string    `json:"projectId,omitempty"`
+	Channel        string    `json:"channel,omitempty"`
 	Runtime        string    `json:"runtime,omitempty"`
 	Actor          string    `json:"actor,omitempty"`
+	Message        string    `json:"message,omitempty"`
 	RunStatus      string    `json:"runStatus,omitempty"`
 	TaskID         string    `json:"taskId,omitempty"`
 	TaskIDs        []string  `json:"taskIds,omitempty"`
@@ -151,7 +153,7 @@ func SummarizeHandoff(events []HandoffEvent) HandoffSummary {
 
 func isHandoffStart(event string) bool {
 	switch event {
-	case "task.dispatch_started", "task.claimed", "task.claimed_existing_execution":
+	case "dispatch.attempt", "task.dispatch_started", "task.claimed", "task.claimed_existing_execution":
 		return true
 	default:
 		return false
@@ -160,7 +162,7 @@ func isHandoffStart(event string) bool {
 
 func isHandoffEnd(event string) bool {
 	switch event {
-	case "task.moved_to_review", "task.dispatch_failed", "task.execution_converged":
+	case "dispatch.handed_off", "dispatch.failed", "task.moved_to_review", "task.dispatch_failed", "task.execution_converged":
 		return true
 	default:
 		return false
@@ -170,6 +172,20 @@ func isHandoffEnd(event string) bool {
 // HandoffEventLabel maps a machine event name to a short Chinese UI label.
 func HandoffEventLabel(event string) string {
 	switch event {
+	case "dispatch.attempt":
+		return "尝试派发"
+	case "dispatch.channel_failed":
+		return "渠道失败"
+	case "dispatch.fallback":
+		return "回退下一渠道"
+	case "dispatch.handed_off":
+		return "已交接"
+	case "dispatch.failed":
+		return "派发失败"
+	case "dispatch.uncertain":
+		return "回执不确定"
+	case "dispatch.status":
+		return "状态变更"
 	case "task.claimed":
 		return "认领"
 	case "task.claimed_existing_execution":

@@ -20,8 +20,8 @@ func TestDetailHandoffHeaderVisibleWhenEmpty(t *testing.T) {
 	b.detail.handoffLog = executor.HandoffLogView{}
 	b.detail.handoffLogFailed = false
 	settle(t, tt)
-	if !tt.HasText("自动承接") {
-		t.Fatalf("empty handoff section header missing; texts: %v", tt.Texts())
+	if !tt.HasText("运行日志") {
+		t.Fatalf("empty runtime log section header missing; texts: %v", tt.Texts())
 	}
 	if tt.HasText("查看") {
 		t.Fatalf("empty handoff should not offer expand toggle; texts: %v", tt.Texts())

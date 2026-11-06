@@ -188,7 +188,7 @@ func TestDispatchFailureKeepsColumn(t *testing.T) {
 		for i, c := range cs {
 			fmt.Fprintf(&all, "#%d [%s] %q; ", i, c.Author, c.Text)
 		}
-		return len(cs) >= 2 && strings.Contains(last, "Herdr 派发 codex 失败"),
+		return len(cs) >= 1 && strings.Contains(last, "没能交给 Herdr"),
 			fmt.Sprintf("comments=%d all=%s", len(cs), all.String())
 	})
 	cur, _ := st.Task(task.ID)
@@ -269,7 +269,8 @@ func TestDispatchFallsBackToCLIWhenHerdrUnreachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	d := NewDispatcher(st)
+	logPath := filepath.Join(t.TempDir(), "dispatch.jsonl")
+	d := NewDispatcher(st, "", "", logPath)
 	defer d.Close()
 
 	if err := d.Dispatch(task.ID, RuntimeCodex, "fallback-test"); err != nil {
@@ -287,8 +288,18 @@ func TestDispatchFallsBackToCLIWhenHerdrUnreachable(t *testing.T) {
 		t.Fatalf("fallback never launched the CLI: %v", err)
 	}
 	comments, _ := st.Comments(task.ID)
-	if !hasComment(comments, "回退到独立 CLI 执行") {
-		t.Fatalf("fallback reason missing from comments: %+v", comments)
+	for _, c := range comments {
+		if strings.Contains(c.Text, "Herdr 派发") || strings.Contains(c.Text, "回退") || strings.Contains(c.Text, "无法读取 Herdr") {
+			t.Fatalf("technical Herdr failure leaked into the user timeline: %q", c.Text)
+		}
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read dispatch log: %v", err)
+	}
+	logText := string(logged)
+	if !strings.Contains(logText, `"event":"dispatch.channel_failed"`) || !strings.Contains(logText, `"channel":"herdr"`) || !strings.Contains(logText, `"reason":"unavailable"`) {
+		t.Fatalf("dispatch log missing the Herdr failure record: %s", logText)
 	}
 	for _, c := range comments {
 		if strings.Contains(c.Text, "已交给 Herdr") {

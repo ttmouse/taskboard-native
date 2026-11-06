@@ -26,7 +26,7 @@ exit 1`)
 			return false, err.Error()
 		}
 		for _, comment := range cur.Comments {
-			if !strings.Contains(comment.Text, "Herdr 派发 pi 失败") {
+			if !strings.Contains(comment.Text, "没能交给 Herdr") {
 				continue
 			}
 			if !strings.Contains(comment.Text, "无法在 Herdr 创建项目 space") {

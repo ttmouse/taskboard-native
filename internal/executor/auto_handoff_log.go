@@ -7,19 +7,26 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
+
+	"taskboard-native/internal/model"
 )
 
-// handoffEvent is a compact, machine-readable record of one automatic handoff
-// decision. It intentionally excludes task text, workspace paths, and raw
-// errors because those may contain private data or credentials.
+// handoffEvent is a compact, machine-readable record of one dispatch or
+// automatic handoff decision. It is the operator's side of a card's history:
+// comments tell a person what happened, this log tells whoever debugs it why.
+// It intentionally excludes task text and agent output, and Message carries
+// only a clipped single-line diagnostic, never credentials.
 type handoffEvent struct {
 	Timestamp      time.Time `json:"timestamp"`
 	Event          string    `json:"event"`
 	ProjectID      string    `json:"projectId,omitempty"`
+	Channel        string    `json:"channel,omitempty"`
 	Runtime        string    `json:"runtime,omitempty"`
 	Actor          string    `json:"actor,omitempty"`
+	Message        string    `json:"message,omitempty"`
 	RunStatus      string    `json:"runStatus,omitempty"`
 	TaskID         string    `json:"taskId,omitempty"`
 	TaskIDs        []string  `json:"taskIds,omitempty"`
@@ -81,4 +88,52 @@ func (d *Dispatcher) logHandoff(event handoffEvent) {
 	if err := d.handoffLog.append(event); err != nil {
 		log.Printf("taskboard: automatic handoff log: %v", err)
 	}
+}
+
+// dispatchLogMaxMessage keeps one diagnostic readable in a single log line
+// while leaving room for a CLI failure excerpt.
+const dispatchLogMaxMessage = 800
+
+// logDispatch records one dispatch decision for later diagnosis. Card comments
+// stay user-facing; this is where channel failures, fallbacks, and status
+// transitions live.
+func (d *Dispatcher) logDispatch(event, taskID, channel, runtime, actor, reason, message string) {
+	d.logHandoff(handoffEvent{
+		Event:   event,
+		TaskID:  taskID,
+		Channel: channel,
+		Runtime: runtime,
+		Actor:   actor,
+		Reason:  reason,
+		Message: clipMessage(message),
+	})
+}
+
+// recordTrackedStatus logs one status transition of a tracked execution. It is
+// the only place intermediate states survive: the executions row keeps just the
+// latest one.
+func (d *Dispatcher) recordTrackedStatus(run *model.Execution, channel string, last *string) {
+	if run.Status == *last {
+		return
+	}
+	*last = run.Status
+	d.logHandoff(handoffEvent{
+		Event:          "dispatch.status",
+		TaskID:         run.TaskID,
+		Channel:        channel,
+		Runtime:        run.Runtime,
+		ExecutionState: run.Status,
+		Message:        clipMessage(run.Detail),
+	})
+}
+
+// clipMessage flattens a diagnostic to one bounded line. It counts runes, so a
+// Chinese diagnostic never gets cut inside a character.
+func clipMessage(message string) string {
+	line := strings.Join(strings.Fields(message), " ")
+	runes := []rune(line)
+	if len(runes) > dispatchLogMaxMessage {
+		return string(runes[:dispatchLogMaxMessage]) + "…"
+	}
+	return line
 }

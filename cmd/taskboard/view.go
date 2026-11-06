@@ -2203,7 +2203,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 
 				// Automatic handoff timeline: always show the section header (even when empty).
 				ui.Row(c).FillWidth().Gap(t.Space(1.5)).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "自动承接").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
+					ui.Text(c, "运行日志").FontSize(fxs(t)).FontWeight(600).TextColor(t.TextMuted)
 					if sum := handoffSummaryLine(d.handoffLog.Summary); sum != "" {
 						ui.Text(c, sum).FontSize(fxs(t)).TextColor(t.TextMuted).
 							MaxLines(1).Ellipsis("…").Tooltip(sum).Grow(1)
@@ -2211,7 +2211,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 						ui.Spacer(c)
 					}
 					if d.handoffLogLoading {
-						loading.LinearDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入自动承接日志")
+						loading.LinearDots(c, loading.Options{Size: 12, Color: t.TextMuted}).Label("正在载入运行日志")
 					}
 					if len(d.handoffLog.Events) > 0 {
 						label := fmt.Sprintf("查看 %d 条记录", len(d.handoffLog.Events))
@@ -2237,7 +2237,7 @@ func (b *board) detailView(c *ui.Context, t *ui.Theme) {
 					}
 				})
 				if d.handoffLogFailed {
-					ui.Text(c, "自动承接日志暂时无法读取").FontSize(fsm(t)).TextColor(t.TextMuted)
+					ui.Text(c, "运行日志暂时无法读取").FontSize(fsm(t)).TextColor(t.TextMuted)
 				} else if d.handoffLogExpanded && len(d.handoffLog.Events) > 0 {
 					ui.Column(c).FillWidth().Gap(t.Space(0.5)).Children(func() {
 						for _, ev := range d.handoffLog.Events {
@@ -2466,6 +2466,9 @@ func handoffSummaryLine(sum executor.HandoffSummary) string {
 
 func handoffEventLine(ev executor.HandoffEvent) string {
 	parts := []string{commentTimestamp(ev.Timestamp), executor.HandoffEventLabel(ev.Event)}
+	if ev.Channel != "" {
+		parts = append(parts, strings.ToUpper(ev.Channel))
+	}
 	if ev.Runtime != "" {
 		parts = append(parts, runtimeLabel(ev.Runtime))
 	}
@@ -2476,6 +2479,9 @@ func handoffEventLine(ev executor.HandoffEvent) string {
 	}
 	if ev.Reason != "" {
 		parts = append(parts, ev.Reason)
+	}
+	if ev.Message != "" {
+		parts = append(parts, ev.Message)
 	}
 	return strings.Join(parts, " · ")
 }

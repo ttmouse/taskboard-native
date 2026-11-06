@@ -354,6 +354,11 @@ var (
 )
 
 func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
+	lastStatus := run.Status
+	save := func() {
+		_ = d.store.SaveExecution(*run)
+		d.recordTrackedStatus(run, "herdr", &lastStatus)
+	}
 	ticker := time.NewTicker(herdrProbeInterval)
 	defer ticker.Stop()
 	var unreachableSince time.Time
@@ -363,7 +368,7 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 		address, ok := herdrAddress(run.SessionID)
 		if !ok {
 			run.Status, run.Detail = "failed", "Herdr terminal 标识无效"
-			_ = d.store.SaveExecution(*run)
+			save()
 			return
 		}
 		status, err := herdrGet(ctx, address)
@@ -380,14 +385,14 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 			if time.Since(unreachableSince) >= herdrUnreachableGrace {
 				run.Status = "released"
 				run.Detail = fmt.Sprintf("Herdr terminal 连续 %s 不可达；已释放写锁，可按人类指令重新派发或评论跟进", herdrUnreachableGrace)
-				_ = d.store.SaveExecution(*run)
+				save()
 				return
 			}
 			misses++
 			if misses >= herdrFlapProbes {
 				run.Status = "disconnected"
 				run.Detail = fmt.Sprintf("Herdr terminal 连续 %d 次不可达；宽限期内继续探测，超过 %s 释放写锁", misses, herdrUnreachableGrace)
-				_ = d.store.SaveExecution(*run)
+				save()
 			}
 			select {
 			case <-ctx.Done():
@@ -409,7 +414,7 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 		case "done":
 			idleSince = time.Time{}
 			run.Status, run.Detail = "returned", "Herdr agent turn 已结束；任务状态由执行 Agent 回写"
-			_ = d.store.SaveExecution(*run)
+			save()
 			return
 		case "idle":
 			// A newly created Herdr terminal reports idle before the agent's
@@ -418,7 +423,7 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 			if status.Turn == 0 && status.ExitCode == nil {
 				idleSince = time.Time{}
 				run.Status, run.Detail = "running", HerdrInitialTurnPendingDetail
-				_ = d.store.SaveExecution(*run)
+				save()
 				break
 			}
 			if idleSince.IsZero() {
@@ -426,7 +431,7 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 			}
 			if time.Since(idleSince) >= herdrIdleGrace {
 				run.Status, run.Detail = "returned", "Herdr agent turn 已结束；任务状态由执行 Agent 回写"
-				_ = d.store.SaveExecution(*run)
+				save()
 				return
 			}
 			run.Status, run.Detail = "running", "Herdr turn 暂时 idle，等待状态稳定"
@@ -439,11 +444,11 @@ func (d *Dispatcher) trackHerdr(ctx context.Context, run *model.Execution) {
 					run.Status = "failed"
 					run.Detail = fmt.Sprintf("Herdr agent exited with status %d", *status.ExitCode)
 				}
-				_ = d.store.SaveExecution(*run)
+				save()
 				return
 			}
 		}
-		_ = d.store.SaveExecution(*run)
+		save()
 		select {
 		case <-ctx.Done():
 			return

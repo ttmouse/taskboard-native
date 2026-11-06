@@ -367,13 +367,9 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 		d.runDesktop(ctx, task, dir, text, actor, by, followupID)
 		return
 	}
-	if followupID != "" {
-		if err := d.comment(task.ID, actor, fmt.Sprintf("已按评论 @%s 改由该渠道新建会话处理（工作目录 %s）…", actor, dir)); err != nil {
-			return
-		}
-	} else if err := d.comment(task.ID, actor, fmt.Sprintf("派发 %s 执行（工作目录 %s；发起人 %s）…", runtime, dir, by)); err != nil {
-		return // store is gone; nothing to write back to
-	}
+	// Which channel carried the card is dispatch bookkeeping: the card shows the
+	// outcome, the log keeps the route.
+	d.logDispatch("dispatch.attempt", task.ID, "", runtime, by, "", "")
 	if err := ctx.Err(); err != nil {
 		return
 	}
@@ -390,7 +386,8 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 	if runtime != RuntimeDSH {
 		plan, planErr := t3Plan(d.runtimeConfigPath, runtime)
 		if planErr != nil {
-			d.comment(task.ID, actor, "T3 渠道配置无效，未派发："+planErr.Error())
+			d.logDispatch("dispatch.failed", task.ID, "t3", runtime, by, "config_invalid", planErr.Error())
+			d.comment(task.ID, actor, "T3 渠道配置无效，未派发。请修正渠道配置后重试。")
 			return
 		}
 		if !plan.canStart() {
@@ -410,24 +407,24 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 		}
 	}
 	if runtime != RuntimeDSH && herdrAvailable() {
-		start := time.Now()
 		run := &model.Execution{TaskID: task.ID, Runtime: runtime, Status: "submitting", FollowupID: followupID, Detail: "正在请求 Herdr 在项目 space 中创建 tab"}
 		if err := d.store.SaveExecution(*run); err != nil {
-			d.comment(task.ID, actor, "保存 Herdr 派发意图失败，回退 CLI："+err.Error())
+			d.logDispatch("dispatch.channel_failed", task.ID, "herdr", runtime, by, "intent_save_failed", err.Error())
 		} else {
 			sessionID, herr := herdrCreate(ctx, task, projectName, dir, runtime, d.boardURL, actor, text)
 			if herr == nil {
 				run.SessionID, run.Status, run.Detail = sessionID, "running", HerdrInitialTurnPendingDetail
 				if err := d.store.SaveExecution(*run); err != nil {
 					d.setFollowup(followupID, "unknown")
-					d.comment(task.ID, actor, "Herdr 已创建 terminal，但执行记录保存失败；不会另建会话："+err.Error())
+					d.logDispatch("dispatch.uncertain", task.ID, "herdr", runtime, by, "receipt_save_failed", err.Error())
+					d.comment(task.ID, actor, "已交给 Herdr，但看板没能记下这次执行。不会另建会话，请先在 Herdr 中核对。")
 					return
 				}
 				d.setFollowup(followupID, "sent")
 				if followupID == "" {
 					d.syncRunningTaskColumn(task.ID, actor)
 				}
-				d.comment(task.ID, actor, fmt.Sprintf("已交给 Herdr %s（项目 space 中的任务 tab 已打开；发起人 %s；%s）。", runtime, by, time.Since(start).Round(time.Second)))
+				d.logDispatch("dispatch.handed_off", task.ID, "herdr", runtime, by, "", sessionID)
 				d.trackHerdr(ctx, run)
 				return
 			}
@@ -436,19 +433,21 @@ func (d *Dispatcher) runWithText(ctx context.Context, task model.Task, projectNa
 			if isHerdrUnavailable(herr) {
 				run.Status, run.Detail = "failed", herr.Error()
 				_ = d.store.SaveExecution(*run)
-				d.comment(task.ID, actor, fmt.Sprintf("Herdr 派发 %s 失败：%v。回退到独立 CLI 执行。", runtime, herr))
+				d.logDispatch("dispatch.channel_failed", task.ID, "herdr", runtime, by, "unavailable", herr.Error())
 				// fall through to CLI path
 			} else {
 				var launchErr *herdrLaunchError
 				if errors.As(herr, &launchErr) && launchErr.uncertain {
 					run.Status, run.Detail = "unknown", "Herdr 创建 tab 的回执不确定；禁止再次创建，请先在项目 space 核对："+herr.Error()
 					d.setFollowup(followupID, "unknown")
+					d.logDispatch("dispatch.uncertain", task.ID, "herdr", runtime, by, "launch_uncertain", herr.Error())
 				} else {
 					run.Status, run.Detail = "failed", herr.Error()
 					d.setFollowup(followupID, "failed")
+					d.logDispatch("dispatch.failed", task.ID, "herdr", runtime, by, "config", herr.Error())
 				}
 				_ = d.store.SaveExecution(*run)
-				d.comment(task.ID, actor, fmt.Sprintf("Herdr 派发 %s 失败：%v。", runtime, herr))
+				d.comment(task.ID, actor, fmt.Sprintf("没能交给 Herdr：%v。", herr))
 				return
 			}
 		}
@@ -525,6 +524,7 @@ func (d *Dispatcher) executeCLI(ctx context.Context, cmd *exec.Cmd, task model.T
 	if err := d.store.SaveExecution(*run); err != nil {
 		d.comment(task.ID, actor, "保存会话状态失败："+err.Error())
 	}
+	d.logDispatch("dispatch.status", task.ID, "cli", runtime, actor, "", status)
 	if run.FollowupID != "" {
 		// Even a failed process may have changed files. Once it started, never
 		// replay this comment automatically; a fresh instruction is required.
@@ -545,23 +545,14 @@ func (d *Dispatcher) executeCLI(ctx context.Context, cmd *exec.Cmd, task model.T
 		}
 	}
 	if runErr == nil {
-		if strings.TrimSpace(stdout.String()) == "" {
-			d.comment(task.ID, actor, fmt.Sprintf("%s 进程未返回结果文字（%s）；程序未修改任务状态，请以执行 Agent 的原卡回写为准。", runtime, elapsed))
-			return
-		}
-		d.comment(task.ID, actor, fmt.Sprintf("%s 会话已结束（%s）；工作结果和卡片状态由执行 Agent 回写。", runtime, elapsed))
 		return
 	}
 	if ctx.Err() != nil {
 		d.comment(task.ID, actor, fmt.Sprintf("%s 执行被取消（服务关闭），已运行 %s；任务留在原列。", runtime, elapsed))
 		return
 	}
-	detail := failureDiagnostic(stdout.String(), stderr.String())
-	body := fmt.Sprintf("%s 执行失败（exit %d，%s）。", runtime, exit, elapsed)
-	if detail != "" {
-		body += "诊断：\n\n" + detail
-	}
-	d.comment(task.ID, actor, body)
+	d.logDispatch("dispatch.failed", task.ID, "cli", runtime, actor, fmt.Sprintf("exit_%d", exit), failureDiagnostic(stdout.String(), stderr.String()))
+	d.comment(task.ID, actor, fmt.Sprintf("%s 执行失败（exit %d，%s）。诊断已写入运行日志。", runtime, exit, elapsed))
 }
 
 func (d *Dispatcher) comment(taskID, by, text string) error {

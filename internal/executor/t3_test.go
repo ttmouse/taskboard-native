@@ -154,6 +154,70 @@ func TestT3CreateUnavailableWhenPinnedPortIsClosed(t *testing.T) {
 	}
 }
 
+// A live server publishes its port into server-runtime.json, and `thread list`
+// resolves a project from the board's cwd before it reaches the server. Reading
+// the published port keeps a healthy server reachable from a cwd that has no T3
+// project — the exact case that silently demoted T3 to CLI in production.
+func TestT3AvailableReadsPublishedPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	baseDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(baseDir, "userdata"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtime := `{"version":1,"port":` + strconv.Itoa(listener.Addr().(*net.TCPAddr).Port) + `}`
+	if err := os.WriteFile(filepath.Join(baseDir, "userdata", "server-runtime.json"), []byte(runtime), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("T3_CALLS", calls)
+	bin := writeFakeT3(t, `printf 'called\n' >> "$T3_CALLS"`)
+	if !t3Available(context.Background(), testT3Plan(t, bin, baseDir)) {
+		t.Fatal("published port is live, want available")
+	}
+	if _, statErr := os.Stat(calls); !os.IsNotExist(statErr) {
+		t.Fatal("probed the CLI although the published port was live")
+	}
+}
+
+func TestT3AvailableRejectsStalePublishedPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	baseDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(baseDir, "userdata"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtime := `{"version":1,"port":` + strconv.Itoa(port) + `}`
+	if err := os.WriteFile(filepath.Join(baseDir, "userdata", "server-runtime.json"), []byte(runtime), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if t3Available(context.Background(), testT3Plan(t, writeFakeT3(t, `exit 0`), baseDir)) {
+		t.Fatal("stale port is closed, want unavailable")
+	}
+}
+
+// Servers too old to publish a port are probed through the CLI. A project
+// resolution error still means the server answered, so it must not read as
+// "no server".
+func TestT3AvailableTreatsProjectErrorAsReachable(t *testing.T) {
+	bin := writeFakeT3(t, `
+case "$1 $2" in
+  "thread list") printf "No T3 Code project matches '.'. Pass a project id or a path inside a project.\n" >&2; exit 1 ;;
+esac
+exit 0
+`)
+	if !t3Available(context.Background(), testT3Plan(t, bin, t.TempDir())) {
+		t.Fatal("server answered with a project error, want available")
+	}
+}
+
 func TestT3CreateClassifiesStartFailures(t *testing.T) {
 	bin := writeFakeT3(t, `
 case "$1 $2" in
@@ -341,7 +405,8 @@ printf '{"type":"thread.started","thread_id":"00000000-0000-4000-8000-0000000000
 printf 'returned\n'`)
 	st := newTestStore(t)
 	_, task := projectWithWorkspace(t, st)
-	d := NewDispatcher(st, profile)
+	logPath := filepath.Join(t.TempDir(), "dispatch.jsonl")
+	d := NewDispatcher(st, profile, "", logPath)
 	defer d.Close()
 	if err := d.Dispatch(task.ID, RuntimeCodex, "test"); err != nil {
 		t.Fatal(err)
@@ -357,8 +422,18 @@ printf 'returned\n'`)
 		t.Fatal("CLI fallback did not run")
 	}
 	comments, _ := st.Comments(task.ID)
-	if !hasComment(comments, "T3 派发 codex 失败") || !hasComment(comments, "回退到下一可用执行方式") {
-		t.Fatalf("missing T3 fallback comment: %#v", comments)
+	for _, c := range comments {
+		if strings.Contains(c.Text, "T3 派发") || strings.Contains(c.Text, "回退到") || strings.Contains(c.Text, "T3 服务不可达") {
+			t.Fatalf("technical T3 failure leaked into the user timeline: %q", c.Text)
+		}
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read dispatch log: %v", err)
+	}
+	logText := string(logged)
+	if !strings.Contains(logText, `"channel":"t3"`) || !strings.Contains(logText, `"reason":"unavailable"`) {
+		t.Fatalf("dispatch log missing the T3 failure record: %s", logText)
 	}
 }
 
@@ -398,8 +473,8 @@ exit 1
 		t.Fatal("CLI ran even though T3 accepted the thread")
 	}
 	comments, _ := st.Comments(task.ID)
-	if !hasComment(comments, "已交给 T3 codex") {
-		t.Fatalf("missing T3 dispatch comment: %#v", comments)
+	if len(comments) != 0 {
+		t.Fatalf("a successful T3 dispatch must not narrate itself on the card: %#v", comments)
 	}
 }
 

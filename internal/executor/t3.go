@@ -282,12 +282,37 @@ func t3Run(ctx context.Context, plan *t3RuntimePlan, args ...string) ([]byte, st
 	return stdout.Bytes(), combined, err
 }
 
-// t3Available probes the configured server. When the operator pinned a
-// loopback port it is a cheap TCP check; otherwise `thread list` is the only
-// way to ask the CLI whether its server is up.
+// t3ServerPort reads the port the running server published for baseDir. The
+// server writes this file at startup, and a stale file is harmless because the
+// caller TCP-probes the port before trusting it.
+func t3ServerPort(baseDir string) int {
+	raw, err := os.ReadFile(filepath.Join(baseDir, "userdata", "server-runtime.json"))
+	if err != nil {
+		return 0
+	}
+	var runtime struct {
+		Port int `json:"port"`
+	}
+	if err := json.Unmarshal(raw, &runtime); err != nil {
+		return 0
+	}
+	if runtime.Port <= 0 || runtime.Port > 65535 {
+		return 0
+	}
+	return runtime.Port
+}
+
+// t3Available probes the server that owns baseDir. A pinned port and the one
+// the server published are both cheap TCP checks; only a server too old to
+// publish its port needs the CLI, whose `thread list` first resolves a project
+// from the board's cwd and fails there even while the server is healthy.
 func t3Available(ctx context.Context, plan *t3RuntimePlan) bool {
-	if plan.port > 0 {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(plan.port)), t3ProbeTimeout)
+	port := plan.port
+	if port == 0 {
+		port = t3ServerPort(plan.baseDir)
+	}
+	if port > 0 {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), t3ProbeTimeout)
 		if err != nil {
 			return false
 		}
@@ -297,7 +322,12 @@ func t3Available(ctx context.Context, plan *t3RuntimePlan) bool {
 	probe, cancel := context.WithTimeout(ctx, t3CommandTimeout)
 	defer cancel()
 	_, combined, err := t3Run(probe, plan, "thread", "list", "--base-dir", plan.baseDir, "--json")
-	return err == nil && !t3NoServer(combined)
+	if err != nil {
+		// A server that answered "no project matches this cwd" is up; only a
+		// missing server or an unreadable answer means the transport is down.
+		return strings.Contains(combined, "No T3 Code project matches")
+	}
+	return !t3NoServer(combined)
 }
 
 // t3Create adds the project (idempotent) and starts one thread. The returned
@@ -403,14 +433,13 @@ const (
 	transportStopped
 )
 
-// tryT3Dispatch carries one card from "T3 chosen" to a tracked thread. The
-// dispatch comment is already written by runWithText, so every outcome here
-// writes its own follow-up and nothing is silent.
+// tryT3Dispatch carries one card from "T3 chosen" to a tracked thread. Nothing
+// is written to the card on success; only outcomes a person must act on reach
+// the comment stream.
 func (d *Dispatcher) tryT3Dispatch(ctx context.Context, task model.Task, dir, runtime, actor, by, text, followupID string, plan *t3RuntimePlan) transportOutcome {
-	start := time.Now()
 	run := &model.Execution{TaskID: task.ID, Runtime: runtime, Status: "submitting", FollowupID: followupID, Detail: "正在请求 T3 打开线程"}
 	if err := d.store.SaveExecution(*run); err != nil {
-		d.comment(task.ID, actor, "保存 T3 派发意图失败，回退 CLI："+err.Error())
+		d.logDispatch("dispatch.channel_failed", task.ID, "t3", runtime, by, "intent_save_failed", err.Error())
 		return transportFallthrough
 	}
 	// A fresh dispatch gets the plain task text: the hc review pipeline only
@@ -423,14 +452,15 @@ func (d *Dispatcher) tryT3Dispatch(ctx context.Context, task model.Task, dir, ru
 		run.SessionID, run.Status, run.Detail = sessionID, "running", t3InitialTurnPendingDetail
 		if err := d.store.SaveExecution(*run); err != nil {
 			d.setFollowup(followupID, "unknown")
-			d.comment(task.ID, actor, "T3 已创建线程，但执行记录保存失败；不会另建会话："+err.Error())
+			d.logDispatch("dispatch.uncertain", task.ID, "t3", runtime, by, "receipt_save_failed", err.Error())
+			d.comment(task.ID, actor, "已在 T3 创建线程，但看板没能记下这次执行。不会另建会话，请先在 T3 中核对。")
 			return transportStopped
 		}
 		d.setFollowup(followupID, "sent")
 		if followupID == "" {
 			d.syncRunningTaskColumn(task.ID, actor)
 		}
-		d.comment(task.ID, actor, fmt.Sprintf("已交给 T3 %s（线程已启动；发起人 %s；%s）。", runtime, by, time.Since(start).Round(time.Second)))
+		d.logDispatch("dispatch.handed_off", task.ID, "t3", runtime, by, "", sessionID)
 		d.trackT3(ctx, run, plan)
 		return transportDispatched
 	}
@@ -438,18 +468,20 @@ func (d *Dispatcher) tryT3Dispatch(ctx context.Context, task model.Task, dir, ru
 	if errors.As(t3Err, &failure) && failure.kind == t3ErrUnavailable {
 		run.Status, run.Detail = "failed", t3Err.Error()
 		_ = d.store.SaveExecution(*run)
-		d.comment(task.ID, actor, fmt.Sprintf("T3 派发 %s 失败：%v。回退到下一可用执行方式。", runtime, t3Err))
+		d.logDispatch("dispatch.channel_failed", task.ID, "t3", runtime, by, "unavailable", t3Err.Error())
 		return transportFallthrough
 	}
 	if errors.As(t3Err, &failure) && failure.uncertain {
 		run.Status, run.Detail = "unknown", "T3 创建线程的回执不确定；禁止再次创建，请先在 T3 中核对："+t3Err.Error()
 		d.setFollowup(followupID, "unknown")
+		d.logDispatch("dispatch.uncertain", task.ID, "t3", runtime, by, "launch_uncertain", t3Err.Error())
 	} else {
 		run.Status, run.Detail = "failed", t3Err.Error()
 		d.setFollowup(followupID, "failed")
+		d.logDispatch("dispatch.failed", task.ID, "t3", runtime, by, "config", t3Err.Error())
 	}
 	_ = d.store.SaveExecution(*run)
-	d.comment(task.ID, actor, fmt.Sprintf("T3 派发 %s 失败：%v。", runtime, t3Err))
+	d.comment(task.ID, actor, fmt.Sprintf("没能交给 T3：%v。", t3Err))
 	return transportStopped
 }
 
@@ -457,10 +489,15 @@ func (d *Dispatcher) tryT3Dispatch(ctx context.Context, task model.Task, dir, ru
 // turn only becomes `returned`: the execution Agent writes the task result
 // and moves the card, the program never does.
 func (d *Dispatcher) trackT3(ctx context.Context, run *model.Execution, plan *t3RuntimePlan) {
+	lastStatus := run.Status
+	save := func() {
+		_ = d.store.SaveExecution(*run)
+		d.recordTrackedStatus(run, "t3", &lastStatus)
+	}
 	threadID, ok := t3SessionAddress(run.SessionID)
 	if !ok {
 		run.Status, run.Detail = "failed", "T3 线程标识无效"
-		_ = d.store.SaveExecution(*run)
+		save()
 		return
 	}
 	ticker := time.NewTicker(t3ProbeInterval)
@@ -482,14 +519,14 @@ func (d *Dispatcher) trackT3(ctx context.Context, run *model.Execution, plan *t3
 			if time.Since(unreachableSince) >= t3UnreachableGrace {
 				run.Status = "released"
 				run.Detail = fmt.Sprintf("T3 线程连续 %s 不可达；已释放写锁，可按人类指令重新派发或评论跟进", t3UnreachableGrace)
-				_ = d.store.SaveExecution(*run)
+				save()
 				return
 			}
 			misses++
 			if misses >= t3FlapProbes {
 				run.Status = "disconnected"
 				run.Detail = fmt.Sprintf("T3 线程连续 %d 次不可达；宽限期内继续探测，超过 %s 释放写锁", misses, t3UnreachableGrace)
-				_ = d.store.SaveExecution(*run)
+				save()
 			}
 			select {
 			case <-ctx.Done():
@@ -514,7 +551,7 @@ func (d *Dispatcher) trackT3(ctx context.Context, run *model.Execution, plan *t3
 			if !seenTurn && !t3ObservedTurn(show) {
 				idleSince = time.Time{}
 				run.Status, run.Detail = "running", t3InitialTurnPendingDetail
-				_ = d.store.SaveExecution(*run)
+				save()
 				break
 			}
 			seenTurn = true
@@ -523,23 +560,23 @@ func (d *Dispatcher) trackT3(ctx context.Context, run *model.Execution, plan *t3
 			}
 			if time.Since(idleSince) >= t3IdleGrace {
 				run.Status, run.Detail = "returned", "T3 agent turn 已结束；任务状态由执行 Agent 回写"
-				_ = d.store.SaveExecution(*run)
+				save()
 				return
 			}
 			run.Status, run.Detail = "running", "T3 线程暂时 idle，等待状态稳定"
 		case "completed":
 			run.Status, run.Detail = "returned", "T3 agent turn 已结束；任务状态由执行 Agent 回写"
-			_ = d.store.SaveExecution(*run)
+			save()
 			return
 		case "failed", "cancelled", "interrupted", "rolled_back":
 			run.Status, run.Detail = "failed", "T3 线程状态："+t3State(show)
-			_ = d.store.SaveExecution(*run)
+			save()
 			return
 		default:
 			seenTurn = true
 			run.Status, run.Detail = "running", "T3 线程状态："+t3State(show)
 		}
-		_ = d.store.SaveExecution(*run)
+		save()
 		select {
 		case <-ctx.Done():
 			return
@@ -576,7 +613,8 @@ func (d *Dispatcher) sendT3Followup(ctx context.Context, taskID, actor string, r
 		run.Status, run.Detail = "unknown", detail
 		_ = d.store.SaveExecution(*run)
 		d.setFollowup(run.FollowupID, "unknown")
-		d.comment(taskID, actor, run.Detail)
+		d.logDispatch("dispatch.channel_failed", taskID, "t3", run.Runtime, actor, "followup_unavailable", detail)
+		d.comment(taskID, actor, "评论没能送达原 T3 会话；不会自动重投。")
 		return
 	}
 	threadID, _ := t3SessionAddress(run.SessionID)
@@ -584,7 +622,8 @@ func (d *Dispatcher) sendT3Followup(ctx context.Context, taskID, actor string, r
 		run.Status, run.Detail = "unknown", "T3 thread send 未确认送达；保留原线程，禁止自动重投："+err.Error()
 		_ = d.store.SaveExecution(*run)
 		d.setFollowup(run.FollowupID, "unknown")
-		d.comment(taskID, actor, run.Detail)
+		d.logDispatch("dispatch.uncertain", taskID, "t3", run.Runtime, actor, "followup_unsent", run.Detail)
+		d.comment(taskID, actor, "评论投递结果不确定，不会自动重投。请先在 T3 中原会话核对。")
 		return
 	}
 	run.Status, run.Detail = "running", "评论已发送到原 T3 线程"

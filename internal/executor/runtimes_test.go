@@ -79,8 +79,8 @@ func TestAllRuntimeOutcomes(t *testing.T) {
 				t.Fatalf("accepted dispatch did not move task into doing: %+v", cur)
 			}
 			comments, _ := st.Comments(task.ID)
-			if len(comments) != 2 || !strings.Contains(comments[0].Text, "派发 "+runtime.ID+" 执行") || !strings.Contains(comments[1].Text, "已交给 Herdr") {
-				t.Fatalf("dispatch comments = %+v", comments)
+			if len(comments) != 0 {
+				t.Fatalf("a successful dispatch must not narrate itself on the card: %+v", comments)
 			}
 			args, err := os.ReadFile(argsLog)
 			if err != nil || !strings.Contains(string(args), "--folder\n"+p.WorkspacePath) || !strings.Contains(string(args), runtime.ID) {
