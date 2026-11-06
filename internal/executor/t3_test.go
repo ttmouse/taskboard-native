@@ -53,7 +53,7 @@ esac
 exit 1
 `)
 	task := model.Task{ID: "task-1", Title: "修复\n  卡片 标题"}
-	got, err := t3Create(context.Background(), task, "/work/probe", RuntimeCodex, "Codex", "任务正文", testT3Plan(t, bin, t.TempDir()))
+	got, err := t3Create(context.Background(), task, "/work/probe", RuntimeCodex, "Codex", "任务正文", "http://127.0.0.1:47990", testT3Plan(t, bin, t.TempDir()))
 	if err != nil || got != "t3:mcp:abc-1" {
 		t.Fatalf("t3Create() = %q, %v", got, err)
 	}
@@ -69,6 +69,7 @@ exit 1
 		"--title 修复 卡片 标题",
 		"TASKBOARD_DISPATCH_TASK_ID=task-1",
 		"执行身份：Codex；写看板时使用 --agent Codex。",
+		"看板地址：http://127.0.0.1:47990（TASKBOARD_ADDR=127.0.0.1:47990",
 		"任务正文",
 	} {
 		if !strings.Contains(string(logged), want) {
@@ -89,7 +90,7 @@ case "$1 $2" in
 esac
 exit 1
 `)
-	got, err := t3Create(context.Background(), model.Task{ID: "task-2", Title: "t"}, "/work", RuntimeClaude, "Claude Code", "prompt", testT3Plan(t, bin, t.TempDir()))
+	got, err := t3Create(context.Background(), model.Task{ID: "task-2", Title: "t"}, "/work", RuntimeClaude, "Claude Code", "prompt", "http://127.0.0.1:47990", testT3Plan(t, bin, t.TempDir()))
 	if err != nil || got != "t3:mcp:abc-2" {
 		t.Fatalf("t3Create() = %q, %v", got, err)
 	}
@@ -106,7 +107,7 @@ case "$1 $2" in
 esac
 exit 0
 `)
-	_, err := t3Create(context.Background(), model.Task{ID: "task-3", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", testT3Plan(t, bin, t.TempDir()))
+	_, err := t3Create(context.Background(), model.Task{ID: "task-3", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", "http://127.0.0.1:47990", testT3Plan(t, bin, t.TempDir()))
 	if err == nil || isT3Unavailable(err) {
 		t.Fatalf("project failure = %v, want a config error", err)
 	}
@@ -126,7 +127,7 @@ case "$1 $2" in
 esac
 exit 0
 `)
-	_, err := t3Create(context.Background(), model.Task{ID: "task-4", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", testT3Plan(t, bin, t.TempDir()))
+	_, err := t3Create(context.Background(), model.Task{ID: "task-4", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", "http://127.0.0.1:47990", testT3Plan(t, bin, t.TempDir()))
 	if !isT3Unavailable(err) {
 		t.Fatalf("missing server = %v, want unavailable", err)
 	}
@@ -144,7 +145,7 @@ func TestT3CreateUnavailableWhenPinnedPortIsClosed(t *testing.T) {
 	bin := writeFakeT3(t, `printf 'called\n' >> "$T3_CALLS"`)
 	plan := testT3Plan(t, bin, t.TempDir())
 	plan.port = port
-	_, err = t3Create(context.Background(), model.Task{ID: "task-5", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", plan)
+	_, err = t3Create(context.Background(), model.Task{ID: "task-5", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", "http://127.0.0.1:47990", plan)
 	if !isT3Unavailable(err) {
 		t.Fatalf("closed port = %v, want unavailable", err)
 	}
@@ -162,7 +163,7 @@ case "$1 $2" in
 esac
 exit 0
 `)
-	_, err := t3Create(context.Background(), model.Task{ID: "task-6", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", testT3Plan(t, bin, t.TempDir()))
+	_, err := t3Create(context.Background(), model.Task{ID: "task-6", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", "http://127.0.0.1:47990", testT3Plan(t, bin, t.TempDir()))
 	if err == nil || isT3Unavailable(err) {
 		t.Fatalf("start failure = %v, want a config error", err)
 	}
@@ -180,7 +181,7 @@ case "$1 $2" in
 esac
 exit 0
 `)
-	_, err := t3Create(context.Background(), model.Task{ID: "task-7", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", testT3Plan(t, bin, t.TempDir()))
+	_, err := t3Create(context.Background(), model.Task{ID: "task-7", Title: "t"}, "/work", RuntimeCodex, "Codex", "prompt", "http://127.0.0.1:47990", testT3Plan(t, bin, t.TempDir()))
 	var failure *t3Error
 	if !errors.As(err, &failure) || !failure.uncertain {
 		t.Fatalf("missing thread id = %v, want uncertain", err)

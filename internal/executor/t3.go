@@ -302,7 +302,7 @@ func t3Available(ctx context.Context, plan *t3RuntimePlan) bool {
 
 // t3Create adds the project (idempotent) and starts one thread. The returned
 // id is already transport-prefixed so it can be stored as a session id.
-func t3Create(ctx context.Context, task model.Task, dir, runtime, actor, text string, plan *t3RuntimePlan) (string, error) {
+func t3Create(ctx context.Context, task model.Task, dir, runtime, actor, text, boardURL string, plan *t3RuntimePlan) (string, error) {
 	probe, cancel := context.WithTimeout(ctx, t3CommandTimeout)
 	available := t3Available(probe, plan)
 	cancel()
@@ -315,7 +315,7 @@ func t3Create(ctx context.Context, task model.Task, dir, runtime, actor, text st
 		return "", &t3Error{kind: t3ErrConfig, err: fmt.Errorf("T3 无法登记项目目录：%s", t3Failure(combined, err))}
 	}
 	title := strings.Join(strings.Fields(task.Title), " ")
-	message := text + "\n\n" + t3DispatchMarker(task.ID) + "\n" + t3IdentityLine(actor)
+	message := text + "\n\n" + t3DispatchMarker(task.ID) + "\n" + t3IdentityLine(actor) + t3BoardLine(boardURL)
 	stdout, combined, err := t3Run(ctx, plan,
 		"thread", "start",
 		"--base-dir", plan.baseDir,
@@ -346,6 +346,20 @@ func t3DispatchMarker(taskID string) string {
 // t3IdentityLine replaces TB_AGENT, which T3 also cannot inject.
 func t3IdentityLine(actor string) string {
 	return fmt.Sprintf("执行身份：%s；写看板时使用 --agent %s。", actor, actor)
+}
+
+// t3BoardLine carries TASKBOARD_ADDR the same way, because a T3 thread
+// inherits the T3 server's environment, not the board's. Without this line a
+// non-default board instance is invisible to the executing agent, which then
+// reports the card as missing instead of writing the result back.
+func t3BoardLine(boardURL string) string {
+	address := strings.TrimSpace(boardURL)
+	address = strings.TrimPrefix(address, "http://")
+	address = strings.TrimPrefix(address, "https://")
+	if address == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n看板地址：http://%s（TASKBOARD_ADDR=%s；写看板时用它定位实例）。", address, address)
 }
 
 func t3Get(ctx context.Context, plan *t3RuntimePlan, threadID string) (t3Show, error) {
@@ -404,7 +418,7 @@ func (d *Dispatcher) tryT3Dispatch(ctx context.Context, task model.Task, dir, ru
 	if followupID == "" {
 		text = buildTaskTextForRuntime(task, runtime)
 	}
-	sessionID, t3Err := t3Create(ctx, task, dir, runtime, actor, text, plan)
+	sessionID, t3Err := t3Create(ctx, task, dir, runtime, actor, text, d.boardURL, plan)
 	if t3Err == nil {
 		run.SessionID, run.Status, run.Detail = sessionID, "running", t3InitialTurnPendingDetail
 		if err := d.store.SaveExecution(*run); err != nil {
