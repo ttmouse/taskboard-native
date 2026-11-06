@@ -1506,20 +1506,25 @@ func herdrExecutionLabel(status string, t *ui.Theme) (string, ui.Color) {
 	}
 }
 
-// herdrExecutionDetail is the long-form Tooltip / accessibility text for a
-// Herdr execution badge. Capsules keep the short label; disconnected must
-// spell out that the write lock is still held so people do not re-dispatch.
-func herdrExecutionDetail(status, label string) string {
+// remoteExecutionDetail is the long-form Tooltip / accessibility text for a
+// remote transport's execution badge. Capsules keep the short label;
+// disconnected must spell out that the write lock is still held so people do
+// not re-dispatch.
+func remoteExecutionDetail(sessionID, status, label string) string {
+	transport := "Herdr"
+	if executor.IsT3Session(sessionID) {
+		transport = "T3"
+	}
 	switch status {
 	case "disconnected", "unknown":
-		return "Herdr 执行状态：连接异常（写锁仍占用，暂不可重派；约 2 分钟不可达后释放）"
+		return transport + " 执行状态：连接异常（写锁仍占用，暂不可重派；约 2 分钟不可达后释放）"
 	case "released":
-		return "Herdr 执行状态：已释放写锁，可重新派发或评论跟进"
+		return transport + " 执行状态：已释放写锁，可重新派发或评论跟进"
 	default:
 		if label == "" {
 			return ""
 		}
-		return "Herdr 执行状态：" + label
+		return transport + " 执行状态：" + label
 	}
 }
 
@@ -1681,7 +1686,11 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task, key strin
 	openExecution := false
 	inReview := b.columnHasRole(task.ColumnID, model.ColumnRoleReview)
 	drawExecutionStatus := func() {
-		if task.Execution == nil || !strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") {
+		if task.Execution == nil {
+			return
+		}
+		sessionID := strings.TrimSpace(task.Execution.SessionID)
+		if !strings.HasPrefix(sessionID, "herdr:") && !executor.IsT3Session(sessionID) {
 			return
 		}
 		status := task.Execution.Status
@@ -1689,7 +1698,7 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task, key strin
 		label, color := herdrExecutionLabel(status, t)
 		icon := herdrExecutionIcon(status)
 		if showReturned && label != "" && icon != nil {
-			detail := herdrExecutionDetail(status, label)
+			detail := remoteExecutionDetail(sessionID, status, label)
 			ui.Icon(c, icon).Size(14, 14).TextColor(color).
 				Label(detail).
 				Tooltip(detail)
@@ -1826,7 +1835,8 @@ func (b *board) taskCard(c *ui.Context, t *ui.Theme, task *model.Task, key strin
 			})
 		})
 		if titleOnly {
-			hasFooter := inReview || (task.Execution != nil && strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:"))
+			hasFooter := inReview || (task.Execution != nil &&
+				(strings.HasPrefix(strings.TrimSpace(task.Execution.SessionID), "herdr:") || executor.IsT3Session(task.Execution.SessionID)))
 			if hasFooter {
 				ui.Row(c).FillWidth().Height(t.Space(6)).Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
 					drawExecutionStatus()
