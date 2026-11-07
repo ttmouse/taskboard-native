@@ -44,6 +44,8 @@ scripts/release-macos.sh
 
 它会编译通用版、生成签名更新包并上传成 GitHub release，再把它设为最新版。
 
+更新签名私钥在 `~/Library/Application Support/mygo/update-keys/mygo-update.key`，**务必备份**：已安装的应用只接受这把私钥签名的更新，丢了这个文件就等于断了所有用户的自动升级通道。发版脚本从 `MYGO_UPDATER_PRIVATE_KEY` 或这个路径读取。
+
 ## 运行
 
 ```bash
