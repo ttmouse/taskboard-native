@@ -25,6 +25,7 @@ import (
 	"taskboard-native/internal/service"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/plugins/updater/native"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -86,6 +87,10 @@ func runServe(args []string) int {
 // runWindow starts the service, opens the board window and runs the loop.
 func runWindow() {
 	mygo.App.SetName("taskboard-native")
+
+	// Signed updates come from the GitHub releases of updates.github in
+	// mygo.json, so the window draws in native UI and needs no webview.
+	mygo.Use(native.Plugin)
 
 	// One instance owns the data file and the port.
 	if !mygo.App.RequestSingleInstanceLock() {

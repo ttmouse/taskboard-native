@@ -1,8 +1,12 @@
 {
   "name": "Taskboard",
   "identifier": "dev.douba.taskboard",
-  "version": "0.1.106",
+  "version": "0.1.107",
   "buildCommand": "python3 scripts/generate_version.py",
   "main": "./cmd/taskboard",
-  "out": "build"
+  "out": "build",
+  "updates": {
+    "publicKey": "zNA/O+VN61G9lH2lyMuwYI5HSZvaW9VsgCyob6QHhLg=",
+    "github": "ttmouse/taskboard-native"
+  }
 }

@@ -18,6 +18,32 @@ MyGo 原生看板客户端。数据层由本应用自持；DSH 插件不是运�
 
 以上为免窗口渲染图，与运行中的窗口同源同规格；更多状态（空态、加载态、长标题、窄宽度）见 `docs/assets/render/`，实拍验收截图见 `docs/assets/review/`。
 
+## 安装（直接用，不用编译）
+
+从 [Releases](https://github.com/ttmouse/taskboard-native/releases/latest) 下载 macOS 通用版（Apple 芯片与 Intel 通用），拖进「应用程序」即可。
+
+应用还没有 Apple 开发者签名和公证，第一次打开前要在终端执行一次，去掉系统的隔离标记：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Taskboard.app
+```
+
+或者用安装脚本一条命令装好（下载最新版、校验 SHA-256、复制到「应用程序」、去掉隔离标记）：
+
+```bash
+curl -fsSL https://github.com/ttmouse/taskboard-native/releases/latest/download/install-macos.sh | sh
+```
+
+装了之后会自动更新：启动约 10 秒后查一次新版本，之后每天一次；有新版本会显示更新说明，可以选择安装并重启。更新包用项目自己的密钥签名，应用只接受签名匹配的更新。
+
+发版：改 `mygo.json` 的版本号，写好 `CHANGELOG.md` 对应小节，然后
+
+```bash
+scripts/release-macos.sh
+```
+
+它会编译通用版、生成签名更新包并上传成 GitHub release，再把它设为最新版。
+
 ## 运行
 
 ```bash
