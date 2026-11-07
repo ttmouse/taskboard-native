@@ -14,3 +14,6 @@ __pycache__/
 docs/.dsh-review/
 Taskboard-*.zip
 taskboard-packaged.png
+
+# 本地临时分析目录（分诊脚本与草稿，不入库）
+.audit/
