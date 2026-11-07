@@ -4,6 +4,20 @@ MyGo 原生看板客户端。数据层由本应用自持；DSH 插件不是运�
 
 目标：轻量、MyGo 原生 UI（非 WebView 外壳）、CLI + MCP 供代理读写、按项目作用域查询、写入经 SSE 实时推到已打开的窗口（不轮询）。
 
+## 界面
+
+主界面（明色，1280×800）：
+
+![主界面](docs/assets/render/board-light.png)
+
+| 暗色主界面 | 任务详情 |
+|---|---|
+| ![暗色主界面](docs/assets/render/board-dark.png) | ![任务详情](docs/assets/render/detail-light.png) |
+| **全局搜索** | **新建任务** |
+| ![全局搜索](docs/assets/render/search-light.png) | ![新建任务](docs/assets/render/compose-light.png) |
+
+以上为免窗口渲染图，与运行中的窗口同源同规格；更多状态（空态、加载态、长标题、窄宽度）见 `docs/assets/render/`，实拍验收截图见 `docs/assets/review/`。
+
 ## 运行
 
 ```bash
@@ -35,7 +49,7 @@ Agent 读取建议：先 `tb projects --json` 定位项目与工作路径，再�
 go build ./... && go vet ./... && go test ./...
 ```
 
-免窗口渲染图（1280×800，明暗/空态/加载态）：`docs/assets/render/`；验收截图：`docs/assets/review/`。
+免窗口渲染图（1280×800，明暗/空态/加载态）：`docs/assets/render/`；验收截图：`docs/assets/review/`。改 UI 后跑 `go test ./cmd/taskboard` 会重写这批渲染图；验收流程见 [docs/review-brief.md](docs/review-brief.md)。
 
 ## 连续 API 动效演示
 
