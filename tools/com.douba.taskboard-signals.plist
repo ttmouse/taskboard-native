@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 未安装。安装：cp 到 ~/Library/LaunchAgents/ 后 launchctl load；卸载用 launchctl unload。
+     默认每周一 09:05 跑一次只读采集。改频率就改 StartCalendarInterval。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.douba.taskboard-signals</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/douba/Projects/taskboard-native/tools/signal-collect.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/douba/Projects/taskboard-native</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/douba</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>1</integer>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>5</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/douba/Library/Logs/taskboard-signals.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/douba/Library/Logs/taskboard-signals.err</string>
+</dict>
+</plist>
