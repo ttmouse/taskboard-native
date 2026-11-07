@@ -6,6 +6,7 @@ status: "inbox"
 impact: "low"
 effort: "S"
 category: "performance"
+family: "F8 CLI/MCP 边界"
 created: "2026-11-04"
 evidence: "cmd/tb/main.go:156-165,247-271; internal/service/server.go:598-616"
 evidence_status: "code-inspection"
@@ -13,7 +14,6 @@ evidence_note: "非 JSON 输出最终只打印 ID、列名、标题、版本和�
 verification: ""
 resolution: "- 2026-11-04: 补充实现细节（2026-11-04）：cmd/tb.client.tasks 将响应解码到 json.RawMessage（cmd/tb/main.go:928-930,1051-1061）；在人类可读路径 cmdList 随后再 json.Unmarshal 到 []model.Task（cmd/tb/main.go:254-260）。因此全量列表期间原始 JSON 字节和完整任务对象会同时驻留。summary 默认化可缩小两者；进一步可让人类可读路径直接解码到仅含展示字段的摘要切片，避免保留整份 raw JSON 与多余字段。此客户端驻留开销与 OP-017 的服务端全量扫描/关系补全属于同一列表读取链路。"
 ---
-
 
 ## 现状与证据
 

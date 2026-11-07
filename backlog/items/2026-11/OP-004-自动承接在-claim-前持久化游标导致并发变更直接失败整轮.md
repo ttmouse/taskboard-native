@@ -6,10 +6,12 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "reliability"
+family: "F3 自动承接与执行状态机"
 created: "2026-11-04"
 evidence: "internal/executor/project_run.go:287-302,333-362; docs/concurrency-safety-2026-10-31.md:4-9"
 evidence_status: "source-confirmed-race"
 evidence_note: "dispatchProjectCard 先写 CurrentTaskID/Cursor，再读取并条件移动任务；claim 错误直接向上返回，continueProjectRun 将整轮置为 failed"
+verification: ""
 resolution: ""
 ---
 

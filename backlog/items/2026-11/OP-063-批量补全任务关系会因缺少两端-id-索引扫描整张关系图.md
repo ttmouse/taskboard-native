@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "S"
 category: "performance"
+family: "F5 读放大、N+1 与缺索引"
 created: "2026-11-04"
 evidence: "internal/store/relations.go:356-384; internal/store/store.go:112-125; system SQLite 3.54.0 EXPLAIN QUERY PLAN with current schema"
 evidence_status: "query-plan-confirmed-system-sqlite-3.54.0"
@@ -13,7 +14,6 @@ evidence_note: "enrichTasksLocked 按 source_task_id IN (...) OR target_task_id 
 verification: ""
 resolution: "- 2026-11-04: 补充项目删除清理路径（2026-11-04）：DeleteProject 在持有全局 Store.mu 时，把删除评论/执行/跟进/任务等语句放进同一事务，并执行 DELETE FROM task_relations WHERE source_task_id IN (SELECT id FROM tasks WHERE project_id=?) OR target_task_id IN (...)（internal/store/mutations.go:575-605）。当前关系主键和 target 索引都以 relation_type 开头，项目删除谓词没有 relation_type；源/目标端点索引的收益可能同时覆盖此路径，并缩短持锁事务时间。此具体 DELETE 的 EXPLAIN 尚未验证，验收需单独检查其计划及跨项目关系规模下的锁持有/删除耗时，避免把 OP-063 对 enrichTasksLocked 的 SELECT 计划直接当作 DELETE 计划证据。"
 ---
-
 
 ## 现状与证据
 

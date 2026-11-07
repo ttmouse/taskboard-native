@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "reliability"
+family: "F4 派发校验与进程生命周期"
 created: "2026-11-04"
 evidence: "internal/service/server.go:125-153; internal/executor/dsh.go:47-99,101-147; internal/executor/herdr.go:304-317,332"
 evidence_status: "code-inspection"
@@ -13,8 +14,6 @@ evidence_note: "service.StartOptions 在启动 HTTP Serve goroutine 前同步调
 verification: ""
 resolution: "- 2026-11-04: 补充证据澄清（2026-11-04）：GUI 阻塞点来自 cmd/taskboard/main.go:86-114 的 runWindow 在 service.Start 返回前同步执行；service.Start 的 HTTP Serve goroutine 在 internal/service/server.go:148-152 才启动。新增条目正文中的对应一句意为“cmd/taskboard.runWindow 也同步等待 service.Start 后才进入创建窗口流程”。shell 对反引号命令替换的误处理导致函数名未保留在正文；以上记录是可核对的准确引用。\n- 2026-11-04: 补充同一无时限调用的跟踪路径（2026-11-04）：herdrGet(ctx, address) 也由 trackHerdr 每轮调用（internal/executor/herdr.go:358-369）；传入的是该执行生命周期的 ctx，没有单次探测 deadline。若某次 hc get 挂起，轮询 goroutine 无法进入后续失败计数、断连状态写回或两分钟不可达收敛，直到整个执行 context 被取消。这个后果与启动恢复阻塞不同，但根因相同：herdrGet 的外部子进程调用没有有界时限。建议把验收扩展到恢复查询和运行中轮询，单次探测超时应允许后续轮次继续并保持状态语义。"
 ---
-
-
 
 ## 现状与证据
 

@@ -6,10 +6,12 @@ status: "inbox"
 impact: "high"
 effort: "M"
 category: "security"
+family: "F12 安全与信任边界"
 created: "2026-11-04"
 evidence: "internal/service/server.go:180-209,212-223,296-310; internal/service/server.go:480-510"
 evidence_status: "source-confirmed-browser-risk"
 evidence_note: "Default listener is loopback; all responses set Access-Control-Allow-Origin: *; project/task/board/comment GET routes have no authentication or Origin allowlist. Public-site access to loopback is browser-policy gated in some browsers, but any origin allowed to reach the service can read API responses."
+verification: ""
 resolution: ""
 ---
 

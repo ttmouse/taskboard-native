@@ -6,6 +6,7 @@ status: "inbox"
 impact: "high"
 effort: "M"
 category: "reliability"
+family: "F4 派发校验与进程生命周期"
 created: "2026-11-04"
 evidence: "internal/executor/exec_unix.go:15-48; Go 1.27.1 GOROOT/src/os/exec/exec.go:837-848"
 evidence_status: "source-confirmed-process-tree-escalation-gap"
@@ -13,7 +14,6 @@ evidence_note: "exec_unix sends SIGTERM to the process group, but after WaitDela
 verification: ""
 resolution: "- 2026-11-04: Evidence clarification: Go 1.27.1 watchCtx calls Process.Kill only if the direct child is still alive when WaitDelay expires; if the leader exited earlier but a descendant retains inherited pipes, Wait closes those pipes after the delay without killing that descendant. Both cases allow a SIGTERM-ignoring descendant to survive group cancellation."
 ---
-
 
 ## 现状与证据
 

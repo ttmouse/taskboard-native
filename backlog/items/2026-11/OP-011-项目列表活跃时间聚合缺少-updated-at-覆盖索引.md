@@ -6,10 +6,12 @@ status: "inbox"
 impact: "low"
 effort: "S"
 category: "performance"
+family: "F5 读放大、N+1 与缺索引"
 created: "2026-11-04"
 evidence: "internal/store/queries.go:115-118,159-162; internal/store/store.go:79"
 evidence_status: "source-confirmed-performance-hypothesis"
 evidence_note: "每次列出项目均按项目聚合 MAX(tasks.updated_at)，谓词为 project_id 与 archived=0；现有 tasks_project 索引仅覆盖 (project_id, archived)。候选收益取决于任务量/项目数，尚无真实库 EXPLAIN 或基准，不能认定当前为瓶颈。"
+verification: ""
 resolution: ""
 ---
 

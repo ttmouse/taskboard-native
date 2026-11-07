@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "reliability"
+family: "F1 服务端 SSE 快照与背压"
 created: "2026-11-04"
 evidence: "internal/service/sse.go:89-105,116-135; internal/store/queries.go:80-110"
 evidence_status: "code-inspection"
@@ -13,7 +14,6 @@ evidence_note: "handler 在调用 Snapshot 前订阅并未检查 request context
 verification: ""
 resolution: "- 2026-11-04: 补充证据（2026-11-04）：同一 request context 未传入 Store 的问题也覆盖普通读取端点，不限于 SSE。GET /api/projects 调用 Projects，GET /api/projects/{id}/board 调用 Board，GET /api/tasks 调用 TasksByProject，均不传 r.Context；相关 Store 方法再以 context.Background 执行查询并持有同一 s.mu。尤其 GET /api/tasks 的 limit/summary 在完整读取和关系补全之后才应用（OP-017），客户端中断后仍可能继续做整项目工作。建议方向应把可取消请求上下文传播到所有较重的 Store 读取路径，并在连接取消时及时释放全局锁；保留 SSE 的先订阅后快照语义。"
 ---
-
 
 ## 现状与证据
 

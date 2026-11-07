@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "reliability"
+family: "F3 自动承接与执行状态机"
 created: "2026-11-04"
 evidence: "internal/executor/herdr.go:356-367,380-384,409-413,427-446; internal/executor/desktop.go:227-239,267-273,325-388; internal/store/execution.go:28-42; internal/model/model.go:221-238"
 evidence_status: "source-confirmed-error-path"
@@ -13,7 +14,6 @@ evidence_note: "终态路径忽略 SaveExecution error 后立刻 return; if SQLi
 verification: ""
 resolution: "- 2026-11-04: 补充证据：DSH 的 trackDesktop 在 idle 终态写 returned 失败后仍 return（desktop.go:350-354）；跟踪异常分支忽略写入 disconnected 的错误后也退出（desktop.go:375-388）；服务关闭写 detached 失败后照常退出（desktop.go:330-333）。desktopState 只有 SaveExecution 成功才更新内存 run，因此落库失败时数据库仍保留旧 active 状态；当前 goroutine 随后移除 inflight，不再持续跟踪。与 Herdr 属于同一终态/状态收敛写回失败导致活跃锁残留根因，合并记录，不另建重复项。"
 ---
-
 
 ## 现状与证据
 

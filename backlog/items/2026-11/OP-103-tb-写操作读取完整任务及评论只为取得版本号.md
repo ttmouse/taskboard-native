@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "performance"
+family: "F5 读放大、N+1 与缺索引"
 created: "2026-11-04"
 evidence: "cmd/tb/main.go:471-483,1021-1041; internal/service/server.go:642-649; internal/store/queries.go:236-270"
 evidence_status: "source-confirmed-cli-preflight-overfetch"
@@ -13,7 +14,6 @@ evidence_note: "tb archive 与 relation add/remove 先通过 c.task 读取完整
 verification: ""
 resolution: "- 2026-11-04: 补充 MCP move_task 预检（2026-11-04）：该工具接收调用方提供的 version，但仍先调用 GET /api/tasks/{id} 并只读取 ProjectID 来解析列名；MCP task helper 将完整响应反序列化为 model.Task，而 Task handler 还补全 CompletedBy、Execution、关系和整段评论（cmd/taskboard-mcp/main.go:479-493,728-749; internal/service/server.go:642-649; internal/store/queries.go:254-273,364-380）。这与 tb move 的完整任务预检是同根因，另行叠加 OP-092 的完整 Board 读取。建议的窄化元数据读路径应同时覆盖 MCP move_task；验收统计完整任务响应中评论/关系的字节与调用总数。"
 ---
-
 
 ## 现状与证据
 

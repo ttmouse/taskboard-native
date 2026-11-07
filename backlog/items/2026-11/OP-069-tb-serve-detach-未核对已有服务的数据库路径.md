@@ -6,6 +6,7 @@ status: "inbox"
 impact: "low"
 effort: "S"
 category: "reliability"
+family: "F8 CLI/MCP 边界"
 created: "2026-11-04"
 evidence: "cmd/tb/main.go:677-709; internal/service/server.go:292-294"
 evidence_status: "current-source-confirmed"
@@ -13,7 +14,6 @@ evidence_note: "serveDetached 在 health 200 后无条件打印 already listenin
 verification: ""
 resolution: "- 2026-11-04: 补充 GUI 启动复用路径（2026-11-04）：runWindow 调 service.Start 后只要错误满足 EADDRINUSE，就直接把默认地址交给 newBoard；启动阶段不探测 /api/health，也不校验响应是否属于 Taskboard（cmd/taskboard/main.go:99-113）。端口被非 Taskboard 服务占用时窗口仍打开，后续 API 操作才失败；若占用服务恰好返回兼容形状，还可能误写到错误服务。应将既有服务身份校验覆盖 GUI 复用入口，验证失败时中止启动并明确错误，不能将单纯端口冲突视为“Taskboard 已在运行”。验收包含正确 Taskboard、非 Taskboard HTTP 服务及不响应服务占用默认端口三种情况。"
 ---
-
 
 ## 现状与证据
 

@@ -6,10 +6,12 @@ status: "inbox"
 impact: "medium"
 effort: "S"
 category: "performance"
+family: "F1 服务端 SSE 快照与背压"
 created: "2026-11-04"
 evidence: "internal/store/queries.go:83-99,115-149; internal/service/sse.go:95-103"
 evidence_status: "source-confirmed-unnecessary-work"
 evidence_note: "Snapshot(projectID) 先调用 projectsLocked 查询并物化全部项目、所有列，并为每个项目计算活跃任务 MAX(updated_at)，之后才按 projectID 过滤；项目范围 SSE 每次连接/重连都会触发这条路径。全局订阅则需要完整集合，此优化仅针对传入 projectID 的调用。"
+verification: ""
 resolution: ""
 ---
 

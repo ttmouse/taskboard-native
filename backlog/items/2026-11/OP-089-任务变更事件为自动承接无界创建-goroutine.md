@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "reliability"
+family: "F3 自动承接与执行状态机"
 created: "2026-11-04"
 evidence: "internal/service/server.go:136-140; internal/store/store.go:407-412; internal/store/mutations.go:135-138; internal/executor/dsh.go:39-43; internal/executor/project_run.go:166-178"
 evidence_status: "code-inspection"
@@ -13,7 +14,6 @@ evidence_note: "每个 created/moved/archived 事件都直接 ；事件回调从
 verification: ""
 resolution: "- 2026-11-04: 证据字段补充（2026-11-04）：命令行反引号展开导致 evidence_note 中 `go NoteProjectRun` 被 shell 当作命令执行，正文的“独立启动一个 NoteProjectRun goroutine”与源码一致；准确源码为 internal/service/server.go:138-140。当前 evidence_note 在此命令中无法直接改写，故保留此更正记录供核对。"
 ---
-
 
 ## 现状与证据
 

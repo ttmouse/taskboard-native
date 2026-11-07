@@ -6,6 +6,7 @@ status: "inbox"
 impact: "high"
 effort: "M"
 category: "reliability"
+family: "F1 服务端 SSE 快照与背压"
 created: "2026-11-04"
 evidence: "internal/service/sse.go:102-123,140-151; internal/client/client.go:732-763; internal/service/server.go:278-286; internal/model/model.go:114-134,328-342; internal/store/mutations.go:126,222-225"
 evidence_status: "source-confirmed-cross-layer-limit-mismatch"
@@ -13,7 +14,6 @@ evidence_note: "SSE 服务端把整个 snapshot JSON 写入单个 data 行；客
 verification: ""
 resolution: "- 2026-11-04: 证据补充：问题也可由单张大卡触发。model.Event 携带完整 Task（含 Description），创建/更新事件直接把该 Task 编码成单行 SSE；任务请求体允许接近 1 MiB。该事件越过客户端 Scanner 上限后，重连快照仍包含相同正文，因此同样无法完成恢复。验收需同时覆盖超限的 task event 和初始 snapshot。"
 ---
-
 
 ## 现状与证据
 

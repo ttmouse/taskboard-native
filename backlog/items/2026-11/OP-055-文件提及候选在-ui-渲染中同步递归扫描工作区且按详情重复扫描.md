@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "performance"
+family: "F6 渲染每帧重算"
 created: "2026-11-04"
 evidence: "cmd/taskboard/file_mentions.go:36-75; cmd/taskboard/mention_menu.go:148-153,171-183; cmd/taskboard/board.go:1412-1427; cmd/taskboard/view.go:2199"
 evidence_status: "current-source-confirmed"
@@ -13,8 +14,6 @@ evidence_note: "文件提及搜索首次出现非空 @query 时，filteredWorksp
 verification: ""
 resolution: "- 2026-11-04: 补充已保存文件提及的渲染路径（2026-11-04）：detailMarkdown 每次调用都会先运行 expandWorkspaceMentions 与 linkifyAbsolutePaths，再交给 MyGo Markdown View（cmd/taskboard/detail_images.go:270-303）。commentBodyView 在每次详情视图构建中对每条评论/评论片段调用 detailMarkdown（cmd/taskboard/body_table_ui.go:151-170,235-239）。expandWorkspaceMentions 对每个合法 @{relativePath} token 在 UI 调用路径里执行 filepath.Abs/EvalSymlinks、Rel 安全校验、再次 EvalSymlinks 及 os.Stat 判断文件/目录（cmd/taskboard/file_mentions.go:189-248）；即使 Markdown View 后续复用解析状态，这些文件系统元数据查询和完整文本转换仍逐帧重复。缓存可按原始文本与 workspace 根路径复用，并在二者变化时失效；验收需测量带多个有效 token 的长正文/多评论稳定帧，不重复 EvalSymlinks/Stat/字符串转换，同时文件类型标签与路径安全校验保持正确。\n- 2026-11-04: 补充候选缓存失效边界（2026-11-04）：quickFileMentionTargets 仅比较 quickFileMentionProjectID 与 b.cur；同一项目更新 workspacePath 后，即使 ProjectChange 已刷新 b.projects，仍复用旧目录的文件候选（cmd/taskboard/mention_menu.go:240-259; cmd/taskboard/board.go:773-801）。任务 form 的缓存同样只比较 fileMentionProjectID 与 projectID；detail 只用 nil 表示未加载，没有记录扫描根路径（mention_menu.go:145-183）。此外工作区文件新增/删除后，在当前表单或详情持续打开时不会主动失效候选快照。优化建议须同时解决项目 ID、workspacePath 与目录内容变化的失效策略；验收覆盖同项目切换工作目录、文件增删及多详情复用，确认新路径候选出现、旧路径候选不残留。"
 ---
-
-
 
 ## 现状与证据
 

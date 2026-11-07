@@ -6,6 +6,7 @@ status: "inbox"
 impact: "medium"
 effort: "M"
 category: "performance"
+family: "F5 读放大、N+1 与缺索引"
 created: "2026-11-04"
 evidence: "cmd/taskboard/board.go:585-630; internal/client/client.go:354-376; internal/service/server.go:479-487"
 evidence_status: "code-path-confirmed"
@@ -13,7 +14,6 @@ evidence_note: "openGlobal 按 b.projects 顺序循环调用 b.api.Board(p.ID)�
 verification: ""
 resolution: "- 2026-11-04: 补充启动路径证据（2026-11-04）：newBoard 先后启动 load 和 startStream（cmd/taskboard/board.go:473-495）。startStream 订阅全局 SSE，服务端首帧返回全局 BoardSnapshot（cmd/taskboard/board.go:677-690; internal/service/sse.go:99-123）。与此同时，load 获取项目列表后对全局视图调用 openGlobal，后者仍逐项目 GET Board 并覆盖状态（cmd/taskboard/board.go:530-586,591-643）。因此初始启动在按项目串行 REST 读取全部项目任务的同时，还读取完整全局 SSE 快照，重复构建/传输/反序列化任务数据；应评估以 SSE 首帧作为全局视图初始数据源，避免双重全量加载，并保留连接先订阅后快照的无丢事件语义。"
 ---
-
 
 ## 现状与证据
 

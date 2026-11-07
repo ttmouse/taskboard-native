@@ -6,6 +6,7 @@ status: "inbox"
 impact: "high"
 effort: "M"
 category: "performance"
+family: "F5 读放大、N+1 与缺索引"
 created: "2026-11-04"
 evidence: "internal/service/server.go:568-599; internal/store/queries.go:204-232; internal/store/queries.go:14-19; internal/store/relations.go:356-384"
 evidence_status: "source-confirmed-unbounded-work-before-pagination"
@@ -13,7 +14,6 @@ evidence_note: "GET /api/tasks 接受 limit≤200、offset 和 summary，但先�
 verification: ""
 resolution: "- 2026-11-04: 补充每次列表调用的前置元数据查询（2026-11-04）：Store.TasksByProject 在 tasksLocked 前调用 projectLocked 仅验证项目存在，丢弃返回值；projectLocked 会计算该项目活动任务 MAX(updated_at) 并额外查询所有列（internal/store/queries.go:159-183,204-210）。因此即使无 columnId，普通 GET /api/tasks 也先做两次项目/列 SQL 再查询任务；columnId 请求还会叠加 handler 的 Project 读取（该重复校验已由 OP-052 单独记录）。列表路径可用窄存在性检查，或在分页/筛选 SQL 中保持原 404 语义而避免构造完整 Project。验收记录普通及 column-filter 列表的项目元数据/列查询数。"
 ---
-
 
 ## 现状与证据
 
