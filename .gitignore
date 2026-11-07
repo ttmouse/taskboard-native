@@ -2,6 +2,7 @@ build/
 .jez/
 .mygo/
 .gocache/
+__pycache__/
 *.bak.*
 
 # 运行期 / 本地产物（不提交）
