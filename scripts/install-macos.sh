@@ -63,10 +63,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "下载 Taskboard $version"
-curl -fL --progress-bar -o "$dmg" "$dmg_url" ||
-	fail "下载 $dmg_url 失败，确认这个版本存在"
+# GitHub's download host drops connections on slow networks; the retry
+# starts the transfer again instead of failing the install.
+curl -fL --progress-bar --retry 20 --retry-delay 2 --retry-all-errors -o "$dmg" "$dmg_url" ||
+	fail "下载 $dmg_url 失败，重跑一次"
 
-if curl -fsSL -o "$work/SHA256SUMS" "$sums_url" 2>/dev/null; then
+if curl -fsSL --retry 5 --retry-all-errors -o "$work/SHA256SUMS" "$sums_url" 2>/dev/null; then
 	expected=$(sed -n 's/^\([0-9a-f]\{64\}\) .*\.dmg$/\1/p' "$work/SHA256SUMS")
 	[ -n "$expected" ] || fail "校验文件里没有这个 dmg 的 SHA-256"
 	actual=$(shasum -a 256 "$dmg" | cut -d ' ' -f 1)
@@ -91,8 +93,16 @@ else
 fi
 
 # Quit a running copy first; replacing a live bundle leaves the old process
-# holding the port and the database.
-osascript -e 'tell application "Taskboard" to quit' >/dev/null 2>&1 || true
+# holding the port and the database. The pgrep guard keeps osascript from
+# launching the app just to tell it to quit.
+if pgrep -x Taskboard >/dev/null 2>&1; then
+	osascript -e 'tell application "Taskboard" to quit' >/dev/null 2>&1 || true
+	waited=0
+	while pgrep -x Taskboard >/dev/null 2>&1 && [ "$waited" -lt 10 ]; do
+		sleep 0.5
+		waited=$((waited + 1))
+	done
+fi
 rm -rf "$target"
 ditto "$source_app" "$target" || fail "复制到 $target 失败"
 xattr -dr com.apple.quarantine "$target" 2>/dev/null || true
